@@ -31,7 +31,7 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
 
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
-    best_n_estimators = 200
+    best_n_list = []
     for train_idx, val_idx in tscv.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
@@ -44,7 +44,9 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
                          lgb.log_evaluation(period=-1)])
         preds = m.predict(X_val)
         scores.append(accuracy_score(y_val, preds))
-        best_n_estimators = m.best_iteration_ or 200
+        best_n_list.append(m.best_iteration_ or 200)
+
+    best_n_estimators = int(np.mean(best_n_list))
 
     logger.info(f"MLモデルCV精度: {np.mean(scores):.3f} (+/-{np.std(scores):.3f})")
 
@@ -68,8 +70,11 @@ def load() -> Optional[lgb.LGBMClassifier]:
 
 
 def predict_proba(model: lgb.LGBMClassifier, df: pd.DataFrame) -> float:
-    """最新の特徴量で上昇確率を返す（0.0〜1.0）"""
-    df = build_features(df)
+    """最新の特徴量で上昇確率を返す（0.0〜1.0）。
+    df に既に特徴量列がある場合は再計算しない。
+    """
+    if FEATURE_COLS[0] not in df.columns:
+        df = build_features(df)
     if df.empty or len(df) < 2:
         return 0.5
     latest = df[FEATURE_COLS].iloc[[-1]]

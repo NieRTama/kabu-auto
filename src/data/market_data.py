@@ -38,19 +38,23 @@ def upsert_ohlcv(symbol: str, df: pd.DataFrame) -> int:
     """OHLCVデータをDBにupsertする"""
     if df.empty:
         return 0
-    count = 0
     with get_session() as session:
+        existing_map = {
+            r.date: r
+            for r in session.scalars(
+                select(OHLCV).where(OHLCV.symbol == symbol)
+            ).all()
+        }
+        count = 0
         for dt, row in df.iterrows():
-            existing = session.scalar(
-                select(OHLCV).where(OHLCV.symbol == symbol, OHLCV.date == dt)
-            )
-            if existing:
-                existing.open = float(row.get("open", 0))
-                existing.high = float(row.get("high", 0))
-                existing.low = float(row.get("low", 0))
-                existing.close = float(row.get("close", 0))
-                existing.volume = int(row.get("volume", 0))
-                existing.adjusted_close = float(row.get("close", 0))
+            if dt in existing_map:
+                rec = existing_map[dt]
+                rec.open = float(row.get("open", 0))
+                rec.high = float(row.get("high", 0))
+                rec.low = float(row.get("low", 0))
+                rec.close = float(row.get("close", 0))
+                rec.volume = int(row.get("volume", 0))
+                rec.adjusted_close = float(row.get("close", 0))
             else:
                 session.add(OHLCV(
                     symbol=symbol,
@@ -77,13 +81,13 @@ def update_symbol(symbol: str, years: int = 3) -> None:
 
 
 def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
-    """DBからOHLCVを読み込みDataFrameで返す"""
+    """DBからOHLCVを読み込みDataFrameで返す（最新limit件を時系列昇順で返す）"""
     with get_session() as session:
-        rows = session.scalars(
+        rows = list(reversed(session.scalars(
             select(OHLCV).where(OHLCV.symbol == symbol)
-            .order_by(OHLCV.date.asc())
+            .order_by(OHLCV.date.desc())
             .limit(limit)
-        ).all()
+        ).all()))
     if not rows:
         return pd.DataFrame()
     data = [

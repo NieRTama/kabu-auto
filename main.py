@@ -6,6 +6,7 @@ kabu-auto メインエントリポイント
 import threading
 import time
 
+import pandas as pd
 import uvicorn
 from loguru import logger
 from sqlalchemy import select
@@ -85,7 +86,7 @@ def main() -> None:
                 df = load_ohlcv(sym)
                 if len(df) < 200:
                     continue
-                combined_df = df if combined_df is None else combined_df._append(df)
+                combined_df = df if combined_df is None else pd.concat([combined_df, df])
             except Exception as e:
                 logger.error(f"データ読み込み失敗: {sym} {e}")
         if combined_df is not None and len(combined_df) >= 200:

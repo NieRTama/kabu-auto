@@ -1,8 +1,9 @@
 """SQLiteデータベース管理（WALモード有効）"""
 import shutil
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from loguru import logger
 from sqlalchemy import (
@@ -92,10 +93,18 @@ def init() -> None:
     logger.info(f"DB初期化完了: {db_path}")
 
 
-def get_session() -> Session:
+@contextmanager
+def get_session() -> Iterator[Session]:
     if _Session is None:
         init()
-    return _Session()
+    session = _Session()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 def backup() -> None:

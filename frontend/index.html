@@ -228,8 +228,14 @@
 
   async function emergencyClose() {
     if (!confirm('本当に全ポジションを即時決済しますか？\nこの操作は取り消せません。')) return;
+    const token = prompt('緊急決済トークンを入力してください（起動ログで確認）:');
+    if (!token) return;
     try {
-      const r = await fetch(API + '/api/emergency_close', { method: 'POST' });
+      const r = await fetch(API + '/api/emergency_close', {
+        method: 'POST',
+        headers: { 'X-Emergency-Token': token },
+      });
+      if (r.status === 403) { alert('トークンが正しくありません'); return; }
       const d = await r.json();
       alert(d.message || '実行しました');
       await loadAll();

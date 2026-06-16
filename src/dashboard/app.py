@@ -5,21 +5,24 @@ Webダッシュボード（FastAPI）
 - シグナル履歴
 - 緊急全ポジション決済ボタン
 """
+import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import config as cfg
 from src.data.database import Position, Signal, Trade, get_session
 
 app = FastAPI(title="kabu-auto Dashboard")
 
 _order_manager = None
+_emergency_token: Optional[str] = None
 _system_status = {
     "running": False,
     "ws_connected": False,
@@ -33,8 +36,16 @@ if FRONTEND_DIR.exists():
 
 
 def set_order_manager(om) -> None:
-    global _order_manager
+    global _order_manager, _emergency_token
     _order_manager = om
+    conf_token = cfg.get_section("dashboard").get("emergency_token", "")
+    _emergency_token = conf_token if conf_token else secrets.token_urlsafe(16)
+    logger.info(f"緊急決済トークン (X-Emergency-Token ヘッダーに設定): {_emergency_token}")
+
+
+async def _verify_emergency_token(x_emergency_token: str = Header(...)) -> None:
+    if _emergency_token is None or x_emergency_token != _emergency_token:
+        raise HTTPException(status_code=403, detail="Invalid emergency token")
 
 
 def update_status(running: bool, ws_connected: bool, mode: str) -> None:
@@ -157,8 +168,8 @@ async def get_pnl_chart():
 
 
 @app.post("/api/emergency_close")
-async def emergency_close():
-    """緊急全ポジション決済"""
+async def emergency_close(_: None = Depends(_verify_emergency_token)):
+    """緊急全ポジション決済（X-Emergency-Token ヘッダー必須）"""
     if _order_manager is None:
         raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
     try:

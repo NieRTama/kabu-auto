@@ -53,6 +53,7 @@ data:
 dashboard:
   host: "0.0.0.0"
   port: 8080
+  emergency_token: ""  # 空の場合は起動時にランダム生成してログに表示
 
 alerts:
   line_notify_token: ""  # LINE Notify トークン（任意）

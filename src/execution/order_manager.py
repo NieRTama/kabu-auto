@@ -25,6 +25,7 @@ class OrderManager:
         self._conf = cfg.get_section("trading")
         self._is_paper = self._conf.get("mode", "paper") == "paper"
         self._pending_orders: dict[str, threading.Timer] = {}
+        self._orders_lock = threading.Lock()
 
     def on_order_event(self, event: dict) -> None:
         """WebSocket約定イベントのハンドラ"""
@@ -40,6 +41,9 @@ class OrderManager:
             sector: Optional[str] = None) -> Optional[str]:
         """指値買い注文を発注する"""
         if quantity <= 0:
+            return None
+        if not self._risk.can_place_order():
+            logger.warning(f"日次注文上限に達したため発注スキップ: {symbol}")
             return None
         self._risk.increment_order_count()
 
@@ -79,13 +83,16 @@ class OrderManager:
         """指値売り注文を発注する"""
         if quantity <= 0:
             return None
+        if not self._risk.can_place_order():
+            logger.warning(f"日次注文上限に達したため発注スキップ: {symbol}")
+            return None
         self._risk.increment_order_count()
 
         if self._is_paper:
             order_id = f"PAPER-SELL-{symbol}-{uuid.uuid4().hex[:8]}"
             logger.info(f"[ペーパー] 売り: {symbol} {quantity}株 @{price:.0f}円")
             self._record_trade(order_id, symbol, "SELL", quantity, price)
-            self._update_position(symbol, "SELL", quantity, price)
+            self._update_position(symbol, "SELL", quantity, price, order_id=order_id)
             return order_id
 
         order = {
@@ -133,12 +140,14 @@ class OrderManager:
         timer = threading.Timer(timeout, self._timeout_cancel, args=[order_id])
         timer.daemon = True
         timer.start()
-        self._pending_orders[order_id] = timer
+        with self._orders_lock:
+            self._pending_orders[order_id] = timer
 
     def _cancel_timeout_timer(self, order_id: str) -> None:
-        if order_id in self._pending_orders:
-            self._pending_orders[order_id].cancel()
-            del self._pending_orders[order_id]
+        with self._orders_lock:
+            timer = self._pending_orders.pop(order_id, None)
+        if timer:
+            timer.cancel()
 
     def _timeout_cancel(self, order_id: str) -> None:
         logger.info(f"注文タイムアウト → キャンセル: {order_id}")
@@ -146,6 +155,8 @@ class OrderManager:
             self._client.cancel_order(order_id)
         except Exception as e:
             logger.error(f"キャンセル失敗: {order_id} {e}")
+        with self._orders_lock:
+            self._pending_orders.pop(order_id, None)
         self._update_trade_status(order_id, "CANCELLED")
 
     def _record_trade(self, order_id: str, symbol: str, side: str,
@@ -172,7 +183,8 @@ class OrderManager:
                 session.commit()
 
     def _update_position(self, symbol: str, side: str, quantity: int,
-                         price: float, sector: Optional[str] = None) -> None:
+                         price: float, sector: Optional[str] = None,
+                         order_id: Optional[str] = None) -> None:
         with get_session() as session:
             pos = session.scalar(select(Position).where(Position.symbol == symbol))
             if side == "BUY":
@@ -192,11 +204,9 @@ class OrderManager:
                 pnl = (price - pos.avg_cost) * quantity
                 pos.quantity = max(0, pos.quantity - quantity)
                 pos.updated_at = datetime.now()
-                # 損益をtradeレコードに反映
                 trade = session.scalar(
-                    select(Trade).where(Trade.symbol == symbol, Trade.side == "SELL")
-                    .order_by(Trade.id.desc())
-                )
+                    select(Trade).where(Trade.order_id == order_id)
+                ) if order_id else None
                 if trade:
                     trade.pnl = pnl
             session.commit()

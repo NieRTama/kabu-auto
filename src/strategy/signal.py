@@ -8,7 +8,7 @@ import pandas as pd
 from loguru import logger
 
 from src.core import config as cfg
-from src.strategy.indicators import compute_indicators
+from src.strategy.indicators import build_features
 from src.strategy import ml_model
 
 
@@ -76,7 +76,7 @@ def generate(symbol: str, df: pd.DataFrame,
     buy_thr = conf.get("buy_threshold", 0.6)
     sell_thr = conf.get("sell_threshold", -0.6)
 
-    df = compute_indicators(df)
+    df = build_features(df)
     rule_s = _rule_score(df)
 
     ml_s = 0.0

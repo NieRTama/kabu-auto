@@ -25,15 +25,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     bb = ta.bbands(df["close"], length=bb_p, std=bb_std)
     if bb is not None:
-        df["bb_upper"] = bb.iloc[:, 0]
-        df["bb_mid"] = bb.iloc[:, 1]
-        df["bb_lower"] = bb.iloc[:, 2]
+        df["bb_lower"] = bb.iloc[:, 0]  # BBL
+        df["bb_mid"] = bb.iloc[:, 1]    # BBM
+        df["bb_upper"] = bb.iloc[:, 2]  # BBU
 
     macd = ta.macd(df["close"])
     if macd is not None:
         df["macd"] = macd.iloc[:, 0]
-        df["macd_signal"] = macd.iloc[:, 1]
-        df["macd_hist"] = macd.iloc[:, 2]
+        df["macd_hist"] = macd.iloc[:, 1]    # MACDh
+        df["macd_signal"] = macd.iloc[:, 2]  # MACDs
 
     df["returns"] = df["close"].pct_change()
     df["volume_ma20"] = ta.sma(df["volume"].astype(float), length=20)
