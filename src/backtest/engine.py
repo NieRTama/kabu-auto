@@ -65,7 +65,7 @@ def run_backtest(
         pre_df = full_df[full_df.index.date < start]
         if len(pre_df) >= 200:
             try:
-                model = ml_model.train(pre_df)
+                model = ml_model.train(pre_df, save=False)
                 effective_ml_weight = ml_weight
                 effective_rule_weight = rule_weight
                 logger.info(f"バックテスト用MLモデル学習完了: {len(pre_df)}件")

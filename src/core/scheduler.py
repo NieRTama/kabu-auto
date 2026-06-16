@@ -60,6 +60,13 @@ class TradingScheduler:
                 day_of_week="mon-fri",
                 hour=15, minute=35, id="signal_scan",
             )
+        if "morning_execution" in cb:
+            # 9:05 に前日シグナルを元に発注（ライブモードのみ実行される）
+            self._scheduler.add_job(
+                cb["morning_execution"], "cron",
+                day_of_week="mon-fri",
+                hour=9, minute=5, id="morning_execution",
+            )
 
         self._scheduler.start()
         logger.info("スケジューラ起動完了")

@@ -5,6 +5,7 @@ kabu-auto メインエントリポイント
 """
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pandas as pd
 import uvicorn
@@ -112,10 +113,11 @@ def main() -> None:
                 logger.error(f"損切りチェックエラー: {sym} {e}")
 
     def signal_scan():
-        """15:35に翌営業日の売買候補をスキャン"""
+        """15:35 に翌営業日の売買候補をスキャン。ペーパーモードは終値で即時シミュレート"""
         if TradingScheduler.is_maintenance_window():
             return
         logger.info("シグナルスキャン開始...")
+        is_paper = trading_conf.get("mode", "paper") == "paper"
         for sym in watchlist:
             try:
                 df = load_ohlcv(sym)
@@ -123,10 +125,62 @@ def main() -> None:
                     continue
                 sig = gen_signal(sym, df, model)
                 _save_signal(sig)
-                if sig.action in ("BUY", "SELL"):
-                    logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")
+                if sig.action not in ("BUY", "SELL"):
+                    continue
+                logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")
+                if is_paper:
+                    # ペーパーモード: 当日終値でシミュレート
+                    close_price = float(df["close"].iloc[-1])
+                    if sig.action == "BUY":
+                        qty = risk.calc_position_size(sym, close_price, 500_000)
+                        if qty > 0:
+                            order_mgr.buy(sym, close_price, qty)
+                    elif sig.action == "SELL":
+                        qty = _get_position_qty(sym)
+                        if qty > 0:
+                            order_mgr.sell(sym, close_price, qty)
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
+
+    def morning_execution():
+        """9:05 に前日のBUYシグナルを元に発注（ライブモードのみ）"""
+        if trading_conf.get("mode", "paper") != "live":
+            return
+        if not TradingScheduler.is_market_open():
+            return
+        cutoff = datetime.now() - timedelta(hours=20)
+        with get_session() as session:
+            signals = session.scalars(
+                select(Signal)
+                .where(Signal.action == "BUY", Signal.generated_at >= cutoff)
+                .order_by(Signal.generated_at.desc())
+            ).all()
+            seen: set = set()
+            buy_signals = []
+            for s in signals:
+                if s.symbol not in seen:
+                    seen.add(s.symbol)
+                    buy_signals.append(s)
+
+        if not buy_signals:
+            return
+        try:
+            wallet = client.get_wallet()
+            cash = float(wallet.get("StockAccountWallet", 0))
+        except Exception as e:
+            logger.error(f"余力取得失敗: {e}")
+            return
+        for sig in buy_signals:
+            try:
+                board = client.get_board(sig.symbol)
+                price = board.get("CurrentPrice") or board.get("Sell1", {}).get("Price", 0)
+                if not price:
+                    continue
+                qty = risk.calc_position_size(sig.symbol, float(price), cash)
+                if qty > 0:
+                    order_mgr.buy(sig.symbol, float(price), qty)
+            except Exception as e:
+                logger.error(f"朝発注失敗: {sig.symbol} {e}")
 
     set_ml_retrain_fn(ml_retrain)  # ダッシュボードから手動再学習できるよう登録
 
@@ -136,6 +190,7 @@ def main() -> None:
     scheduler.register("ml_retrain", ml_retrain)
     scheduler.register("stop_loss_check", stop_loss_check)
     scheduler.register("signal_scan", signal_scan)
+    scheduler.register("morning_execution", morning_execution)
 
     # ─── WebSocket 開始 ────────────────────────────────────
     client.start_websocket(on_order_event=order_mgr.on_order_event)
@@ -149,7 +204,7 @@ def main() -> None:
         target=uvicorn.run,
         kwargs={
             "app": dashboard_app,
-            "host": dash_conf.get("host", "0.0.0.0"),
+            "host": dash_conf.get("host", "127.0.0.1"),
             "port": dash_conf.get("port", 8080),
             "log_level": "warning",
         },

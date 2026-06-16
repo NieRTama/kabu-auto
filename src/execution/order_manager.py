@@ -23,6 +23,8 @@ class OrderManager:
         self._client = client
         self._risk = risk
         self._conf = cfg.get_section("trading")
+        # パスワードは kabu_station セクションから取得する
+        self._kabu_password = cfg.get_section("kabu_station").get("password", "")
         self._is_paper = self._conf.get("mode", "paper") == "paper"
         self._pending_orders: dict[str, threading.Timer] = {}
         self._orders_lock = threading.Lock()
@@ -34,28 +36,33 @@ class OrderManager:
         if state == 5:  # 約定済み
             logger.info(f"約定確認: OrderID={order_id}")
             self._cancel_timeout_timer(order_id)
-            self._update_trade_status(order_id, "FILLED",
-                                      filled_at=datetime.now())
+            self._update_trade_status(order_id, "FILLED", filled_at=datetime.now())
+            # ライブモード: 約定後にポジションを更新（ペーパーは発注時点で更新済み）
+            if not self._is_paper:
+                self._update_position_from_fill(order_id)
 
     def buy(self, symbol: str, price: float, quantity: int,
             sector: Optional[str] = None) -> Optional[str]:
         """指値買い注文を発注する"""
         if quantity <= 0:
             return None
-        if not self._risk.can_place_order():
-            logger.warning(f"日次注文上限に達したため発注スキップ: {symbol}")
+        ok, reason = self._risk.can_place_order()
+        if not ok:
+            logger.warning(f"発注スキップ: {symbol} - {reason}")
             return None
         self._risk.increment_order_count()
 
         if self._is_paper:
             order_id = f"PAPER-BUY-{symbol}-{uuid.uuid4().hex[:8]}"
+            now = datetime.now()
             logger.info(f"[ペーパー] 買い: {symbol} {quantity}株 @{price:.0f}円")
-            self._record_trade(order_id, symbol, "BUY", quantity, price)
+            self._record_trade(order_id, symbol, "BUY", quantity, price,
+                               status="FILLED", filled_at=now)
             self._update_position(symbol, "BUY", quantity, price, sector)
             return order_id
 
         order = {
-            "Password": self._conf.get("password", ""),
+            "Password": self._kabu_password,
             "Symbol": symbol,
             "Exchange": 1,
             "SecurityType": 1,  # 株式
@@ -83,20 +90,23 @@ class OrderManager:
         """指値売り注文を発注する"""
         if quantity <= 0:
             return None
-        if not self._risk.can_place_order():
-            logger.warning(f"日次注文上限に達したため発注スキップ: {symbol}")
+        ok, reason = self._risk.can_place_order()
+        if not ok:
+            logger.warning(f"発注スキップ: {symbol} - {reason}")
             return None
         self._risk.increment_order_count()
 
         if self._is_paper:
             order_id = f"PAPER-SELL-{symbol}-{uuid.uuid4().hex[:8]}"
+            now = datetime.now()
             logger.info(f"[ペーパー] 売り: {symbol} {quantity}株 @{price:.0f}円")
-            self._record_trade(order_id, symbol, "SELL", quantity, price)
+            self._record_trade(order_id, symbol, "SELL", quantity, price,
+                               status="FILLED", filled_at=now)
             self._update_position(symbol, "SELL", quantity, price, order_id=order_id)
             return order_id
 
         order = {
-            "Password": self._conf.get("password", ""),
+            "Password": self._kabu_password,
             "Symbol": symbol,
             "Exchange": 1,
             "SecurityType": 1,
@@ -160,7 +170,9 @@ class OrderManager:
         self._update_trade_status(order_id, "CANCELLED")
 
     def _record_trade(self, order_id: str, symbol: str, side: str,
-                      quantity: int, price: float) -> None:
+                      quantity: int, price: float,
+                      status: str = "PENDING",
+                      filled_at: Optional[datetime] = None) -> None:
         with get_session() as session:
             session.add(Trade(
                 order_id=order_id,
@@ -168,7 +180,8 @@ class OrderManager:
                 side=side,
                 quantity=quantity,
                 price=price,
-                status="PENDING",
+                status=status,
+                filled_at=filled_at,
             ))
             session.commit()
 
@@ -181,6 +194,21 @@ class OrderManager:
                 if filled_at:
                     trade.filled_at = filled_at
                 session.commit()
+
+    def _update_position_from_fill(self, order_id: str) -> None:
+        """約定後にポジションを更新する（ライブモード用）"""
+        with get_session() as session:
+            trade = session.scalar(select(Trade).where(Trade.order_id == order_id))
+            if trade is None:
+                logger.warning(f"約定トレード未発見: {order_id}")
+                return
+            symbol, side, quantity, price = (
+                trade.symbol, trade.side, trade.quantity, trade.price
+            )
+        self._update_position(
+            symbol, side, quantity, price,
+            order_id=order_id if side == "SELL" else None,
+        )
 
     def _update_position(self, symbol: str, side: str, quantity: int,
                          price: float, sector: Optional[str] = None,
