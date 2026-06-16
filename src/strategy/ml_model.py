@@ -1,6 +1,10 @@
 """
 機械学習モデル（LightGBM）の学習・推論
-ルックアヘッドバイアスを防ぐため時系列分割を使用する。
+
+モデルは表形式の金融データで実績のあるLightGBMを採用（2025-2026の各種比較研究でも
+日足スイングのような小規模サンプルでは深層学習より優位とされる）。
+ラベリングはトリプルバリア法（labeling.py）を用い、ラベル期間の重なりに対する
+サンプル一意性重みを付与してルックアヘッド・過学習を抑制する。
 """
 import pickle
 from pathlib import Path
@@ -14,18 +18,16 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 
 from src.strategy.indicators import FEATURE_COLS, build_features
+from src.strategy.labeling import build_training_set
 
 MODEL_PATH = Path("models/lgb_model.pkl")
 
 
 def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
-    """時系列分割でLightGBMを学習し保存する"""
-    df = build_features(df)
-    if len(df) < 100:
-        raise ValueError(f"学習データが不足しています: {len(df)}件")
-
-    X = df[FEATURE_COLS]
-    y = df["label"]
+    """トリプルバリアラベル＋サンプル重みでLightGBMを学習し保存する"""
+    X, y, weights = build_training_set(df)
+    if len(X) < 100:
+        raise ValueError(f"学習データが不足しています: {len(X)}件")
 
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
@@ -33,9 +35,11 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
     for train_idx, val_idx in tscv.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        w_tr = weights[train_idx]
         m = lgb.LGBMClassifier(n_estimators=200, learning_rate=0.05,
                                 num_leaves=31, random_state=42, verbose=-1)
-        m.fit(X_tr, y_tr, eval_set=[(X_val, y_val)],
+        m.fit(X_tr, y_tr, sample_weight=w_tr,
+              eval_set=[(X_val, y_val)],
               callbacks=[lgb.early_stopping(20, verbose=False),
                          lgb.log_evaluation(period=-1)])
         preds = m.predict(X_val)
@@ -44,11 +48,11 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
 
     logger.info(f"MLモデルCV精度: {np.mean(scores):.3f} (+/-{np.std(scores):.3f})")
 
-    # CV後に全データで最終モデルを学習
+    # CV後に全データで最終モデルを学習（サンプル重み込み）
     model = lgb.LGBMClassifier(n_estimators=best_n_estimators, learning_rate=0.05,
                                 num_leaves=31, random_state=42, verbose=-1)
-    model.fit(X, y)
-    logger.info("MLモデル学習完了（全データ）")
+    model.fit(X, y, sample_weight=weights)
+    logger.info("MLモデル学習完了（全データ・トリプルバリア法）")
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:

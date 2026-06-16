@@ -39,6 +39,11 @@ strategy:
   rule_weight: 0.5  # ルールベースシグナルの重み
   buy_threshold: 0.6  # 買いシグナル閾値
   sell_threshold: -0.6  # 売りシグナル閾値
+  # トリプルバリア法ラベリング（López de Prado）
+  tb_profit_mult: 2.0  # 利益確定バリア = 終値 ×(1 + mult × ボラティリティ)
+  tb_stop_mult: 2.0    # 損切りバリア   = 終値 ×(1 - mult × ボラティリティ)
+  tb_max_holding: 10   # 時間バリア（最大保有日数、スイング想定）
+  tb_vol_span: 20      # ボラティリティ推定の指数加重期間
 
 data:
   db_path: "data/kabu_auto.db"

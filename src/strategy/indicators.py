@@ -43,7 +43,12 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """ML用の特徴量を作成する"""
+    """ML用の特徴量を作成して返す（ラベルは付与しない）。
+
+    ラベリングは labeling.py のトリプルバリア法で別途行う。
+    特徴量は過去データのみから計算されるため、最新行も保持される
+    （予測時に当日の特徴量を使えるよう dropna は特徴量列のみで行う）。
+    """
     df = compute_indicators(df)
     conf = cfg.get_section("strategy")
     short = conf.get("ma_short", 5)
@@ -52,15 +57,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["ma_cross_sm"] = df[f"ma{short}"] - df[f"ma{mid}"]
     df["ma_cross_ml"] = df[f"ma{mid}"] - df[f"ma{long_}"]
-    df["bb_pct"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"] + 1e-8)
+    bb_width = (df["bb_upper"] - df["bb_lower"]).clip(lower=1e-4)
+    df["bb_pct"] = (df["close"] - df["bb_lower"]) / bb_width
     df["price_momentum_5"] = df["close"].pct_change(5)
     df["price_momentum_20"] = df["close"].pct_change(20)
 
-    target_horizon = 5
-    df["future_return"] = df["close"].shift(-target_horizon) / df["close"] - 1
-    df["label"] = (df["future_return"] > 0.02).astype(int)  # 5日後に2%超上昇なら1
-
-    return df.dropna()
+    return df.dropna(subset=FEATURE_COLS)
 
 
 FEATURE_COLS = [

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# データ・モデル・ログ（生成物）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.log
+data/backups/*.db
+models/*.pkl
+
+# 環境変数
+.env
+.env.local
+
+# OS
+.DS_Store
