@@ -11,6 +11,7 @@ trading:
   max_sector_ratio: 0.40  # 同一セクター最大集中率
   order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
   daily_order_limit: 100  # 1日の最大注文数
+  max_daily_loss: 30000  # 当日損失上限（円）。0 で無効
   watchlist:
     # 金融
     - "8306"   # 三菱UFJフィナンシャル

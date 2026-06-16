@@ -18,16 +18,35 @@ from src.data.database import Position, get_session
 class RiskManager:
     def __init__(self):
         self._daily_order_count = 0
+        self._daily_loss_yen = 0.0
         self._conf = cfg.get_section("trading")
 
     def reset_daily_counters(self) -> None:
         self._daily_order_count = 0
+        self._daily_loss_yen = 0.0
+
+    def record_loss(self, pnl: float) -> None:
+        """損益を記録する（損失のみ累積）"""
+        if pnl < 0:
+            self._daily_loss_yen += abs(pnl)
+
+    def is_daily_loss_limit_reached(self) -> tuple[bool, str]:
+        """当日損失上限チェック。(over_limit, reason) を返す"""
+        limit = self._conf.get("max_daily_loss", 0)
+        if limit <= 0:
+            return False, ""
+        if self._daily_loss_yen >= limit:
+            return True, f"当日損失上限({limit:,.0f}円)に達しました"
+        return False, ""
 
     def can_place_order(self) -> tuple[bool, str]:
         """注文可能かチェック。(ok, reason) を返す"""
         limit = self._conf.get("daily_order_limit", 100)
         if self._daily_order_count >= limit:
             return False, f"1日の注文上限({limit})に達しました"
+        over, reason = self.is_daily_loss_limit_reached()
+        if over:
+            return False, reason
         return True, ""
 
     def increment_order_count(self) -> None:

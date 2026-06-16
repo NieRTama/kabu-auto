@@ -51,7 +51,7 @@ def _make_om(mode: str = "paper", limit_reached: bool = False):
     """
     cfg_mock = _cfg(mode)
     client = MagicMock()
-    client.send_order.return_value = {"OrderId": "LIVE-ORD-001"}
+    client.send_order.return_value = {"Result": 0, "OrderId": "LIVE-ORD-001"}
     risk = MagicMock()
     reason = "1日の注文上限(100)に達しました" if limit_reached else ""
     risk.can_place_order.return_value = (not limit_reached, reason)
@@ -137,7 +137,11 @@ class TestCanPlaceOrderTuple:
 class TestOnOrderEventPositionUpdate:
     def test_live_fill_triggers_position_update(self):
         """ライブモード OrderState=5 受信時に _update_position_from_fill が呼ばれる"""
-        with _make_om(mode="live") as (om, _, _, _):
+        trade_mock = MagicMock()
+        trade_mock.status = "PENDING"
+
+        with _make_om(mode="live") as (om, _, _, session):
+            session.scalar.return_value = trade_mock
             om._update_position_from_fill = MagicMock()
             om.on_order_event({"OrderID": "LIVE-ORD-001", "OrderState": 5})
 

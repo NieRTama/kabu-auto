@@ -3,6 +3,8 @@ kabu-auto メインエントリポイント
 起動: python main.py
 ダッシュボード: http://localhost:8080
 """
+import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -37,6 +39,16 @@ def main() -> None:
     data_conf = cfg.get_section("data")
     dash_conf = cfg.get_section("dashboard")
 
+    # ─── ライブモード起動確認 ──────────────────────────────────
+    if trading_conf.get("mode", "paper") == "live":
+        if os.environ.get("CONFIRM_LIVE_TRADING", "").lower() != "true":
+            logger.error(
+                "ライブモードを起動するには環境変数 CONFIRM_LIVE_TRADING=true が必要です。"
+                "  例: CONFIRM_LIVE_TRADING=true python main.py"
+            )
+            sys.exit(1)
+        logger.warning("【ライブモード】実際の資金を使用して取引します。")
+
     client = KabuClient()
     risk = RiskManager()
     order_mgr = OrderManager(client, risk)
@@ -49,6 +61,9 @@ def main() -> None:
         client.refresh_token()
     except Exception as e:
         logger.warning(f"kabuステーション接続失敗（ペーパーモードで継続）: {e}")
+
+    # ─── 起動時注文同期（ライブモードのみ）────────────────
+    order_mgr.sync_on_startup()
 
     # ─── MLモデルロード ────────────────────────────────────
     model = ml_model.load()
