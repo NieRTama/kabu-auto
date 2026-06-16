@@ -74,9 +74,9 @@ class TradingScheduler:
         now = datetime.now(TZ)
         if now.weekday() >= 5:  # 土日
             return False
-        t = now.time()
-        morning = (9, 0) <= (t.hour, t.minute) <= (11, 30)
-        afternoon = (12, 30) <= (t.hour, t.minute) <= (15, 30)
+        now_hm = (now.hour, now.minute)
+        morning = (9, 0) <= now_hm < (11, 30)
+        afternoon = (12, 30) <= now_hm <= (15, 30)
         return morning or afternoon
 
     @staticmethod

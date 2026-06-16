@@ -9,7 +9,7 @@
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.core import config as cfg
 from src.data.database import Position, get_session
@@ -50,15 +50,9 @@ class RiskManager:
         """最大保有銘柄数チェック"""
         max_pos = self._conf.get("max_positions", 5)
         with get_session() as session:
-            count = session.scalar(
-                select(Position).where(Position.quantity > 0)
-            )
-            if isinstance(count, int):
-                active = count
-            else:
-                active = len(session.scalars(
-                    select(Position).where(Position.quantity > 0)
-                ).all())
+            active = session.scalar(
+                select(func.count(Position.id)).where(Position.quantity > 0)
+            ) or 0
         if active >= max_pos:
             return False, f"最大保有銘柄数({max_pos})に達しています"
         return True, ""

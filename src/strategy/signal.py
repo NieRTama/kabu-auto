@@ -49,13 +49,14 @@ def _rule_score(df: pd.DataFrame) -> float:
         score -= 0.3
 
     # ボリンジャーバンド
-    bb_upper = latest.get("bb_upper", float("inf"))
-    bb_lower = latest.get("bb_lower", 0.0)
+    bb_upper = latest.get("bb_upper")
+    bb_lower = latest.get("bb_lower")
     close = latest["close"]
-    if close < bb_lower:
-        score += 0.2
-    elif close > bb_upper:
-        score -= 0.2
+    if bb_upper is not None and bb_lower is not None:
+        if close < bb_lower:
+            score += 0.2
+        elif close > bb_upper:
+            score -= 0.2
 
     # MACD
     if latest.get("macd_hist", 0) > 0 and prev.get("macd_hist", 0) <= 0:

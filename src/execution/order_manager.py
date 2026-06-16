@@ -5,7 +5,7 @@
 - ペーパートレードモード対応
 """
 import threading
-import time
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -34,7 +34,7 @@ class OrderManager:
             logger.info(f"約定確認: OrderID={order_id}")
             self._cancel_timeout_timer(order_id)
             self._update_trade_status(order_id, "FILLED",
-                                      filled_at=datetime.utcnow())
+                                      filled_at=datetime.now())
 
     def buy(self, symbol: str, price: float, quantity: int,
             sector: Optional[str] = None) -> Optional[str]:
@@ -44,7 +44,7 @@ class OrderManager:
         self._risk.increment_order_count()
 
         if self._is_paper:
-            order_id = f"PAPER-BUY-{symbol}-{int(time.time())}"
+            order_id = f"PAPER-BUY-{symbol}-{uuid.uuid4().hex[:8]}"
             logger.info(f"[ペーパー] 買い: {symbol} {quantity}株 @{price:.0f}円")
             self._record_trade(order_id, symbol, "BUY", quantity, price)
             self._update_position(symbol, "BUY", quantity, price, sector)
@@ -82,7 +82,7 @@ class OrderManager:
         self._risk.increment_order_count()
 
         if self._is_paper:
-            order_id = f"PAPER-SELL-{symbol}-{int(time.time())}"
+            order_id = f"PAPER-SELL-{symbol}-{uuid.uuid4().hex[:8]}"
             logger.info(f"[ペーパー] 売り: {symbol} {quantity}株 @{price:.0f}円")
             self._record_trade(order_id, symbol, "SELL", quantity, price)
             self._update_position(symbol, "SELL", quantity, price)
@@ -180,7 +180,7 @@ class OrderManager:
                     total_qty = pos.quantity + quantity
                     pos.avg_cost = (pos.avg_cost * pos.quantity + price * quantity) / total_qty
                     pos.quantity = total_qty
-                    pos.updated_at = datetime.utcnow()
+                    pos.updated_at = datetime.now()
                 else:
                     session.add(Position(
                         symbol=symbol,
@@ -191,7 +191,7 @@ class OrderManager:
             elif side == "SELL" and pos:
                 pnl = (price - pos.avg_cost) * quantity
                 pos.quantity = max(0, pos.quantity - quantity)
-                pos.updated_at = datetime.utcnow()
+                pos.updated_at = datetime.now()
                 # 損益をtradeレコードに反映
                 trade = session.scalar(
                     select(Trade).where(Trade.symbol == symbol, Trade.side == "SELL")

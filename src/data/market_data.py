@@ -81,7 +81,7 @@ def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
     with get_session() as session:
         rows = session.scalars(
             select(OHLCV).where(OHLCV.symbol == symbol)
-            .order_by(OHLCV.date.desc())
+            .order_by(OHLCV.date.asc())
             .limit(limit)
         ).all()
     if not rows:
@@ -95,7 +95,7 @@ def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
             "close": r.adjusted_close or r.close,
             "volume": r.volume,
         }
-        for r in reversed(rows)
+        for r in rows
     ]
     df = pd.DataFrame(data).set_index("date")
     df.index = pd.to_datetime(df.index)

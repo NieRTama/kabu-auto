@@ -29,7 +29,7 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
 
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
-    model = None
+    best_n_estimators = 200
     for train_idx, val_idx in tscv.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
         y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
@@ -40,9 +40,16 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
                          lgb.log_evaluation(period=-1)])
         preds = m.predict(X_val)
         scores.append(accuracy_score(y_val, preds))
-        model = m
+        best_n_estimators = m.best_iteration_ or 200
 
-    logger.info(f"MLモデル学習完了 CV精度: {np.mean(scores):.3f} (+/-{np.std(scores):.3f})")
+    logger.info(f"MLモデルCV精度: {np.mean(scores):.3f} (+/-{np.std(scores):.3f})")
+
+    # CV後に全データで最終モデルを学習
+    model = lgb.LGBMClassifier(n_estimators=best_n_estimators, learning_rate=0.05,
+                                num_leaves=31, random_state=42, verbose=-1)
+    model.fit(X, y)
+    logger.info("MLモデル学習完了（全データ）")
+
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)

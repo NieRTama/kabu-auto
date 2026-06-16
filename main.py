@@ -3,25 +3,24 @@ kabu-auto メインエントリポイント
 起動: python main.py
 ダッシュボード: http://localhost:8080
 """
-import sys
 import threading
 import time
-from datetime import datetime
 
 import uvicorn
 from loguru import logger
+from sqlalchemy import select
 
 from src.core import config as cfg, logger as log_setup
 from src.core.alerts import alert
 from src.core.scheduler import TradingScheduler
 from src.api.kabu_client import KabuClient
 from src.data import database as db
-from src.data.database import Signal
+from src.data.database import Position, Signal, get_session
 from src.data.market_data import load_ohlcv, update_symbol
 from src.execution.order_manager import OrderManager
 from src.risk.manager import RiskManager
 from src.strategy import ml_model
-from src.strategy.signal import generate as gen_signal
+from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 from src.dashboard.app import app as dashboard_app, set_order_manager, update_status
 
 
@@ -31,7 +30,6 @@ def main() -> None:
     db.init()
 
     trading_conf = cfg.get_section("trading")
-    kabu_conf = cfg.get_section("kabu_station")
     data_conf = cfg.get_section("data")
     dash_conf = cfg.get_section("dashboard")
 
@@ -53,7 +51,7 @@ def main() -> None:
     if model is None:
         logger.info("学習済みモデルなし。十分なデータが揃い次第 /retrain を実行してください。")
 
-    # ─── ウォッチリスト（設定から読み込み or DB内ポジション）─
+    # ─── ウォッチリスト（設定から読み込み）────────────────
     watchlist: list[str] = trading_conf.get("watchlist", [])
 
     # ─── スケジューラのコールバック登録 ──────────────────────
@@ -81,30 +79,34 @@ def main() -> None:
     def ml_retrain():
         nonlocal model
         logger.info("MLモデル週次再学習を開始...")
+        combined_df = None
         for sym in watchlist:
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 200:
                     continue
-                model = ml_model.train(df)
-                break  # 最初の銘柄でモデルを作成（後続は追加学習）
+                combined_df = df if combined_df is None else combined_df._append(df)
             except Exception as e:
-                logger.error(f"再学習失敗: {sym} {e}")
+                logger.error(f"データ読み込み失敗: {sym} {e}")
+        if combined_df is not None and len(combined_df) >= 200:
+            try:
+                model = ml_model.train(combined_df)
+            except Exception as e:
+                logger.error(f"再学習失敗: {e}")
 
     def stop_loss_check():
         if not TradingScheduler.is_market_open():
             return
-        try:
-            boards = {}
-            for sym in watchlist:
+        for sym in watchlist:
+            try:
                 board = client.get_board(sym)
                 price = board.get("CurrentPrice", 0)
                 if price and risk.should_stop_loss(sym, price):
                     logger.warning(f"損切り発動: {sym}")
                     order_mgr.sell(sym, price, _get_position_qty(sym))
                     alert("損切り実行", f"{sym} @{price:.0f}円")
-        except Exception as e:
-            logger.error(f"損切りチェックエラー: {e}")
+            except Exception as e:
+                logger.error(f"損切りチェックエラー: {sym} {e}")
 
     def signal_scan():
         """15:35に翌営業日の売買候補をスキャン"""
@@ -165,15 +167,12 @@ def main() -> None:
 
 
 def _get_position_qty(symbol: str) -> int:
-    from sqlalchemy import select
-    from src.data.database import Position, get_session
     with get_session() as session:
         pos = session.scalar(select(Position).where(Position.symbol == symbol))
     return pos.quantity if pos else 0
 
 
-def _save_signal(sig) -> None:
-    from src.data.database import Signal, get_session
+def _save_signal(sig: TradeSignal) -> None:
     with get_session() as session:
         session.add(Signal(
             symbol=sig.symbol,
