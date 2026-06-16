@@ -257,8 +257,8 @@ strategy:
   bb_std: 2.0          # ボリンジャーバンド標準偏差倍率
   ml_weight: 0.5       # ML シグナルの重み（0〜1）
   rule_weight: 0.5     # ルールベースシグナルの重み（0〜1）
-  buy_threshold: 0.6   # 買いシグナル合成スコア閾値
-  sell_threshold: -0.6 # 売りシグナル合成スコア閾値
+  buy_threshold: 0.25  # 買いシグナル合成スコア閾値
+  sell_threshold: -0.25 # 売りシグナル合成スコア閾値
 ```
 
 ---

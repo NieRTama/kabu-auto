@@ -38,8 +38,8 @@ strategy:
   bb_std: 2.0
   ml_weight: 0.5  # MLシグナルの重み (0.0-1.0)
   rule_weight: 0.5  # ルールベースシグナルの重み
-  buy_threshold: 0.6  # 買いシグナル閾値
-  sell_threshold: -0.6  # 売りシグナル閾値
+  buy_threshold: 0.25  # 買いシグナル閾値（合成スコアは rule/ml を重み付き平均するため実効レンジは約±0.3。0.25 ≈ 平均+2.2σ）
+  sell_threshold: -0.25  # 売りシグナル閾値
   # トリプルバリア法ラベリング（López de Prado）
   tb_profit_mult: 2.0  # 利益確定バリア = 終値 ×(1 + mult × ボラティリティ)
   tb_stop_mult: 2.0    # 損切りバリア   = 終値 ×(1 - mult × ボラティリティ)
