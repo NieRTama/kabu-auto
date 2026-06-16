@@ -1,8 +1,34 @@
-"""テクニカル指標計算モジュール（pandas-ta使用）"""
+"""テクニカル指標計算モジュール（pandas のみ使用）"""
 import pandas as pd
-import pandas_ta as ta
 
 from src.core import config as cfg
+
+
+def _sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(window=length).mean()
+
+
+def _rsi(series: pd.Series, length: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(com=length - 1, min_periods=length).mean()
+    loss = (-delta.clip(upper=0)).ewm(com=length - 1, min_periods=length).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    return 100 - (100 / (1 + rs))
+
+
+def _bbands(series: pd.Series, length: int, std: float):
+    mid = series.rolling(window=length).mean()
+    sigma = series.rolling(window=length).std(ddof=0)
+    return mid - std * sigma, mid, mid + std * sigma
+
+
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, hist, signal_line
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -17,26 +43,18 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     bb_p = conf.get("bb_period", 20)
     bb_std = conf.get("bb_std", 2.0)
 
-    df[f"ma{short}"] = ta.sma(df["close"], length=short)
-    df[f"ma{mid}"] = ta.sma(df["close"], length=mid)
-    df[f"ma{long_}"] = ta.sma(df["close"], length=long_)
+    df[f"ma{short}"] = _sma(df["close"], short)
+    df[f"ma{mid}"] = _sma(df["close"], mid)
+    df[f"ma{long_}"] = _sma(df["close"], long_)
 
-    df["rsi"] = ta.rsi(df["close"], length=rsi_p)
+    df["rsi"] = _rsi(df["close"], rsi_p)
 
-    bb = ta.bbands(df["close"], length=bb_p, std=bb_std)
-    if bb is not None:
-        df["bb_lower"] = bb.iloc[:, 0]  # BBL
-        df["bb_mid"] = bb.iloc[:, 1]    # BBM
-        df["bb_upper"] = bb.iloc[:, 2]  # BBU
+    df["bb_lower"], df["bb_mid"], df["bb_upper"] = _bbands(df["close"], bb_p, bb_std)
 
-    macd = ta.macd(df["close"])
-    if macd is not None:
-        df["macd"] = macd.iloc[:, 0]
-        df["macd_hist"] = macd.iloc[:, 1]    # MACDh
-        df["macd_signal"] = macd.iloc[:, 2]  # MACDs
+    df["macd"], df["macd_hist"], df["macd_signal"] = _macd(df["close"])
 
-    df["returns"] = df["close"].pct_change()
-    df["volume_ma20"] = ta.sma(df["volume"].astype(float), length=20)
+    df["returns"] = df["close"].pct_change(fill_method=None)
+    df["volume_ma20"] = _sma(df["volume"].astype(float), 20)
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
 
     return df
@@ -59,8 +77,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ma_cross_ml"] = df[f"ma{mid}"] - df[f"ma{long_}"]
     bb_width = (df["bb_upper"] - df["bb_lower"]).clip(lower=1e-4)
     df["bb_pct"] = (df["close"] - df["bb_lower"]) / bb_width
-    df["price_momentum_5"] = df["close"].pct_change(5)
-    df["price_momentum_20"] = df["close"].pct_change(20)
+    df["price_momentum_5"] = df["close"].pct_change(5, fill_method=None)
+    df["price_momentum_20"] = df["close"].pct_change(20, fill_method=None)
 
     return df.dropna(subset=FEATURE_COLS)
 

@@ -31,6 +31,7 @@ app = FastAPI(title="kabu-auto Dashboard")
 
 _order_manager = None
 _ml_retrain_fn = None
+_data_update_fn = None
 _emergency_token: Optional[str] = None
 _system_status = {
     "running": False,
@@ -47,6 +48,11 @@ if FRONTEND_DIR.exists():
 def set_ml_retrain_fn(fn) -> None:
     global _ml_retrain_fn
     _ml_retrain_fn = fn
+
+
+def set_data_update_fn(fn) -> None:
+    global _data_update_fn
+    _data_update_fn = fn
 
 
 def set_order_manager(om) -> None:
@@ -383,6 +389,19 @@ async def retrain_model():
         logger.error(f"手動再学習失敗: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     return {"status": "ok", "message": "再学習が完了しました"}
+
+
+@app.post("/api/data/update")
+async def update_market_data():
+    """過去データを手動で取得する（yfinance経由）"""
+    if _data_update_fn is None:
+        raise HTTPException(status_code=503, detail="データ更新関数が設定されていません")
+    try:
+        await asyncio.to_thread(_data_update_fn)
+    except Exception as e:
+        logger.error(f"データ更新失敗: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", "message": "データ更新が完了しました"}
 
 
 # ─── バックテスト ──────────────────────────────────────────────────
