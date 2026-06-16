@@ -21,7 +21,7 @@ class Signal:
     combined_score: float
 
 
-def _rule_score(df: pd.DataFrame) -> float:
+def compute_rule_score(df: pd.DataFrame) -> float:
     """ルールベースのスコアを計算する（-1.0〜+1.0）"""
     if len(df) < 2:
         return 0.0
@@ -77,7 +77,7 @@ def generate(symbol: str, df: pd.DataFrame,
     sell_thr = conf.get("sell_threshold", -0.6)
 
     df = build_features(df)
-    rule_s = _rule_score(df)
+    rule_s = compute_rule_score(df)
 
     ml_s = 0.0
     if model is not None:

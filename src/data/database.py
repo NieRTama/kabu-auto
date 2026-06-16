@@ -70,6 +70,38 @@ class Signal(Base):
     action = Column(String(10))  # "BUY", "SELL", "HOLD"
 
 
+class BacktestRun(Base):
+    __tablename__ = "backtest_runs"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(10), nullable=False)
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=False)
+    initial_capital = Column(Float)
+    final_capital = Column(Float)
+    total_return = Column(Float)
+    max_drawdown = Column(Float)
+    sharpe_ratio = Column(Float)
+    win_rate = Column(Float)
+    trade_count = Column(Integer)
+    use_ml = Column(Integer, default=0)
+    created_at = Column(DateTime)
+    equity_curve_json = Column(Text)  # JSON: [{"date": "YYYY-MM-DD", "equity": float}]
+
+
+class BacktestTradeRecord(Base):
+    __tablename__ = "backtest_trades"
+    id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, nullable=False)
+    symbol = Column(String(10))
+    entry_date = Column(Date)
+    entry_price = Column(Float)
+    exit_date = Column(Date)
+    exit_price = Column(Float)
+    quantity = Column(Integer)
+    pnl = Column(Float)
+    exit_reason = Column(String(30))  # STOP_LOSS / SIGNAL_SELL / END_OF_PERIOD
+
+
 _engine = None
 _Session: Optional[sessionmaker] = None
 

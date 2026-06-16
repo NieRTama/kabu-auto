@@ -117,11 +117,73 @@
       <button class="emergency-btn" onclick="emergencyClose()">全ポジション即時決済</button>
     </div>
   </div>
+
+  <!-- ─── バックテスト ───────────────────────────────────────────── -->
+  <div class="card" style="margin-bottom:24px;">
+    <h2>📊 バックテスト</h2>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;">
+      <div>
+        <div class="label" style="margin-bottom:4px;">銘柄</div>
+        <select id="bt-symbol" style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;">
+          <option value="">読み込み中...</option>
+        </select>
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:4px;">開始日</div>
+        <input id="bt-start" type="date" value="2022-01-01"
+          style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;">
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:4px;">終了日</div>
+        <input id="bt-end" type="date" value="2024-12-31"
+          style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;">
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:4px;">初期資金（円）</div>
+        <input id="bt-capital" type="number" value="500000" step="10000"
+          style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:130px;">
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;padding-bottom:2px;">
+        <input id="bt-use-ml" type="checkbox">
+        <label for="bt-use-ml" style="font-size:0.85rem;color:#94a3b8;">ML使用（低速）</label>
+      </div>
+      <button id="bt-run-btn" onclick="runBacktest()"
+        style="background:#0284c7;color:white;border:none;padding:8px 20px;border-radius:6px;font-size:0.9rem;font-weight:600;cursor:pointer;">
+        実行
+      </button>
+    </div>
+    <div style="margin-bottom:16px;">
+      <div class="label" style="margin-bottom:8px;">実行履歴</div>
+      <div style="overflow-x:auto;">
+        <table style="font-size:0.8rem;">
+          <thead>
+            <tr><th>銘柄</th><th>期間</th><th>リターン</th><th>MDD</th><th>シャープ</th><th>勝率</th><th>取引数</th><th>ML</th><th></th></tr>
+          </thead>
+          <tbody id="bt-runs-tbody"><tr><td colspan="9" style="color:#64748b">なし</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="bt-detail" style="display:none;">
+      <hr style="border-color:#334155;margin:16px 0;">
+      <div id="bt-metrics" class="grid" style="margin-bottom:16px;"></div>
+      <canvas id="bt-chart" style="max-height:280px;margin-bottom:16px;"></canvas>
+      <div class="label" style="margin-bottom:8px;">取引一覧</div>
+      <div style="overflow-x:auto;">
+        <table style="font-size:0.8rem;">
+          <thead>
+            <tr><th>エントリー</th><th>単価</th><th>エグジット</th><th>単価</th><th>数量</th><th>損益</th><th>理由</th></tr>
+          </thead>
+          <tbody id="bt-trades-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 </main>
 
 <script>
   const API = '';
   let pnlChart = null;
+  let btChart = null;
 
   async function fetchJson(url) {
     const r = await fetch(API + url);
@@ -130,6 +192,145 @@
 
   async function loadAll() {
     await Promise.all([loadStatus(), loadPnlSummary(), loadPositions(), loadSignals(), loadTrades(), loadPnlChart()]);
+  }
+
+  // ── バックテスト ────────────────────────────────────────────────
+
+  async function initBacktest() {
+    const symbols = await fetchJson('/api/watchlist');
+    const sel = document.getElementById('bt-symbol');
+    sel.innerHTML = symbols.map(s => `<option value="${s}">${s}</option>`).join('');
+    await loadBtRuns();
+  }
+
+  async function loadBtRuns() {
+    const runs = await fetchJson('/api/backtest/runs');
+    const tbody = document.getElementById('bt-runs-tbody');
+    if (!runs.length) { tbody.innerHTML = '<tr><td colspan="9" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = runs.map(r => {
+      const ret = r.total_return;
+      const retColor = ret > 0 ? '#4ade80' : ret < 0 ? '#f87171' : '#e2e8f0';
+      const period = `${r.start_date || ''} ~ ${r.end_date || ''}`;
+      return `<tr style="cursor:pointer;" onclick="loadBtDetail(${r.id})">
+        <td><strong>${r.symbol}</strong></td>
+        <td style="font-size:0.75rem;color:#64748b;">${period}</td>
+        <td style="color:${retColor};font-weight:700;">${(ret * 100).toFixed(1)}%</td>
+        <td style="color:#f87171;">${(r.max_drawdown * 100).toFixed(1)}%</td>
+        <td>${(r.sharpe_ratio || 0).toFixed(2)}</td>
+        <td>${(r.win_rate * 100).toFixed(0)}%</td>
+        <td>${r.trade_count}</td>
+        <td>${r.use_ml ? '✓' : '-'}</td>
+        <td style="color:#38bdf8;font-size:0.75rem;">詳細</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadBtDetail(runId) {
+    const d = await fetchJson(`/api/backtest/${runId}`);
+    const run = d.run;
+
+    // メトリクスカード
+    const ret = run.total_return;
+    const retColor = ret > 0 ? 'green' : ret < 0 ? 'red' : 'neutral';
+    document.getElementById('bt-metrics').innerHTML = `
+      <div class="card" style="padding:12px;">
+        <div class="label">トータルリターン</div>
+        <div class="value ${retColor}">${(ret * 100).toFixed(1)}%</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">最大ドローダウン</div>
+        <div class="value red">-${(run.max_drawdown * 100).toFixed(1)}%</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">シャープレシオ</div>
+        <div class="value neutral">${(run.sharpe_ratio || 0).toFixed(2)}</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">勝率</div>
+        <div class="value neutral">${(run.win_rate * 100).toFixed(0)}%</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">最終資産</div>
+        <div class="value neutral">¥${(run.final_capital || 0).toLocaleString()}</div>
+      </div>`;
+
+    // エクイティカーブ
+    const labels = d.equity_curve.map(e => e.date);
+    const values = d.equity_curve.map(e => e.equity);
+    if (btChart) btChart.destroy();
+    const ctx = document.getElementById('bt-chart').getContext('2d');
+    btChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: '資産推移 (¥)',
+          data: values,
+          borderColor: '#a78bfa',
+          backgroundColor: 'rgba(167,139,250,0.1)',
+          fill: true, tension: 0.2, pointRadius: 0,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#64748b', maxTicksLimit: 12 }, grid: { color: '#1e293b' } },
+          y: { ticks: { color: '#64748b', callback: v => '¥' + v.toLocaleString() }, grid: { color: '#334155' } }
+        }
+      }
+    });
+
+    // 取引一覧
+    const REASON_LABEL = { STOP_LOSS: '損切り', SIGNAL_SELL: 'シグナル', END_OF_PERIOD: '期間終了' };
+    document.getElementById('bt-trades-tbody').innerHTML = d.trades.map(t => {
+      const pnlColor = (t.pnl || 0) >= 0 ? '#4ade80' : '#f87171';
+      return `<tr>
+        <td>${t.entry_date || ''}</td>
+        <td>¥${(t.entry_price || 0).toLocaleString()}</td>
+        <td>${t.exit_date || ''}</td>
+        <td>¥${(t.exit_price || 0).toLocaleString()}</td>
+        <td>${(t.quantity || 0).toLocaleString()}株</td>
+        <td style="color:${pnlColor};font-weight:600;">${(t.pnl || 0) >= 0 ? '+' : ''}¥${(t.pnl || 0).toLocaleString()}</td>
+        <td style="font-size:0.75rem;color:#94a3b8;">${REASON_LABEL[t.exit_reason] || t.exit_reason}</td>
+      </tr>`;
+    }).join('') || '<tr><td colspan="7" style="color:#64748b">取引なし</td></tr>';
+
+    document.getElementById('bt-detail').style.display = 'block';
+    document.getElementById('bt-detail').scrollIntoView({ behavior: 'smooth' });
+  }
+
+  async function runBacktest() {
+    const symbol = document.getElementById('bt-symbol').value;
+    const start = document.getElementById('bt-start').value;
+    const end = document.getElementById('bt-end').value;
+    const capital = parseFloat(document.getElementById('bt-capital').value);
+    const useML = document.getElementById('bt-use-ml').checked;
+    if (!symbol || !start || !end) { alert('銘柄・期間を入力してください'); return; }
+
+    const btn = document.getElementById('bt-run-btn');
+    btn.textContent = '実行中...';
+    btn.disabled = true;
+    try {
+      const r = await fetch(API + '/api/backtest/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol, start, end, initial_capital: capital, use_ml: useML }),
+      });
+      if (!r.ok) {
+        const err = await r.json();
+        alert('エラー: ' + (err.detail || r.statusText));
+        return;
+      }
+      const result = await r.json();
+      await loadBtRuns();
+      await loadBtDetail(result.run_id);
+    } catch(e) {
+      alert('エラー: ' + e.message);
+    } finally {
+      btn.textContent = '実行';
+      btn.disabled = false;
+    }
   }
 
   async function loadStatus() {
@@ -245,6 +446,7 @@
   }
 
   loadAll();
+  initBacktest();
   setInterval(loadAll, 10000);  // 10秒ごとに自動更新
 </script>
 </body>
