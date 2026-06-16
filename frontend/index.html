@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>kabu-auto ダッシュボード</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #0f172a; color: #e2e8f0; }
+    header { background: #1e293b; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #334155; }
+    header h1 { font-size: 1.4rem; color: #38bdf8; letter-spacing: 0.05em; }
+    .badge { padding: 4px 12px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+    .badge.paper { background: #854d0e; color: #fef3c7; }
+    .badge.live { background: #166534; color: #dcfce7; }
+    .badge.offline { background: #7f1d1d; color: #fee2e2; }
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+    .card .label { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+    .card .value { font-size: 1.8rem; font-weight: 700; }
+    .card .value.green { color: #4ade80; }
+    .card .value.red { color: #f87171; }
+    .card .value.neutral { color: #e2e8f0; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+    @media (max-width: 768px) { .row { grid-template-columns: 1fr; } }
+    .card h2 { font-size: 0.9rem; color: #94a3b8; margin-bottom: 16px; text-transform: uppercase; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th { text-align: left; color: #64748b; font-weight: 600; padding: 8px 0; border-bottom: 1px solid #334155; }
+    td { padding: 8px 0; border-bottom: 1px solid #1e293b; }
+    .tag { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .tag.BUY { background: #14532d; color: #86efac; }
+    .tag.SELL { background: #7f1d1d; color: #fca5a5; }
+    .tag.HOLD { background: #1e3a5f; color: #93c5fd; }
+    .tag.FILLED { background: #14532d; color: #86efac; }
+    .tag.PENDING { background: #713f12; color: #fcd34d; }
+    .tag.CANCELLED { background: #374151; color: #9ca3af; }
+    .emergency-btn {
+      background: #dc2626; color: white; border: none; padding: 12px 24px;
+      border-radius: 8px; font-size: 1rem; font-weight: 700; cursor: pointer;
+      width: 100%; margin-top: 8px; transition: background 0.2s;
+    }
+    .emergency-btn:hover { background: #b91c1c; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+    .status-dot.online { background: #4ade80; }
+    .status-dot.offline { background: #f87171; }
+    canvas { max-height: 280px; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>📈 kabu-auto</h1>
+  <div id="mode-badge" class="badge paper">PAPER</div>
+</header>
+<main>
+  <div class="grid">
+    <div class="card">
+      <div class="label">累積損益</div>
+      <div id="total-pnl" class="value neutral">¥0</div>
+    </div>
+    <div class="card">
+      <div class="label">勝率</div>
+      <div id="win-rate" class="value neutral">0%</div>
+    </div>
+    <div class="card">
+      <div class="label">勝ち / 負け</div>
+      <div id="win-loss" class="value neutral">0 / 0</div>
+    </div>
+    <div class="card">
+      <div class="label">保有銘柄数</div>
+      <div id="position-count" class="value neutral">0</div>
+    </div>
+    <div class="card">
+      <div class="label">システム状態</div>
+      <div id="sys-status" class="value neutral"><span class="status-dot offline"></span>確認中...</div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card" style="grid-column: span 2;">
+      <h2>累積損益グラフ</h2>
+      <canvas id="pnl-chart"></canvas>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>保有ポジション</h2>
+      <table>
+        <thead><tr><th>銘柄</th><th>数量</th><th>平均取得</th><th>セクター</th></tr></thead>
+        <tbody id="positions-tbody"><tr><td colspan="4" style="color:#64748b">なし</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>直近シグナル</h2>
+      <table>
+        <thead><tr><th>銘柄</th><th>時刻</th><th>スコア</th><th>判断</th></tr></thead>
+        <tbody id="signals-tbody"><tr><td colspan="4" style="color:#64748b">なし</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>取引履歴（直近）</h2>
+      <table>
+        <thead><tr><th>銘柄</th><th>売買</th><th>価格</th><th>損益</th><th>状態</th></tr></thead>
+        <tbody id="trades-tbody"><tr><td colspan="5" style="color:#64748b">なし</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>⚠️ 緊急操作</h2>
+      <p style="color:#f87171; font-size:0.85rem; margin-bottom:12px;">
+        システム異常時に全ポジションを即時決済します。<br>
+        この操作は取り消せません。
+      </p>
+      <button class="emergency-btn" onclick="emergencyClose()">全ポジション即時決済</button>
+    </div>
+  </div>
+</main>
+
+<script>
+  const API = '';
+  let pnlChart = null;
+
+  async function fetchJson(url) {
+    const r = await fetch(API + url);
+    return r.json();
+  }
+
+  async function loadAll() {
+    await Promise.all([loadStatus(), loadPnlSummary(), loadPositions(), loadSignals(), loadTrades(), loadPnlChart()]);
+  }
+
+  async function loadStatus() {
+    const s = await fetchJson('/api/status');
+    const dot = s.running ? '<span class="status-dot online"></span>稼働中' : '<span class="status-dot offline"></span>停止';
+    document.getElementById('sys-status').innerHTML = dot;
+    const badge = document.getElementById('mode-badge');
+    badge.textContent = s.mode === 'live' ? 'LIVE' : 'PAPER';
+    badge.className = 'badge ' + (s.mode === 'live' ? 'live' : 'paper');
+  }
+
+  async function loadPnlSummary() {
+    const d = await fetchJson('/api/pnl_summary');
+    const pnlEl = document.getElementById('total-pnl');
+    pnlEl.textContent = '¥' + d.total_pnl.toLocaleString();
+    pnlEl.className = 'value ' + (d.total_pnl > 0 ? 'green' : d.total_pnl < 0 ? 'red' : 'neutral');
+    document.getElementById('win-rate').textContent = (d.win_rate * 100).toFixed(1) + '%';
+    document.getElementById('win-loss').textContent = d.win_count + ' / ' + d.loss_count;
+  }
+
+  async function loadPositions() {
+    const list = await fetchJson('/api/positions');
+    document.getElementById('position-count').textContent = list.length;
+    const tbody = document.getElementById('positions-tbody');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = list.map(p => `
+      <tr>
+        <td><strong>${p.symbol}</strong></td>
+        <td>${p.quantity.toLocaleString()}株</td>
+        <td>¥${p.avg_cost.toLocaleString()}</td>
+        <td>${p.sector || '-'}</td>
+      </tr>`).join('');
+  }
+
+  async function loadSignals() {
+    const list = await fetchJson('/api/signals?limit=20');
+    const tbody = document.getElementById('signals-tbody');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = list.map(s => {
+      const t = s.generated_at ? new Date(s.generated_at + 'Z').toLocaleTimeString('ja-JP') : '-';
+      return `<tr>
+        <td><strong>${s.symbol}</strong></td>
+        <td style="font-size:0.75rem;color:#64748b">${t}</td>
+        <td>${(s.combined_score || 0).toFixed(2)}</td>
+        <td><span class="tag ${s.action}">${s.action}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadTrades() {
+    const list = await fetchJson('/api/trades?limit=20');
+    const tbody = document.getElementById('trades-tbody');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="5" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = list.map(t => {
+      const pnlText = t.pnl != null ? (t.pnl >= 0 ? `<span style="color:#4ade80">+¥${t.pnl.toLocaleString()}</span>` : `<span style="color:#f87171">¥${t.pnl.toLocaleString()}</span>`) : '-';
+      return `<tr>
+        <td><strong>${t.symbol}</strong></td>
+        <td><span class="tag ${t.side}">${t.side}</span></td>
+        <td>¥${(t.price || 0).toLocaleString()}</td>
+        <td>${pnlText}</td>
+        <td><span class="tag ${t.status}">${t.status}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadPnlChart() {
+    const data = await fetchJson('/api/pnl_chart');
+    const labels = data.map(d => d.date);
+    const values = data.map(d => d.pnl);
+    if (pnlChart) { pnlChart.destroy(); }
+    const ctx = document.getElementById('pnl-chart').getContext('2d');
+    pnlChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: '累積損益 (¥)',
+          data: values,
+          borderColor: '#38bdf8',
+          backgroundColor: 'rgba(56,189,248,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: 3,
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#64748b', maxTicksLimit: 10 }, grid: { color: '#1e293b' } },
+          y: { ticks: { color: '#64748b', callback: v => '¥' + v.toLocaleString() }, grid: { color: '#334155' } }
+        }
+      }
+    });
+  }
+
+  async function emergencyClose() {
+    if (!confirm('本当に全ポジションを即時決済しますか？\nこの操作は取り消せません。')) return;
+    try {
+      const r = await fetch(API + '/api/emergency_close', { method: 'POST' });
+      const d = await r.json();
+      alert(d.message || '実行しました');
+      await loadAll();
+    } catch(e) {
+      alert('エラー: ' + e.message);
+    }
+  }
+
+  loadAll();
+  setInterval(loadAll, 10000);  // 10秒ごとに自動更新
+</script>
+</body>
+</html>

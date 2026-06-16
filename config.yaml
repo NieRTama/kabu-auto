@@ -1,0 +1,44 @@
+kabu_station:
+  base_url: "http://localhost:18080/kabusapi"
+  password: ""  # kabuステーション ログインパスワード
+  token_refresh_time: "08:30"  # 毎朝トークン再取得
+
+trading:
+  mode: "paper"  # "paper" (仮想) or "live" (本番)
+  max_positions: 5  # 最大同時保有銘柄数
+  max_position_ratio: 0.20  # 1銘柄あたり最大資金比率 (20%)
+  stop_loss_pct: -0.05  # 損切りライン (-5%)
+  max_sector_ratio: 0.40  # 同一セクター最大集中率
+  order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
+  daily_order_limit: 100  # 1日の最大注文数
+
+strategy:
+  ma_short: 5
+  ma_mid: 25
+  ma_long: 75
+  rsi_period: 14
+  rsi_oversold: 30
+  rsi_overbought: 70
+  bb_period: 20
+  bb_std: 2.0
+  ml_weight: 0.5  # MLシグナルの重み (0.0-1.0)
+  rule_weight: 0.5  # ルールベースシグナルの重み
+  buy_threshold: 0.6  # 買いシグナル閾値
+  sell_threshold: -0.6  # 売りシグナル閾値
+
+data:
+  db_path: "data/kabu_auto.db"
+  backup_dir: "data/backups"
+  history_years: 3  # 取得する過去データ年数
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
+
+alerts:
+  line_notify_token: ""  # LINE Notify トークン（任意）
+  email: ""  # アラート送信先メール（任意）
+
+logging:
+  level: "INFO"
+  file: "data/kabu_auto.log"
