@@ -143,7 +143,7 @@ def main() -> None:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
 
     def morning_execution():
-        """9:05 に前日のBUYシグナルを元に発注（ライブモードのみ）"""
+        """9:05 に前日のBUY/SELLシグナルを元に発注（ライブモードのみ）"""
         if trading_conf.get("mode", "paper") != "live":
             return
         if not TradingScheduler.is_market_open():
@@ -152,16 +152,38 @@ def main() -> None:
         with get_session() as session:
             signals = session.scalars(
                 select(Signal)
-                .where(Signal.action == "BUY", Signal.generated_at >= cutoff)
+                .where(Signal.action.in_(["BUY", "SELL"]), Signal.generated_at >= cutoff)
                 .order_by(Signal.generated_at.desc())
             ).all()
             seen: set = set()
-            buy_signals = []
+            pending: list = []
             for s in signals:
                 if s.symbol not in seen:
                     seen.add(s.symbol)
-                    buy_signals.append(s)
+                    pending.append(s)
 
+        if not pending:
+            return
+
+        buy_signals = [s for s in pending if s.action == "BUY"]
+        sell_signals = [s for s in pending if s.action == "SELL"]
+
+        # ── SELL シグナル: 保有ポジションがあれば売る ─────────────
+        for sig in sell_signals:
+            try:
+                qty = _get_position_qty(sig.symbol)
+                if qty <= 0:
+                    continue
+                board = client.get_board(sig.symbol)
+                price = board.get("CurrentPrice") or board.get("Buy1", {}).get("Price", 0)
+                if not price:
+                    continue
+                order_mgr.sell(sig.symbol, float(price), qty)
+                logger.info(f"朝売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
+            except Exception as e:
+                logger.error(f"朝売り発注失敗: {sig.symbol} {e}")
+
+        # ── BUY シグナル: 余力を確認して買う ──────────────────────
         if not buy_signals:
             return
         try:
@@ -179,8 +201,9 @@ def main() -> None:
                 qty = risk.calc_position_size(sig.symbol, float(price), cash)
                 if qty > 0:
                     order_mgr.buy(sig.symbol, float(price), qty)
+                    logger.info(f"朝買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
             except Exception as e:
-                logger.error(f"朝発注失敗: {sig.symbol} {e}")
+                logger.error(f"朝買い発注失敗: {sig.symbol} {e}")
 
     set_ml_retrain_fn(ml_retrain)  # ダッシュボードから手動再学習できるよう登録
 
