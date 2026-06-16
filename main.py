@@ -26,7 +26,7 @@ from src.risk.manager import RiskManager
 from src.strategy import ml_model
 from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 from src.dashboard.app import (
-    app as dashboard_app, set_order_manager, set_ml_retrain_fn, update_status,
+    app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn, update_status,
 )
 
 
@@ -220,7 +220,8 @@ def main() -> None:
             except Exception as e:
                 logger.error(f"朝買い発注失敗: {sig.symbol} {e}")
 
-    set_ml_retrain_fn(ml_retrain)  # ダッシュボードから手動再学習できるよう登録
+    set_ml_retrain_fn(ml_retrain)
+    set_data_update_fn(data_update)
 
     scheduler.register("token_refresh", token_refresh)
     scheduler.register("data_update", data_update)
