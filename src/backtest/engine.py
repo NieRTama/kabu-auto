@@ -87,6 +87,8 @@ def run_backtest(
     rule_scores: list[float] = []
     ml_scores: list[float] = []
     combined_scores: list[float] = []
+    # 診断用: 単元未満で見送られたBUYシグナルを記録する（資金不足の検出用）
+    budget_blocked_prices: list[float] = []
 
     for dt in full_df.index[mask]:
         dt_date = dt.date()
@@ -161,6 +163,9 @@ def run_backtest(
                 pos_qty = qty
                 pos_avg_cost = close_price
                 pos_entry_date = dt_date
+            else:
+                # 1単元（100株）の購入に必要な額が資金配分上限を超えている
+                budget_blocked_prices.append(close_price)
 
         equity_curve.append({
             "date": dt_date.isoformat(),
@@ -181,6 +186,7 @@ def run_backtest(
     # ── スコア分布診断（取引が出ない原因を数値で特定する）──────────
     _log_score_diagnostics(symbol, rule_scores, ml_scores, combined_scores,
                            buy_thr, sell_thr)
+    _log_budget_diagnostics(symbol, budget_blocked_prices, initial_capital, max_pos_ratio)
 
     # ── パフォーマンス指標 ────────────────────────────────────────
     pnls = [t["pnl"] for t in sim_trades]
@@ -265,6 +271,31 @@ def _log_score_diagnostics(
         f"[診断] {symbol} 現在の閾値 BUY>={buy_thr} / SELL<={sell_thr} → "
         f"BUY={int((arr >= buy_thr).sum())}回 "
         f"SELL={int((arr <= sell_thr).sum())}回"
+    )
+
+
+def _log_budget_diagnostics(
+    symbol: str,
+    budget_blocked_prices: list,
+    initial_capital: float,
+    max_pos_ratio: float,
+) -> None:
+    """BUYシグナルが出たのに1単元（100株）すら買えず見送られた回数をログ出力する。
+
+    max_position_ratio による1銘柄あたりの予算が、東証の単元株制度（100株単位）の
+    最低購入額に届かない場合、シグナルが何回出ても永遠に取引数0になる。
+    閾値ではなく資金配分の設定が原因であることを区別できるようにする。
+    """
+    if not budget_blocked_prices:
+        return
+    budget = initial_capital * max_pos_ratio
+    min_price = min(budget_blocked_prices)
+    logger.warning(
+        f"[診断] {symbol}: BUYシグナルが{len(budget_blocked_prices)}回発生したが、"
+        f"1単元(100株)の購入に必要な額（最安値時で{min_price * 100:,.0f}円）が"
+        f"資金配分上限（{budget:,.0f}円 = 資金{initial_capital:,.0f}円 × "
+        f"max_position_ratio {max_pos_ratio:.0%}）を超えるため見送られた。"
+        f"このままでは{symbol}は約{min_price:,.0f}円/株以下に下がらない限り取引されない。"
     )
 
 
