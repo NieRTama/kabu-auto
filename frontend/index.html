@@ -273,10 +273,20 @@
   let pnlChart = null;
   let dailyPnlChart = null;
   let btChart = null;
+  let symbolNames = {};
 
   async function fetchJson(url) {
     const r = await fetch(API + url);
     return r.json();
+  }
+
+  function symLabel(code) {
+    const name = symbolNames[code];
+    return name ? `${code} ${name}` : code;
+  }
+
+  async function loadSymbolNames() {
+    symbolNames = await fetchJson('/api/symbol_names');
   }
 
   async function loadAll() {
@@ -434,7 +444,7 @@
   async function initBacktest() {
     const symbols = await fetchJson('/api/watchlist');
     const sel = document.getElementById('bt-symbol');
-    sel.innerHTML = symbols.map(s => `<option value="${s}">${s}</option>`).join('');
+    sel.innerHTML = symbols.map(s => `<option value="${s}">${symLabel(s)}</option>`).join('');
     await loadBtRuns();
   }
 
@@ -447,7 +457,7 @@
       const retColor = ret > 0 ? '#4ade80' : ret < 0 ? '#f87171' : '#e2e8f0';
       const period = `${r.start_date || ''} ~ ${r.end_date || ''}`;
       return `<tr style="cursor:pointer;" onclick="loadBtDetail(${r.id})">
-        <td><strong>${r.symbol}</strong></td>
+        <td><strong>${symLabel(r.symbol)}</strong></td>
         <td style="font-size:0.75rem;color:#64748b;">${period}</td>
         <td style="color:${retColor};font-weight:700;">${(ret * 100).toFixed(1)}%</td>
         <td style="color:#f87171;">${(r.max_drawdown * 100).toFixed(1)}%</td>
@@ -618,7 +628,7 @@
         : '-';
       const retColor = (p.return_pct || 0) > 0 ? '#4ade80' : (p.return_pct || 0) < 0 ? '#f87171' : '#e2e8f0';
       return `<tr>
-        <td><strong>${p.symbol}</strong></td>
+        <td><strong>${symLabel(p.symbol)}</strong></td>
         <td>${(p.quantity || 0).toLocaleString()}株</td>
         <td>¥${(p.avg_cost || 0).toLocaleString()}</td>
         <td>${p.latest_price != null ? '¥' + p.latest_price.toLocaleString() : '-'}</td>
@@ -636,7 +646,7 @@
     tbody.innerHTML = list.map(s => {
       const t = s.generated_at ? new Date(s.generated_at + 'Z').toLocaleTimeString('ja-JP') : '-';
       return `<tr>
-        <td><strong>${s.symbol}</strong></td>
+        <td><strong>${symLabel(s.symbol)}</strong></td>
         <td style="font-size:0.75rem;color:#64748b">${t}</td>
         <td>${(s.combined_score || 0).toFixed(2)}</td>
         <td><span class="tag ${s.action}">${s.action}</span></td>
@@ -664,7 +674,7 @@
         }
       }
       return `<tr>
-        <td><strong>${t.symbol}</strong></td>
+        <td><strong>${symLabel(t.symbol)}</strong></td>
         <td><span class="tag ${t.side}">${t.side}</span></td>
         <td>${(t.quantity || 0).toLocaleString()}株</td>
         <td>¥${(t.price || 0).toLocaleString()}</td>
@@ -753,10 +763,12 @@
     }
   }
 
-  loadAll();
+  loadSymbolNames().then(() => {
+    loadAll();
+    initBacktest();
+  });
   loadModelMetrics();
   loadDailyPnlChart();
-  initBacktest();
   setInterval(loadAll, 10000);
   setInterval(loadModelMetrics, 60000);
   setInterval(loadDailyPnlChart, 60000);

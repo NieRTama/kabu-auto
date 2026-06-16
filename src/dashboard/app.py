@@ -421,6 +421,12 @@ async def get_watchlist():
     return cfg.get_section("trading").get("watchlist", [])
 
 
+@app.get("/api/symbol_names")
+async def get_symbol_names():
+    """config.yaml の銘柄コード→会社名マッピングを返す（ダッシュボード表示用）"""
+    return cfg.get_section("trading").get("symbol_names", {})
+
+
 @app.post("/api/backtest/run")
 async def start_backtest(req: BacktestRequest):
     """バックテストを実行してrun_idを返す（数秒〜十数秒かかる）"""
