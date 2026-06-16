@@ -11,6 +11,7 @@ trading:
   max_sector_ratio: 0.40  # 同一セクター最大集中率
   order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
   daily_order_limit: 100  # 1日の最大注文数
+  max_daily_loss: 30000  # 当日損失上限（円）。0 で無効
   watchlist:
     # 金融
     - "8306"   # 三菱UFJフィナンシャル
@@ -51,9 +52,9 @@ data:
   history_years: 3  # 取得する過去データ年数
 
 dashboard:
-  host: "0.0.0.0"
+  host: "127.0.0.1"  # LAN内からアクセスする場合は "0.0.0.0" に変更
   port: 8080
-  emergency_token: ""  # 空の場合は起動時にランダム生成してログに表示
+  emergency_token: ""  # 空の場合は起動時にランダム生成してログに記録
 
 alerts:
   line_notify_token: ""  # LINE Notify トークン（任意）

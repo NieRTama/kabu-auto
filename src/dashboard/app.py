@@ -54,7 +54,11 @@ def set_order_manager(om) -> None:
     _order_manager = om
     conf_token = cfg.get_section("dashboard").get("emergency_token", "")
     _emergency_token = conf_token if conf_token else secrets.token_urlsafe(16)
-    logger.info(f"緊急決済トークン (X-Emergency-Token ヘッダーに設定): {_emergency_token}")
+    log_path = cfg.get_section("logging").get("file", "data/kabu_auto.log")
+    logger.warning(
+        f"緊急決済トークン: {_emergency_token}  "
+        f"← X-Emergency-Token ヘッダーに使用。ログファイル({log_path})へのアクセスを制限してください"
+    )
 
 
 async def _verify_emergency_token(x_emergency_token: str = Header(...)) -> None:

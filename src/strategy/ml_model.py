@@ -25,7 +25,8 @@ from src.strategy.labeling import build_training_set
 MODEL_PATH = Path("models/lgb_model.pkl")
 
 
-def train(df: pd.DataFrame, trigger: Optional[str] = None) -> lgb.LGBMClassifier:
+def train(df: pd.DataFrame, trigger: Optional[str] = None,
+          save: bool = True) -> lgb.LGBMClassifier:
     """トリプルバリアラベル＋サンプル重みでLightGBMを学習し保存する。
 
     trigger が指定された場合（"weekly_schedule" / "manual"）、
@@ -65,9 +66,10 @@ def train(df: pd.DataFrame, trigger: Optional[str] = None) -> lgb.LGBMClassifier
     model.fit(X, y, sample_weight=weights)
     logger.info("MLモデル学習完了（全データ・トリプルバリア法）")
 
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(model, f)
+    if save:
+        MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(model, f)
 
     if trigger is not None:
         _save_metrics(
