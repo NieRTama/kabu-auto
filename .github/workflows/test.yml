@@ -20,7 +20,9 @@ jobs:
       - name: Install dependencies
         # pandas-ta==0.3.14b0 は PyPI で Python 3.11 向けに未配布のため除外する。
         # テスト環境では conftest.py がスタブを注入するため不要。
-        run: grep -v '^pandas-ta' requirements.txt | pip install -r /dev/stdin
+        run: |
+          grep -v '^pandas-ta' requirements.txt | pip install -r /dev/stdin
+          pip install pytest
 
       - name: Run tests
         run: pytest tests/ -v --tb=short
