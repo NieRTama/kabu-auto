@@ -53,7 +53,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["macd"], df["macd_hist"], df["macd_signal"] = _macd(df["close"])
 
-    df["returns"] = df["close"].pct_change()
+    df["returns"] = df["close"].pct_change(fill_method=None)
     df["volume_ma20"] = _sma(df["volume"].astype(float), 20)
     df["volume_ratio"] = df["volume"] / df["volume_ma20"]
 
@@ -77,8 +77,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ma_cross_ml"] = df[f"ma{mid}"] - df[f"ma{long_}"]
     bb_width = (df["bb_upper"] - df["bb_lower"]).clip(lower=1e-4)
     df["bb_pct"] = (df["close"] - df["bb_lower"]) / bb_width
-    df["price_momentum_5"] = df["close"].pct_change(5)
-    df["price_momentum_20"] = df["close"].pct_change(20)
+    df["price_momentum_5"] = df["close"].pct_change(5, fill_method=None)
+    df["price_momentum_20"] = df["close"].pct_change(20, fill_method=None)
 
     return df.dropna(subset=FEATURE_COLS)
 
