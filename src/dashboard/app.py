@@ -13,6 +13,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,7 +24,7 @@ from sqlalchemy import func, select
 
 from src.core import config as cfg
 from src.data.database import (
-    BacktestRun, BacktestTradeRecord, ModelMetrics, Position, Signal, Trade, get_session,
+    BacktestRun, BacktestTradeRecord, ModelMetrics, OHLCV, Position, Signal, Trade, get_session,
 )
 
 app = FastAPI(title="kabu-auto Dashboard")
@@ -69,6 +71,33 @@ def update_status(running: bool, ws_connected: bool, mode: str) -> None:
     })
 
 
+def _compute_max_drawdown(cumulative_values: list) -> float:
+    """累積損益リストから最大ドローダウン率を返す（負の値、例: -0.12 = -12%）"""
+    if len(cumulative_values) < 2:
+        return 0.0
+    peak = cumulative_values[0]
+    max_dd = 0.0
+    for v in cumulative_values:
+        if v > peak:
+            peak = v
+        if peak > 0:
+            dd = (v - peak) / peak
+            if dd < max_dd:
+                max_dd = dd
+    return round(max_dd, 4)
+
+
+def _compute_sharpe(daily_pnl: list) -> float:
+    """日次損益リストから年率換算シャープレシオを返す"""
+    if len(daily_pnl) < 2:
+        return 0.0
+    arr = np.array(daily_pnl, dtype=float)
+    std = float(arr.std())
+    if std == 0:
+        return 0.0
+    return round(float(arr.mean() / std * (252 ** 0.5)), 2)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     index = FRONTEND_DIR / "index.html"
@@ -88,16 +117,31 @@ async def get_positions():
         positions = session.scalars(
             select(Position).where(Position.quantity > 0)
         ).all()
-    return [
-        {
-            "symbol": p.symbol,
-            "quantity": p.quantity,
-            "avg_cost": p.avg_cost,
-            "sector": p.sector,
-            "opened_at": p.opened_at.isoformat() if p.opened_at else None,
-        }
-        for p in positions
-    ]
+        result = []
+        for p in positions:
+            latest = session.scalar(
+                select(OHLCV).where(OHLCV.symbol == p.symbol).order_by(OHLCV.date.desc())
+            )
+            latest_price = latest.close if latest else None
+            unrealized_pnl = (
+                round((latest_price - p.avg_cost) * p.quantity, 0)
+                if latest_price and p.avg_cost else None
+            )
+            return_pct = (
+                round((latest_price - p.avg_cost) / p.avg_cost, 4)
+                if latest_price and p.avg_cost else None
+            )
+            result.append({
+                "symbol": p.symbol,
+                "quantity": p.quantity,
+                "avg_cost": p.avg_cost,
+                "sector": p.sector,
+                "opened_at": p.opened_at.isoformat() if p.opened_at else None,
+                "latest_price": latest_price,
+                "unrealized_pnl": unrealized_pnl,
+                "return_pct": return_pct,
+            })
+    return result
 
 
 @app.get("/api/trades")
@@ -177,6 +221,92 @@ async def get_pnl_chart():
             "pnl": round(cumulative, 0),
         })
     return data
+
+
+@app.get("/api/pnl/daily")
+async def get_pnl_daily(days: int = 90):
+    """日次損益（棒グラフ用）と累積損益を返す"""
+    with get_session() as session:
+        trades = session.scalars(
+            select(Trade).where(Trade.pnl.isnot(None), Trade.filled_at.isnot(None))
+            .order_by(Trade.filled_at)
+        ).all()
+
+    daily: dict = {}
+    for t in trades:
+        date_str = t.filled_at.strftime("%Y-%m-%d")
+        daily[date_str] = daily.get(date_str, 0.0) + (t.pnl or 0.0)
+
+    sorted_dates = sorted(daily.keys())
+    if len(sorted_dates) > days:
+        sorted_dates = sorted_dates[-days:]
+
+    cumulative = 0.0
+    result = []
+    for d in sorted_dates:
+        daily_pnl = round(daily[d], 0)
+        cumulative += daily_pnl
+        result.append({"date": d, "daily_pnl": daily_pnl, "cumulative_pnl": round(cumulative, 0)})
+    return result
+
+
+@app.get("/api/pnl/enhanced_summary")
+async def get_pnl_enhanced_summary():
+    """今日/MTD/YTD/シャープレシオ/最大ドローダウン/含み損益合計を返す"""
+    today = datetime.utcnow().date()
+    month_start = today.replace(day=1)
+    year_start = today.replace(month=1, day=1)
+
+    with get_session() as session:
+        trades = session.scalars(
+            select(Trade).where(Trade.pnl.isnot(None), Trade.filled_at.isnot(None))
+            .order_by(Trade.filled_at)
+        ).all()
+        positions = session.scalars(select(Position).where(Position.quantity > 0)).all()
+        total_unrealized = 0.0
+        for p in positions:
+            latest = session.scalar(
+                select(OHLCV).where(OHLCV.symbol == p.symbol).order_by(OHLCV.date.desc())
+            )
+            if latest and latest.close and p.avg_cost:
+                total_unrealized += (latest.close - p.avg_cost) * p.quantity
+
+    daily: dict = {}
+    for t in trades:
+        d = t.filled_at.strftime("%Y-%m-%d")
+        daily[d] = daily.get(d, 0.0) + (t.pnl or 0.0)
+
+    total_pnl = sum(daily.values())
+    today_pnl = daily.get(today.isoformat(), 0.0)
+    mtd_pnl = sum(v for k, v in daily.items() if k >= month_start.isoformat())
+    ytd_pnl = sum(v for k, v in daily.items() if k >= year_start.isoformat())
+
+    win_count = sum(1 for t in trades if (t.pnl or 0) > 0)
+    loss_count = sum(1 for t in trades if (t.pnl or 0) < 0)
+    total = win_count + loss_count
+
+    sorted_dates = sorted(daily.keys())
+    cumulative_values: list = []
+    daily_pnl_list: list = []
+    cum = 0.0
+    for d in sorted_dates:
+        pnl = daily[d]
+        cum += pnl
+        cumulative_values.append(cum)
+        daily_pnl_list.append(pnl)
+
+    return {
+        "total_pnl": round(total_pnl, 0),
+        "today_pnl": round(today_pnl, 0),
+        "mtd_pnl": round(mtd_pnl, 0),
+        "ytd_pnl": round(ytd_pnl, 0),
+        "total_unrealized_pnl": round(total_unrealized, 0),
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "win_rate": round(win_count / total, 3) if total > 0 else 0.0,
+        "max_drawdown": _compute_max_drawdown(cumulative_values),
+        "sharpe_ratio": _compute_sharpe(daily_pnl_list),
+    }
 
 
 @app.post("/api/emergency_close")
