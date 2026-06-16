@@ -83,6 +83,10 @@ def run_backtest(
     pos_entry_date: Optional[date] = None
     sim_trades = []
     equity_curve = []
+    # 診断用: 各日の生スコアを記録してあとで分布をログ出力する
+    rule_scores: list[float] = []
+    ml_scores: list[float] = []
+    combined_scores: list[float] = []
 
     for dt in full_df.index[mask]:
         dt_date = dt.date()
@@ -134,6 +138,9 @@ def run_backtest(
                 pass
 
         combined = r_score * effective_rule_weight + ml_s * effective_ml_weight
+        rule_scores.append(r_score)
+        ml_scores.append(ml_s)
+        combined_scores.append(combined)
 
         # ── 売り判定 ──────────────────────────────────────────────
         if combined <= sell_thr and pos_qty > 0:
@@ -170,6 +177,10 @@ def run_backtest(
             symbol, pos_entry_date, pos_avg_cost,
             last_idx.date(), last_close, pos_qty, pnl, "END_OF_PERIOD",
         ))
+
+    # ── スコア分布診断（取引が出ない原因を数値で特定する）──────────
+    _log_score_diagnostics(symbol, rule_scores, ml_scores, combined_scores,
+                           buy_thr, sell_thr)
 
     # ── パフォーマンス指標 ────────────────────────────────────────
     pnls = [t["pnl"] for t in sim_trades]
@@ -208,6 +219,53 @@ def run_backtest(
         f"シャープ={sharpe:.2f} 取引数={len(sim_trades)}"
     )
     return run_id
+
+
+def _log_score_diagnostics(
+    symbol: str,
+    rule_scores: list,
+    ml_scores: list,
+    combined_scores: list,
+    buy_thr: float,
+    sell_thr: float,
+) -> None:
+    """各日の合成スコア分布をログ出力し、取引が出ない原因を数値で示す。
+
+    どの閾値なら何回シグナルが出るかを表で示すことで、
+    勘ではなく実データに基づいて閾値を決められるようにする。
+    """
+    if not combined_scores:
+        logger.warning(f"[診断] {symbol}: スコア計算対象日が0件（データ不足）")
+        return
+
+    arr = np.array(combined_scores)
+    rule_arr = np.array(rule_scores)
+    ml_arr = np.array(ml_scores)
+    n = len(arr)
+
+    logger.info(
+        f"[診断] {symbol} スコア分布（{n}日）: "
+        f"合成 min={arr.min():.3f} max={arr.max():.3f} "
+        f"平均={arr.mean():.3f} 標準偏差={arr.std():.3f}"
+    )
+    logger.info(
+        f"[診断] {symbol} 内訳: "
+        f"ルール[min={rule_arr.min():.2f} max={rule_arr.max():.2f}] "
+        f"ML[min={ml_arr.min():.2f} max={ml_arr.max():.2f}]"
+    )
+
+    # 候補閾値ごとに BUY/SELL シグナル発生回数を集計
+    parts = []
+    for thr in (0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6):
+        buys = int((arr >= thr).sum())
+        sells = int((arr <= -thr).sum())
+        parts.append(f"±{thr}: BUY={buys}/SELL={sells}")
+    logger.info(f"[診断] {symbol} 閾値別シグナル数 → " + " | ".join(parts))
+    logger.info(
+        f"[診断] {symbol} 現在の閾値 BUY>={buy_thr} / SELL<={sell_thr} → "
+        f"BUY={int((arr >= buy_thr).sum())}回 "
+        f"SELL={int((arr <= sell_thr).sum())}回"
+    )
 
 
 def _make_trade(
