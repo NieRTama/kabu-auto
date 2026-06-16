@@ -70,6 +70,18 @@ class Signal(Base):
     action = Column(String(10))  # "BUY", "SELL", "HOLD"
 
 
+class ModelMetrics(Base):
+    __tablename__ = "model_metrics"
+    id = Column(Integer, primary_key=True)
+    trained_at = Column(DateTime)
+    cv_mean_accuracy = Column(Float)
+    cv_std_accuracy = Column(Float)
+    n_samples = Column(Integer)
+    n_estimators = Column(Integer)
+    feature_importances_json = Column(Text)  # JSON: {"feature": importance_score}
+    trigger = Column(String(20), default="manual")  # "weekly_schedule" / "manual"
+
+
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
     id = Column(Integer, primary_key=True)

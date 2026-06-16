@@ -118,6 +118,49 @@
     </div>
   </div>
 
+  <!-- ─── MLモデル ──────────────────────────────────────────────── -->
+  <div class="card" style="margin-bottom:24px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h2>🤖 MLモデル</h2>
+      <button id="retrain-btn" onclick="retrainModel()"
+        style="background:#065f46;color:#6ee7b7;border:1px solid #059669;padding:6px 16px;border-radius:6px;font-size:0.85rem;font-weight:600;cursor:pointer;">
+        手動再学習
+      </button>
+    </div>
+    <div class="grid" id="ml-summary" style="margin-bottom:20px;">
+      <div class="card" style="padding:12px;">
+        <div class="label">最終学習日時</div>
+        <div id="ml-trained-at" class="value neutral" style="font-size:1rem;">未学習</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">CV精度（平均）</div>
+        <div id="ml-cv-mean" class="value neutral">—</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">CV精度（±std）</div>
+        <div id="ml-cv-std" class="value neutral">—</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">学習サンプル数</div>
+        <div id="ml-n-samples" class="value neutral">—</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">トリガー</div>
+        <div id="ml-trigger" class="value neutral">—</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+      <div>
+        <div class="label" style="margin-bottom:8px;">CV精度推移</div>
+        <canvas id="ml-accuracy-chart" style="max-height:220px;"></canvas>
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:8px;">特徴量重要度（最新モデル）</div>
+        <canvas id="ml-importance-chart" style="max-height:220px;"></canvas>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── バックテスト ───────────────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px;">
     <h2>📊 バックテスト</h2>
@@ -192,6 +235,149 @@
 
   async function loadAll() {
     await Promise.all([loadStatus(), loadPnlSummary(), loadPositions(), loadSignals(), loadTrades(), loadPnlChart()]);
+  }
+
+  // ── MLモデルメトリクス ────────────────────────────────────────────
+
+  let mlAccChart = null;
+  let mlImpChart = null;
+
+  async function loadModelMetrics() {
+    const [metrics, latest] = await Promise.all([
+      fetchJson('/api/model/metrics?limit=20'),
+      fetchJson('/api/model/latest'),
+    ]);
+
+    // サマリーカード
+    if (latest) {
+      const dt = latest.trained_at
+        ? new Date(latest.trained_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })
+        : '不明';
+      document.getElementById('ml-trained-at').textContent = dt;
+      const mean = latest.cv_mean_accuracy;
+      const meanEl = document.getElementById('ml-cv-mean');
+      meanEl.textContent = (mean * 100).toFixed(1) + '%';
+      meanEl.className = 'value ' + (mean >= 0.6 ? 'green' : mean >= 0.5 ? 'neutral' : 'red');
+      document.getElementById('ml-cv-std').textContent = '±' + (latest.cv_std_accuracy * 100).toFixed(1) + '%';
+      document.getElementById('ml-n-samples').textContent = (latest.n_samples || 0).toLocaleString() + '件';
+      const triggerLabel = { weekly_schedule: '週次自動', manual: '手動' };
+      document.getElementById('ml-trigger').textContent = triggerLabel[latest.trigger] || latest.trigger || '—';
+    }
+
+    // CV精度推移チャート（古→新の順）
+    const sorted = [...metrics].reverse();
+    const accLabels = sorted.map(r => r.trained_at
+      ? new Date(r.trained_at).toLocaleDateString('ja-JP', { month: 'numeric', day: 'numeric' })
+      : '');
+    const accMean = sorted.map(r => +(r.cv_mean_accuracy * 100).toFixed(2));
+    const accStdUp = sorted.map(r => +((r.cv_mean_accuracy + r.cv_std_accuracy) * 100).toFixed(2));
+    const accStdDn = sorted.map(r => +((r.cv_mean_accuracy - r.cv_std_accuracy) * 100).toFixed(2));
+
+    if (mlAccChart) mlAccChart.destroy();
+    const accCtx = document.getElementById('ml-accuracy-chart').getContext('2d');
+    mlAccChart = new Chart(accCtx, {
+      type: 'line',
+      data: {
+        labels: accLabels,
+        datasets: [
+          {
+            label: 'CV精度（%）',
+            data: accMean,
+            borderColor: '#34d399',
+            backgroundColor: 'rgba(52,211,153,0.15)',
+            fill: false, tension: 0.3, pointRadius: 4,
+          },
+          {
+            label: '上限(+std)',
+            data: accStdUp,
+            borderColor: 'rgba(52,211,153,0.3)',
+            borderDash: [4, 4],
+            pointRadius: 0, fill: false,
+          },
+          {
+            label: '下限(-std)',
+            data: accStdDn,
+            borderColor: 'rgba(52,211,153,0.3)',
+            borderDash: [4, 4],
+            pointRadius: 0,
+            fill: '-1',
+            backgroundColor: 'rgba(52,211,153,0.05)',
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#64748b', maxTicksLimit: 8 }, grid: { color: '#1e293b' } },
+          y: {
+            ticks: { color: '#64748b', callback: v => v + '%' },
+            grid: { color: '#334155' },
+            min: 40, max: 80,
+          },
+        },
+      },
+    });
+
+    // 特徴量重要度バーチャート（最新モデル）
+    if (latest && latest.feature_importances) {
+      const fi = latest.feature_importances;
+      const sorted_fi = Object.entries(fi).sort((a, b) => b[1] - a[1]);
+      const fiLabels = sorted_fi.map(([k]) => k);
+      const fiValues = sorted_fi.map(([, v]) => v);
+      const total = fiValues.reduce((s, v) => s + v, 0) || 1;
+      const fiPct = fiValues.map(v => +((v / total) * 100).toFixed(1));
+
+      if (mlImpChart) mlImpChart.destroy();
+      const impCtx = document.getElementById('ml-importance-chart').getContext('2d');
+      mlImpChart = new Chart(impCtx, {
+        type: 'bar',
+        data: {
+          labels: fiLabels,
+          datasets: [{
+            data: fiPct,
+            backgroundColor: 'rgba(56,189,248,0.7)',
+            borderColor: '#38bdf8',
+            borderWidth: 1,
+          }],
+        },
+        options: {
+          indexAxis: 'y',
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: {
+              ticks: { color: '#64748b', callback: v => v + '%' },
+              grid: { color: '#334155' },
+            },
+            y: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: '#1e293b' } },
+          },
+        },
+      });
+    }
+  }
+
+  async function retrainModel() {
+    if (!confirm('MLモデルを手動再学習します。数分かかることがあります。よろしいですか？')) return;
+    const btn = document.getElementById('retrain-btn');
+    btn.textContent = '再学習中...';
+    btn.disabled = true;
+    try {
+      const r = await fetch(API + '/api/model/retrain', { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json();
+        alert('エラー: ' + (err.detail || r.statusText));
+        return;
+      }
+      const d = await r.json();
+      alert(d.message || '完了しました');
+      await loadModelMetrics();
+    } catch(e) {
+      alert('エラー: ' + e.message);
+    } finally {
+      btn.textContent = '手動再学習';
+      btn.disabled = false;
+    }
   }
 
   // ── バックテスト ────────────────────────────────────────────────
@@ -446,8 +632,10 @@
   }
 
   loadAll();
+  loadModelMetrics();
   initBacktest();
-  setInterval(loadAll, 10000);  // 10秒ごとに自動更新
+  setInterval(loadAll, 10000);      // 10秒ごとに自動更新
+  setInterval(loadModelMetrics, 60000);  // 1分ごとにML状態を更新
 </script>
 </body>
 </html>

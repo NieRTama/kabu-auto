@@ -22,12 +22,13 @@ from sqlalchemy import func, select
 
 from src.core import config as cfg
 from src.data.database import (
-    BacktestRun, BacktestTradeRecord, Position, Signal, Trade, get_session,
+    BacktestRun, BacktestTradeRecord, ModelMetrics, Position, Signal, Trade, get_session,
 )
 
 app = FastAPI(title="kabu-auto Dashboard")
 
 _order_manager = None
+_ml_retrain_fn = None
 _emergency_token: Optional[str] = None
 _system_status = {
     "running": False,
@@ -39,6 +40,11 @@ _system_status = {
 FRONTEND_DIR = Path(__file__).parent.parent.parent / "frontend"
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+def set_ml_retrain_fn(fn) -> None:
+    global _ml_retrain_fn
+    _ml_retrain_fn = fn
 
 
 def set_order_manager(om) -> None:
@@ -184,6 +190,65 @@ async def emergency_close(_: None = Depends(_verify_emergency_token)):
         return {"status": "ok", "message": "全ポジション決済を開始しました"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── MLモデルメトリクス ───────────────────────────────────────────
+
+
+@app.get("/api/model/metrics")
+async def get_model_metrics(limit: int = 20):
+    """学習履歴（CV精度・サンプル数）を時系列で返す"""
+    with get_session() as session:
+        records = session.scalars(
+            select(ModelMetrics).order_by(ModelMetrics.id.desc()).limit(limit)
+        ).all()
+    return [
+        {
+            "id": r.id,
+            "trained_at": r.trained_at.isoformat() if r.trained_at else None,
+            "cv_mean_accuracy": r.cv_mean_accuracy,
+            "cv_std_accuracy": r.cv_std_accuracy,
+            "n_samples": r.n_samples,
+            "n_estimators": r.n_estimators,
+            "trigger": r.trigger,
+        }
+        for r in records
+    ]
+
+
+@app.get("/api/model/latest")
+async def get_model_latest():
+    """最新の学習結果（特徴量重要度含む）を返す"""
+    with get_session() as session:
+        record = session.scalar(
+            select(ModelMetrics).order_by(ModelMetrics.id.desc())
+        )
+    if record is None:
+        return None
+    fi = json.loads(record.feature_importances_json) if record.feature_importances_json else {}
+    return {
+        "id": record.id,
+        "trained_at": record.trained_at.isoformat() if record.trained_at else None,
+        "cv_mean_accuracy": record.cv_mean_accuracy,
+        "cv_std_accuracy": record.cv_std_accuracy,
+        "n_samples": record.n_samples,
+        "n_estimators": record.n_estimators,
+        "trigger": record.trigger,
+        "feature_importances": fi,
+    }
+
+
+@app.post("/api/model/retrain")
+async def retrain_model():
+    """MLモデルを手動再学習する（ウォッチリスト全銘柄のデータを使用）"""
+    if _ml_retrain_fn is None:
+        raise HTTPException(status_code=503, detail="再学習関数が設定されていません")
+    try:
+        await asyncio.to_thread(_ml_retrain_fn)
+    except Exception as e:
+        logger.error(f"手動再学習失敗: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", "message": "再学習が完了しました"}
 
 
 # ─── バックテスト ──────────────────────────────────────────────────

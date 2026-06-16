@@ -6,7 +6,9 @@
 ラベリングはトリプルバリア法（labeling.py）を用い、ラベル期間の重なりに対する
 サンプル一意性重みを付与してルックアヘッド・過学習を抑制する。
 """
+import json
 import pickle
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -23,8 +25,13 @@ from src.strategy.labeling import build_training_set
 MODEL_PATH = Path("models/lgb_model.pkl")
 
 
-def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
-    """トリプルバリアラベル＋サンプル重みでLightGBMを学習し保存する"""
+def train(df: pd.DataFrame, trigger: Optional[str] = None) -> lgb.LGBMClassifier:
+    """トリプルバリアラベル＋サンプル重みでLightGBMを学習し保存する。
+
+    trigger が指定された場合（"weekly_schedule" / "manual"）、
+    CV精度・特徴量重要度をDBに保存する。
+    バックテスト内での学習時は trigger=None で呼び出してDBに記録しない。
+    """
     X, y, weights = build_training_set(df)
     if len(X) < 100:
         raise ValueError(f"学習データが不足しています: {len(X)}件")
@@ -47,8 +54,10 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
         best_n_list.append(m.best_iteration_ or 200)
 
     best_n_estimators = int(np.mean(best_n_list))
+    cv_mean = float(np.mean(scores))
+    cv_std = float(np.std(scores))
 
-    logger.info(f"MLモデルCV精度: {np.mean(scores):.3f} (+/-{np.std(scores):.3f})")
+    logger.info(f"MLモデルCV精度: {cv_mean:.3f} (+/-{cv_std:.3f})")
 
     # CV後に全データで最終モデルを学習（サンプル重み込み）
     model = lgb.LGBMClassifier(n_estimators=best_n_estimators, learning_rate=0.05,
@@ -59,7 +68,37 @@ def train(df: pd.DataFrame) -> lgb.LGBMClassifier:
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(MODEL_PATH, "wb") as f:
         pickle.dump(model, f)
+
+    if trigger is not None:
+        _save_metrics(
+            cv_mean=cv_mean,
+            cv_std=cv_std,
+            n_samples=len(X),
+            n_estimators=best_n_estimators,
+            feature_importances=dict(zip(FEATURE_COLS, model.feature_importances_.tolist())),
+            trigger=trigger,
+        )
+
     return model
+
+
+def _save_metrics(
+    cv_mean: float, cv_std: float, n_samples: int,
+    n_estimators: int, feature_importances: dict, trigger: str,
+) -> None:
+    from src.data.database import ModelMetrics, get_session
+    with get_session() as session:
+        session.add(ModelMetrics(
+            trained_at=datetime.now(),
+            cv_mean_accuracy=round(cv_mean, 4),
+            cv_std_accuracy=round(cv_std, 4),
+            n_samples=n_samples,
+            n_estimators=n_estimators,
+            feature_importances_json=json.dumps(feature_importances),
+            trigger=trigger,
+        ))
+        session.commit()
+    logger.info(f"MLモデルメトリクス保存完了 (trigger={trigger})")
 
 
 def load() -> Optional[lgb.LGBMClassifier]:

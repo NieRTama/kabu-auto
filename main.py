@@ -22,7 +22,9 @@ from src.execution.order_manager import OrderManager
 from src.risk.manager import RiskManager
 from src.strategy import ml_model
 from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
-from src.dashboard.app import app as dashboard_app, set_order_manager, update_status
+from src.dashboard.app import (
+    app as dashboard_app, set_order_manager, set_ml_retrain_fn, update_status,
+)
 
 
 def main() -> None:
@@ -91,7 +93,7 @@ def main() -> None:
                 logger.error(f"データ読み込み失敗: {sym} {e}")
         if combined_df is not None and len(combined_df) >= 200:
             try:
-                model = ml_model.train(combined_df)
+                model = ml_model.train(combined_df, trigger="weekly_schedule")
             except Exception as e:
                 logger.error(f"再学習失敗: {e}")
 
@@ -125,6 +127,8 @@ def main() -> None:
                     logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
+
+    set_ml_retrain_fn(ml_retrain)  # ダッシュボードから手動再学習できるよう登録
 
     scheduler.register("token_refresh", token_refresh)
     scheduler.register("data_update", data_update)
