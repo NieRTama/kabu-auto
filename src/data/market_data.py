@@ -28,6 +28,8 @@ def fetch_ohlcv(symbol: str, start: date, end: date) -> pd.DataFrame:
     if df.empty:
         logger.warning(f"データ取得なし: {symbol} ({start} ~ {end})")
         return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     df.columns = [c.lower() for c in df.columns]
     df.index = pd.to_datetime(df.index).date
     df.index.name = "date"
