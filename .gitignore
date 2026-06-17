@@ -17,5 +17,8 @@ models/*.pkl
 .env
 .env.local
 
+# 旧形式ウォッチリスト（watchlists.json に移行済み。後方互換のため残置するが追跡しない）
+watchlist.json
+
 # OS
 .DS_Store

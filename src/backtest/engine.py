@@ -31,14 +31,21 @@ def run_backtest(
     end: date,
     initial_capital: float = 500_000.0,
     use_ml: bool = False,
+    buy_threshold: Optional[float] = None,
+    sell_threshold: Optional[float] = None,
 ) -> int:
-    """バックテストを実行してDBに保存し、run_id を返す"""
+    """バックテストを実行してDBに保存し、run_id を返す。
+
+    buy_threshold/sell_threshold を指定すると、アクティブなリスクプロファイル
+    （config の strategy.buy_threshold/sell_threshold）を上書きしてこの実行だけに適用する。
+    ライブ/ペーパー取引の設定には一切影響しない（探索的なバックテスト専用の上書き）。
+    """
     strat_conf = cfg.get_section("strategy")
     trade_conf = cfg.get_section("trading")
     stop_loss_pct = trade_conf.get("stop_loss_pct", -0.05)
     max_pos_ratio = trade_conf.get("max_position_ratio", 0.20)
-    buy_thr = strat_conf.get("buy_threshold", 0.6)
-    sell_thr = strat_conf.get("sell_threshold", -0.6)
+    buy_thr = buy_threshold if buy_threshold is not None else strat_conf.get("buy_threshold", 0.6)
+    sell_thr = sell_threshold if sell_threshold is not None else strat_conf.get("sell_threshold", -0.6)
     ml_weight = strat_conf.get("ml_weight", 0.5)
     rule_weight = strat_conf.get("rule_weight", 0.5)
 
@@ -211,6 +218,8 @@ def run_backtest(
             use_ml=1 if model is not None else 0,
             created_at=datetime.now(),
             equity_curve_json=json.dumps(equity_curve),
+            buy_threshold=buy_thr,
+            sell_threshold=sell_thr,
         )
         session.add(run)
         session.flush()

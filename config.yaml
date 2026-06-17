@@ -15,7 +15,7 @@ trading:
   paper_initial_capital: 500000  # ペーパーモードの初期資金（円）。発注サイズ算定の基準
   # ※ max_positions / max_position_ratio / stop_loss_pct / max_sector_ratio / max_daily_loss は
   #    アクティブな risk_profile（下記）の値で起動時・切替時に上書きされる。
-  # ウォッチリスト・銘柄名は watchlist.json で管理する（ダッシュボードのGUIから追加・削除可能）
+  # ウォッチリスト・銘柄名は watchlists.json で管理する（複数リスト対応。ダッシュボードのGUIから追加・削除・切替可能）
 
 # ─── リスクプロファイル ────────────────────────────────────────────────────
 # 日次の成績を見て「ハイリスク・ハイリターン」⇔「ローリスク・ローリターン」の

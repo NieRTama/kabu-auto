@@ -12,11 +12,12 @@ import secrets
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import numpy as np
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel
@@ -470,6 +471,100 @@ async def delete_watchlist_entry(code: str):
     return watchlist_store.remove(code)
 
 
+# ─── 複数ウォッチリストの管理（作成・切替・削除・改名） ──────────────────────
+
+
+@app.get("/api/watchlists")
+async def get_watchlists():
+    """全ウォッチリスト名とアクティブなリスト名を返す"""
+    return {"active": watchlist_store.get_active_list_name(), "names": watchlist_store.get_list_names()}
+
+
+class WatchlistNameRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/watchlists")
+async def create_watchlist(req: WatchlistNameRequest):
+    """新規の空ウォッチリストを作成し、アクティブに切り替える"""
+    try:
+        names = watchlist_store.create_list(req.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"active": watchlist_store.get_active_list_name(), "names": names}
+
+
+@app.delete("/api/watchlists/{name}")
+async def delete_watchlist(name: str):
+    """ウォッチリストを削除する（最後の1つは削除不可。アクティブリストの場合は自動切替）"""
+    try:
+        return watchlist_store.delete_list(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/watchlists/active")
+async def set_active_watchlist(req: WatchlistNameRequest):
+    """アクティブなウォッチリストを切り替える（次回のジョブ実行から反映される）"""
+    try:
+        watchlist_store.switch_active(req.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"active": req.name}
+
+
+class WatchlistRenameRequest(BaseModel):
+    new_name: str
+
+
+@app.put("/api/watchlists/{name}")
+async def rename_watchlist(name: str, req: WatchlistRenameRequest):
+    """ウォッチリスト名を変更する"""
+    try:
+        new_name = watchlist_store.rename_list(name, req.new_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"active": watchlist_store.get_active_list_name(), "names": watchlist_store.get_list_names(), "renamed_to": new_name}
+
+
+# ─── ウォッチリストの外部出力（エクスポート）・取込（インポート） ────────────
+
+
+@app.get("/api/watchlist/export")
+async def export_watchlist(name: Optional[str] = None):
+    """指定リスト（省略時はアクティブリスト）をJSONファイルとしてダウンロードする"""
+    try:
+        data = watchlist_store.export_list(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    filename = f"watchlist_{data['name']}.json".replace("/", "_")
+    # HTTPヘッダーはLatin-1必須のため、日本語等のリスト名は RFC 6266 の
+    # filename*=UTF-8'' percent-encoding で渡す（ASCII filename はフォールバック用）
+    encoded = quote(filename)
+    return JSONResponse(
+        content=data,
+        headers={
+            "Content-Disposition": f"attachment; filename=\"watchlist_export.json\"; filename*=UTF-8''{encoded}"
+        },
+    )
+
+
+class WatchlistImportRequest(BaseModel):
+    name: str
+    entries: list[dict]
+    overwrite: bool = False
+
+
+@app.post("/api/watchlist/import")
+async def import_watchlist(req: WatchlistImportRequest):
+    """エクスポートされたJSON（{"name", "entries"}）からウォッチリストを取込み、アクティブに切り替える"""
+    try:
+        names = watchlist_store.import_list(req.name, req.entries, overwrite=req.overwrite)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"active": watchlist_store.get_active_list_name(), "names": names}
+
+
 @app.get("/api/symbol_names")
 async def get_symbol_names():
     """銘柄コード→会社名マッピングを返す（ダッシュボード表示用）"""
@@ -494,6 +589,15 @@ class BacktestRequest(BaseModel):
     end: str          # "YYYY-MM-DD"
     initial_capital: float = 500_000.0
     use_ml: bool = False
+    buy_threshold: Optional[float] = None   # 省略時はアクティブなリスクプロファイルの値を使用
+    sell_threshold: Optional[float] = None  # ライブ/ペーパー取引の設定には影響しない（この実行のみ）
+
+
+@app.get("/api/backtest/default_thresholds")
+async def get_backtest_default_thresholds():
+    """現在アクティブな買い/売り閾値（バックテストのデフォルト値表示用）を返す"""
+    strat = cfg.get_section("strategy")
+    return {"buy_threshold": strat.get("buy_threshold", 0.6), "sell_threshold": strat.get("sell_threshold", -0.6)}
 
 
 @app.post("/api/backtest/run")
@@ -509,7 +613,8 @@ async def start_backtest(req: BacktestRequest):
         raise HTTPException(status_code=400, detail="開始日は終了日より前にしてください")
     try:
         run_id = await asyncio.to_thread(
-            run_backtest, req.symbol, start_d, end_d, req.initial_capital, req.use_ml
+            run_backtest, req.symbol, start_d, end_d, req.initial_capital, req.use_ml,
+            req.buy_threshold, req.sell_threshold,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -540,6 +645,8 @@ async def get_backtest_runs(limit: int = 20):
             "win_rate": r.win_rate,
             "trade_count": r.trade_count,
             "use_ml": bool(r.use_ml),
+            "buy_threshold": r.buy_threshold,
+            "sell_threshold": r.sell_threshold,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in runs
@@ -574,6 +681,8 @@ async def get_backtest_detail(run_id: int):
             "win_rate": run.win_rate,
             "trade_count": run.trade_count,
             "use_ml": bool(run.use_ml),
+            "buy_threshold": run.buy_threshold,
+            "sell_threshold": run.sell_threshold,
         },
         "equity_curve": equity_curve,
         "trades": [

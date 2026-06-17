@@ -38,7 +38,7 @@ from src.dashboard.app import (
 def main() -> None:
     load_dotenv()  # .env の KABU_API_PASSWORD などを読み込む（任意・存在しなければ無視）
     cfg.load("config.yaml")
-    watchlist_store.load("watchlist.json")
+    watchlist_store.load("watchlists.json")  # 旧 watchlist.json があれば自動移行される
     risk_profile_store.load("risk_profile.json")  # アクティブなリスクプロファイルを config に適用
     log_setup.setup()
     db.init()

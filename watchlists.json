@@ -1,0 +1,156 @@
+{
+  "active": "小額リスト",
+  "lists": {
+    "メイン": [
+      {
+        "code": "8306",
+        "name": "三菱UFJフィナンシャル・グループ",
+        "sector": "Financial Services"
+      },
+      {
+        "code": "8316",
+        "name": "三井住友フィナンシャルグループ",
+        "sector": "Financial Services"
+      },
+      {
+        "code": "7203",
+        "name": "トヨタ自動車",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7267",
+        "name": "ホンダ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9432",
+        "name": "NTT",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9433",
+        "name": "KDDI",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9984",
+        "name": "ソフトバンクグループ",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "6702",
+        "name": "富士通",
+        "sector": "Technology"
+      },
+      {
+        "code": "6758",
+        "name": "ソニーグループ",
+        "sector": "Technology"
+      },
+      {
+        "code": "8058",
+        "name": "三菱商事",
+        "sector": "Industrials"
+      },
+      {
+        "code": "3489",
+        "name": "FaithNetwork Co.,Ltd",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "4755",
+        "name": "Rakuten Group, Inc.",
+        "sector": "Consumer Cyclical"
+      }
+    ],
+    "小額リスト": [
+      {
+        "code": "9434",
+        "name": "SoftBank Corp.",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9432",
+        "name": "NTT, Inc.",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "4755",
+        "name": "Rakuten Group, Inc.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7813",
+        "name": "Platz Co., Ltd.",
+        "sector": "Healthcare"
+      },
+      {
+        "code": "7532",
+        "name": "Pan Pacific International Holdings Corporation",
+        "sector": "Consumer Defensive"
+      }
+    ],
+    "テスト用": [
+      {
+        "code": "8306",
+        "name": "三菱UFJフィナンシャル・グループ",
+        "sector": "Financial Services"
+      },
+      {
+        "code": "8316",
+        "name": "三井住友フィナンシャルグループ",
+        "sector": "Financial Services"
+      },
+      {
+        "code": "7203",
+        "name": "トヨタ自動車",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7267",
+        "name": "ホンダ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9432",
+        "name": "NTT",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9433",
+        "name": "KDDI",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9984",
+        "name": "ソフトバンクグループ",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "6702",
+        "name": "富士通",
+        "sector": "Technology"
+      },
+      {
+        "code": "6758",
+        "name": "ソニーグループ",
+        "sector": "Technology"
+      },
+      {
+        "code": "8058",
+        "name": "三菱商事",
+        "sector": "Industrials"
+      },
+      {
+        "code": "3489",
+        "name": "FaithNetwork Co.,Ltd",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "4755",
+        "name": "Rakuten Group, Inc.",
+        "sector": "Consumer Cyclical"
+      }
+    ]
+  }
+}

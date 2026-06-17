@@ -101,6 +101,8 @@ class BacktestRun(Base):
     use_ml = Column(Integer, default=0)
     created_at = Column(DateTime)
     equity_curve_json = Column(Text)  # JSON: [{"date": "YYYY-MM-DD", "equity": float}]
+    buy_threshold = Column(Float)   # この実行で実際に使われた買い閾値（探索的に上書きされた場合も記録）
+    sell_threshold = Column(Float)  # この実行で実際に使われた売り閾値
 
 
 class BacktestTradeRecord(Base):
@@ -136,8 +138,23 @@ def init() -> None:
         conn.commit()
 
     Base.metadata.create_all(_engine)
+    _migrate_add_missing_columns(_engine)
     _Session = sessionmaker(bind=_engine, expire_on_commit=False)
     logger.info(f"DB初期化完了: {db_path}")
+
+
+def _migrate_add_missing_columns(engine) -> None:
+    """create_all はテーブル新規作成のみ行うため、既存DBに後から追加したカラムを
+    SQLiteの ALTER TABLE ADD COLUMN で補う簡易マイグレーション。"""
+    with engine.connect() as conn:
+        for table in Base.metadata.tables.values():
+            existing = {row[1] for row in conn.execute(text(f'PRAGMA table_info("{table.name}")'))}
+            for col in table.columns:
+                if col.name not in existing:
+                    col_type = col.type.compile(engine.dialect)
+                    conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col_type}'))
+                    logger.info(f"DBマイグレーション: {table.name}.{col.name} ({col_type}) を追加")
+        conn.commit()
 
 
 @contextmanager

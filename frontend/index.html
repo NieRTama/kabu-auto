@@ -188,7 +188,34 @@
 
   <!-- ─── ウォッチリスト管理 ────────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px;">
-    <h2>🔖 ウォッチリスト管理</h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
+      <h2 style="margin-bottom:0;">🔖 ウォッチリスト管理</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <select id="wl-select" onchange="onWlSelectChange()"
+          style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;"></select>
+        <button onclick="createWatchlistList()" title="新規リストを作成"
+          style="background:#0c4a6e;color:#7dd3fc;border:1px solid #0369a1;padding:6px 10px;border-radius:6px;font-size:0.8rem;cursor:pointer;">＋新規</button>
+        <button onclick="renameWatchlistList()" title="リスト名を変更"
+          style="background:#374151;color:#d1d5db;border:1px solid #4b5563;padding:6px 10px;border-radius:6px;font-size:0.8rem;cursor:pointer;">改名</button>
+        <button onclick="deleteWatchlistList()" title="このリストを削除"
+          style="background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;padding:6px 10px;border-radius:6px;font-size:0.8rem;cursor:pointer;">削除</button>
+        <span style="border-left:1px solid #334155;height:20px;margin:0 2px;"></span>
+        <button onclick="exportWatchlistList()" title="このリストをJSONファイルで保存"
+          style="background:#065f46;color:#6ee7b7;border:1px solid #059669;padding:6px 10px;border-radius:6px;font-size:0.8rem;cursor:pointer;">⬇ 出力</button>
+        <button onclick="document.getElementById('wl-import-file').click()" title="JSONファイルからリストを取込"
+          style="background:#065f46;color:#6ee7b7;border:1px solid #059669;padding:6px 10px;border-radius:6px;font-size:0.8rem;cursor:pointer;">⬆ 取込</button>
+        <input id="wl-import-file" type="file" accept="application/json" style="display:none;" onchange="importWatchlistFile(event)">
+      </div>
+    </div>
+    <div id="wl-list-edit" style="display:none;gap:8px;align-items:center;margin-bottom:16px;">
+      <input id="wl-list-edit-input" type="text" placeholder="リスト名"
+        style="background:#0f172a;color:#e2e8f0;border:1px solid #38bdf8;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:200px;">
+      <button onclick="confirmWlListEdit()"
+        style="background:#065f46;color:#6ee7b7;border:1px solid #059669;padding:6px 14px;border-radius:6px;font-size:0.8rem;font-weight:600;cursor:pointer;">OK</button>
+      <button onclick="cancelWlListEdit()"
+        style="background:#374151;color:#d1d5db;border:1px solid #4b5563;padding:6px 14px;border-radius:6px;font-size:0.8rem;cursor:pointer;">キャンセル</button>
+      <span id="wl-list-edit-msg" style="font-size:0.8rem;color:#f87171;"></span>
+    </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;">
       <div>
         <div class="label" style="margin-bottom:4px;">銘柄コード</div>
@@ -291,14 +318,30 @@
         実行
       </button>
     </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;padding:10px 12px;background:#0f172a;border-radius:8px;border:1px dashed #334155;">
+      <div style="font-size:0.78rem;color:#94a3b8;align-self:center;">
+        閾値オーバーライド（この実行のみ。空欄なら現在のリスクプロファイルの値を使用）:
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:4px;">買い閾値</div>
+        <input id="bt-buy-thr" type="number" step="0.01" placeholder="例: 0.18"
+          style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:100px;">
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:4px;">売り閾値</div>
+        <input id="bt-sell-thr" type="number" step="0.01" placeholder="例: -0.18"
+          style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:100px;">
+      </div>
+      <span id="bt-thr-default" style="font-size:0.78rem;color:#64748b;"></span>
+    </div>
     <div style="margin-bottom:16px;">
       <div class="label" style="margin-bottom:8px;">実行履歴</div>
       <div style="overflow-x:auto;">
         <table style="font-size:0.8rem;">
           <thead>
-            <tr><th>銘柄</th><th>期間</th><th>リターン</th><th>MDD</th><th>シャープ</th><th>勝率</th><th>取引数</th><th>ML</th><th></th></tr>
+            <tr><th>銘柄</th><th>期間</th><th>リターン</th><th>MDD</th><th>シャープ</th><th>勝率</th><th>取引数</th><th>閾値</th><th>ML</th><th></th></tr>
           </thead>
-          <tbody id="bt-runs-tbody"><tr><td colspan="9" style="color:#64748b">なし</td></tr></tbody>
+          <tbody id="bt-runs-tbody"><tr><td colspan="10" style="color:#64748b">なし</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -616,6 +659,144 @@
     if (btn) removeWatchlistEntry(btn.dataset.code);
   });
 
+  // ── 複数ウォッチリストの管理（作成・切替・削除・改名・出力・取込） ──────
+
+  async function loadWatchlistSelector() {
+    const d = await fetchJson('/api/watchlists');
+    const sel = document.getElementById('wl-select');
+    sel.innerHTML = d.names.map(n =>
+      `<option value="${escapeHtml(n)}" ${n === d.active ? 'selected' : ''}>${escapeHtml(n)}</option>`
+    ).join('');
+  }
+
+  async function refreshWatchlistViews() {
+    await loadWatchlistSelector();
+    await loadWatchlistManager();
+    await loadSymbolNames();
+    await initBacktest();
+  }
+
+  async function onWlSelectChange() {
+    const name = document.getElementById('wl-select').value;
+    await fetch(API + '/api/watchlists/active', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    await refreshWatchlistViews();
+  }
+
+  // window.prompt() はWindows上でIME（日本語入力）と相性が悪く、入力が確定できない
+  // ことがあるため、リスト名の入力には常設のインライン入力欄を使う。
+  let wlListEditMode = null;   // 'create' | 'rename' | 'import'
+  let wlPendingImportEntries = null;
+
+  function _openWlListEdit(mode, prefillValue) {
+    wlListEditMode = mode;
+    document.getElementById('wl-list-edit-msg').textContent = '';
+    const input = document.getElementById('wl-list-edit-input');
+    input.value = prefillValue || '';
+    document.getElementById('wl-list-edit').style.display = 'flex';
+    input.focus();
+    input.select();
+  }
+
+  function cancelWlListEdit() {
+    wlListEditMode = null;
+    wlPendingImportEntries = null;
+    document.getElementById('wl-list-edit').style.display = 'none';
+  }
+
+  document.getElementById('wl-list-edit-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') confirmWlListEdit();
+    if (e.key === 'Escape') cancelWlListEdit();
+  });
+
+  async function confirmWlListEdit() {
+    const name = document.getElementById('wl-list-edit-input').value.trim();
+    const msg = document.getElementById('wl-list-edit-msg');
+    if (!name) { msg.textContent = 'リスト名を入力してください'; return; }
+    const mode = wlListEditMode;
+    const existingNames = Array.from(document.getElementById('wl-select').options).map(o => o.value);
+
+    try {
+      if (mode === 'create') {
+        const r = await fetch(API + '/api/watchlists', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        if (!r.ok) { const err = await r.json(); msg.textContent = 'エラー: ' + (err.detail || r.statusText); return; }
+      } else if (mode === 'rename') {
+        const current = document.getElementById('wl-select').value;
+        if (name === current) { cancelWlListEdit(); return; }
+        const r = await fetch(API + '/api/watchlists/' + encodeURIComponent(current), {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ new_name: name }),
+        });
+        if (!r.ok) { const err = await r.json(); msg.textContent = 'エラー: ' + (err.detail || r.statusText); return; }
+      } else if (mode === 'import') {
+        let overwrite = false;
+        if (existingNames.includes(name)) {
+          if (!confirm(`「${name}」は既に存在します。上書きしますか？`)) return;
+          overwrite = true;
+        }
+        const r = await fetch(API + '/api/watchlist/import', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, entries: wlPendingImportEntries, overwrite }),
+        });
+        if (!r.ok) { const err = await r.json(); msg.textContent = 'エラー: ' + (err.detail || r.statusText); return; }
+      }
+      cancelWlListEdit();
+      await refreshWatchlistViews();
+    } catch (e) {
+      msg.textContent = 'エラー: ' + e.message;
+    }
+  }
+
+  function createWatchlistList() {
+    _openWlListEdit('create', '');
+  }
+
+  function renameWatchlistList() {
+    const current = document.getElementById('wl-select').value;
+    _openWlListEdit('rename', current);
+  }
+
+  async function deleteWatchlistList() {
+    const current = document.getElementById('wl-select').value;
+    if (!confirm(`ウォッチリスト「${current}」を削除しますか？\nこの操作は取り消せません。`)) return;
+    const r = await fetch(API + '/api/watchlists/' + encodeURIComponent(current), { method: 'DELETE' });
+    if (!r.ok) { const err = await r.json(); alert('エラー: ' + (err.detail || r.statusText)); return; }
+    await refreshWatchlistViews();
+  }
+
+  function exportWatchlistList() {
+    const current = document.getElementById('wl-select').value;
+    // Content-Disposition: attachment が付くのでページ遷移せずダウンロードされる
+    window.location.href = API + '/api/watchlist/export?name=' + encodeURIComponent(current);
+  }
+
+  async function importWatchlistFile(event) {
+    const file = event.target.files[0];
+    event.target.value = '';  // 同じファイルを連続選択できるようにリセット
+    if (!file) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      alert('JSONの読み込みに失敗しました: ' + e.message);
+      return;
+    }
+    const entries = Array.isArray(parsed) ? parsed : parsed.entries;
+    const defaultName = Array.isArray(parsed) ? file.name.replace(/\.json$/i, '') : (parsed.name || '');
+    if (!Array.isArray(entries)) {
+      alert('対応していないファイル形式です（code/name/sectorを持つ配列が必要です）');
+      return;
+    }
+    wlPendingImportEntries = entries;
+    _openWlListEdit('import', defaultName);
+  }
+
   async function addWatchlistEntry() {
     const code = document.getElementById('wl-code').value.trim();
     const name = document.getElementById('wl-name').value.trim();
@@ -664,17 +845,26 @@
     const entries = await fetchJson('/api/watchlist');
     const sel = document.getElementById('bt-symbol');
     sel.innerHTML = entries.map(e => `<option value="${escapeHtml(e.code)}">${symLabel(e.code)}</option>`).join('');
+    await loadBtDefaultThresholds();
     await loadBtRuns();
+  }
+
+  async function loadBtDefaultThresholds() {
+    const d = await fetchJson('/api/backtest/default_thresholds');
+    document.getElementById('bt-thr-default').textContent =
+      `現在の値: 買い${d.buy_threshold} / 売り${d.sell_threshold}`;
   }
 
   async function loadBtRuns() {
     const runs = await fetchJson('/api/backtest/runs');
     const tbody = document.getElementById('bt-runs-tbody');
-    if (!runs.length) { tbody.innerHTML = '<tr><td colspan="9" style="color:#64748b">なし</td></tr>'; return; }
+    if (!runs.length) { tbody.innerHTML = '<tr><td colspan="10" style="color:#64748b">なし</td></tr>'; return; }
     tbody.innerHTML = runs.map(r => {
       const ret = r.total_return;
       const retColor = ret > 0 ? '#4ade80' : ret < 0 ? '#f87171' : '#e2e8f0';
       const period = `${r.start_date || ''} ~ ${r.end_date || ''}`;
+      const thr = (r.buy_threshold != null && r.sell_threshold != null)
+        ? `${r.buy_threshold} / ${r.sell_threshold}` : '-';
       return `<tr style="cursor:pointer;" onclick="loadBtDetail(${r.id})">
         <td><strong>${symLabel(r.symbol)}</strong></td>
         <td style="font-size:0.75rem;color:#64748b;">${period}</td>
@@ -683,6 +873,7 @@
         <td>${(r.sharpe_ratio || 0).toFixed(2)}</td>
         <td>${(r.win_rate * 100).toFixed(0)}%</td>
         <td>${r.trade_count}</td>
+        <td style="font-size:0.72rem;color:#94a3b8;">${thr}</td>
         <td>${r.use_ml ? '✓' : '-'}</td>
         <td style="color:#38bdf8;font-size:0.75rem;">詳細</td>
       </tr>`;
@@ -716,6 +907,10 @@
       <div class="card" style="padding:12px;">
         <div class="label">最終資産</div>
         <div class="value neutral">¥${(run.final_capital || 0).toLocaleString()}</div>
+      </div>
+      <div class="card" style="padding:12px;">
+        <div class="label">使用した閾値</div>
+        <div class="value neutral" style="font-size:1.1rem;">買い${run.buy_threshold ?? '-'} / 売り${run.sell_threshold ?? '-'}</div>
       </div>`;
 
     // エクイティカーブ
@@ -770,6 +965,8 @@
     const end = document.getElementById('bt-end').value;
     const capital = parseFloat(document.getElementById('bt-capital').value);
     const useML = document.getElementById('bt-use-ml').checked;
+    const buyThrRaw = document.getElementById('bt-buy-thr').value.trim();
+    const sellThrRaw = document.getElementById('bt-sell-thr').value.trim();
     if (!symbol || !start || !end) { alert('銘柄・期間を入力してください'); return; }
 
     const btn = document.getElementById('bt-run-btn');
@@ -779,7 +976,11 @@
       const r = await fetch(API + '/api/backtest/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, start, end, initial_capital: capital, use_ml: useML }),
+        body: JSON.stringify({
+          symbol, start, end, initial_capital: capital, use_ml: useML,
+          buy_threshold: buyThrRaw === '' ? null : parseFloat(buyThrRaw),
+          sell_threshold: sellThrRaw === '' ? null : parseFloat(sellThrRaw),
+        }),
       });
       if (!r.ok) {
         const err = await r.json();
@@ -987,6 +1188,7 @@
     loadAll();
     initBacktest();
     loadWatchlistManager();
+    loadWatchlistSelector();
   });
   loadRiskProfile();
   loadModelMetrics();
