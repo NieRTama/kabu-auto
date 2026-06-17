@@ -36,7 +36,7 @@ strategy:
 data:
   db_path: "data/kabu_auto.db"
   backup_dir: "data/backups"
-  history_years: 3  # 取得する過去データ年数
+  history_years: 7  # 取得する過去データ年数
 
 dashboard:
   host: "127.0.0.1"  # LAN内からアクセスする場合は "0.0.0.0" に変更
