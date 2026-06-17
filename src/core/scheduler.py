@@ -1,7 +1,10 @@
 """
 APSchedulerによるジョブスケジューラ
+- 毎朝8:25: 日次リスクカウンタリセット
 - 毎朝8:30: APIトークン更新
-- 毎日16:00: データ更新・バックアップ・ML再学習（週次）
+- 毎日16:00: データ更新
+- 毎日16:20: シグナルスキャン（data_updateの完了を待つため16:00より後ろに設定）
+- 毎日17:00: バックアップ・ML再学習（週次）
 - 土曜: メンテナンス時間帯の回避
 """
 from datetime import datetime
@@ -24,6 +27,12 @@ class TradingScheduler:
     def start(self) -> None:
         cb = self._registered_callbacks
 
+        if "risk_reset" in cb:
+            # 取引開始前に日次カウンタ（注文数・損失額）をリセットする
+            self._scheduler.add_job(
+                cb["risk_reset"], "cron",
+                day_of_week="mon-fri", hour=8, minute=25, id="risk_reset",
+            )
         if "token_refresh" in cb:
             self._scheduler.add_job(
                 cb["token_refresh"], "cron",
@@ -54,11 +63,13 @@ class TradingScheduler:
                 id="stop_loss_check",
             )
         if "signal_scan" in cb:
-            # 後場終了後 15:35 に翌日の銘柄スクリーニング
+            # 後場終了後、当日分のOHLCV更新（data_update 16:00）が完了してから
+            # 翌日の銘柄スクリーニングを行う。data_updateより前に動かすと前日終値で
+            # シグナルを生成してしまうため、必ず data_update より後の時刻にすること。
             self._scheduler.add_job(
                 cb["signal_scan"], "cron",
                 day_of_week="mon-fri",
-                hour=15, minute=35, id="signal_scan",
+                hour=16, minute=20, id="signal_scan",
             )
         if "morning_execution" in cb:
             # 9:05 に前日シグナルを元に発注（ライブモードのみ実行される）

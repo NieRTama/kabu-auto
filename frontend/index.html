@@ -122,6 +122,17 @@
     </div>
   </div>
 
+  <!-- ─── リスクプロファイル切替 ──────────────────────────────────── -->
+  <div class="card" style="margin-bottom:24px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <h2 style="margin-bottom:0;">⚖️ リスクプロファイル</h2>
+      <span style="font-size:0.8rem;color:#94a3b8;">日次の損益を見てリスクの取り方を切り替えられます</span>
+    </div>
+    <div id="risk-profile-buttons" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;"></div>
+    <div id="risk-profile-detail" style="font-size:0.8rem;color:#94a3b8;overflow-x:auto;"></div>
+    <span id="rp-msg" style="font-size:0.8rem;color:#f87171;"></span>
+  </div>
+
   <!-- ─── 損益グラフ ────────────────────────────────────────────── -->
   <div class="row">
     <div class="card">
@@ -320,9 +331,19 @@
     return r.json();
   }
 
+  // ウォッチリストの会社名・銘柄コードはユーザー入力（外部API取得値も含む）であり
+  // innerHTML への挿入前に必ずエスケープする（保存型XSS対策）
+  function escapeHtml(str) {
+    if (str == null) return '';
+    return String(str).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
   function symLabel(code) {
     const name = symbolNames[code];
-    return name ? `${code} ${name}` : code;
+    const label = name ? `${code} ${name}` : code;
+    return escapeHtml(label);
   }
 
   async function loadSymbolNames() {
@@ -335,6 +356,73 @@
       loadSignals(), loadTrades(), loadPnlChart(),
     ]);
   }
+
+  // ── リスクプロファイル ──────────────────────────────────────────────
+  const RP_META = {
+    conservative: { label: 'ローリスク', color: '#0ea5e9', desc: 'ローリスク・ローリターン' },
+    balanced:     { label: 'バランス',   color: '#22c55e', desc: '中庸' },
+    aggressive:   { label: 'ハイリスク', color: '#f97316', desc: 'ハイリスク・ハイリターン' },
+  };
+
+  async function loadRiskProfile() {
+    const d = await fetchJson('/api/risk_profile');
+    const wrap = document.getElementById('risk-profile-buttons');
+    const profiles = d.profiles || {};
+    const order = ['conservative', 'balanced', 'aggressive'];
+    const names = order.filter(n => n in profiles).concat(
+      Object.keys(profiles).filter(n => !order.includes(n)));
+    wrap.innerHTML = names.map(name => {
+      const meta = RP_META[name] || { label: name, color: '#64748b' };
+      const active = name === d.active;
+      return `<button class="rp-btn" data-name="${escapeHtml(name)}"
+        style="cursor:pointer;border-radius:8px;padding:8px 16px;font-size:0.85rem;font-weight:700;
+          border:2px solid ${meta.color};
+          background:${active ? meta.color : 'transparent'};
+          color:${active ? '#0f172a' : meta.color};">
+        ${escapeHtml(meta.label)}${active ? ' ●' : ''}
+      </button>`;
+    }).join('');
+
+    const active = profiles[d.active];
+    const detail = document.getElementById('risk-profile-detail');
+    if (active) {
+      const fmtPct = v => (v * 100).toFixed(0) + '%';
+      detail.innerHTML = `現在: <strong style="color:${(RP_META[d.active]||{}).color||'#e2e8f0'}">`
+        + `${escapeHtml((RP_META[d.active]||{}).desc || d.active)}</strong>　|　`
+        + `1銘柄上限 ${fmtPct(active.max_position_ratio)}　`
+        + `損切り ${fmtPct(active.stop_loss_pct)}　`
+        + `最大保有 ${active.max_positions}銘柄　`
+        + `当日損失上限 ¥${(active.max_daily_loss||0).toLocaleString()}　`
+        + `売買閾値 ±${active.buy_threshold}`;
+    } else {
+      detail.textContent = 'リスクプロファイル未設定（config の素の値で動作）';
+    }
+  }
+
+  document.getElementById('risk-profile-buttons').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.rp-btn');
+    if (!btn) return;
+    const name = btn.dataset.name;
+    const meta = RP_META[name] || { desc: name };
+    if (!confirm(`リスクプロファイルを「${meta.desc}」に切り替えます。\n発注サイズ・損切り幅・売買閾値に反映されます。よろしいですか？`)) return;
+    const msg = document.getElementById('rp-msg');
+    msg.textContent = '';
+    try {
+      const r = await fetch(API + '/api/risk_profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) {
+        const err = await r.json();
+        msg.textContent = 'エラー: ' + (err.detail || r.statusText);
+        return;
+      }
+      await loadRiskProfile();
+    } catch (err) {
+      msg.textContent = 'エラー: ' + err.message;
+    }
+  });
 
   // ── MLモデルメトリクス ────────────────────────────────────────────
 
@@ -514,13 +602,20 @@
     const entries = await fetchJson('/api/watchlist');
     const tbody = document.getElementById('watchlist-tbody');
     if (!entries.length) { tbody.innerHTML = '<tr><td colspan="3" style="color:#64748b">なし</td></tr>'; return; }
+    // 銘柄コードはonclickへの文字列埋め込みではなくdata属性経由で渡す
+    // （HTMLエスケープだけではonclick内のJS文字列リテラル脱出を防げないため）
     tbody.innerHTML = entries.map(e => `<tr>
-        <td><strong>${e.code}</strong></td>
-        <td>${e.name || ''}</td>
-        <td><button onclick="removeWatchlistEntry('${e.code}')"
+        <td><strong>${escapeHtml(e.code)}</strong></td>
+        <td>${escapeHtml(e.name || '')}</td>
+        <td><button class="wl-remove-btn" data-code="${escapeHtml(e.code)}"
           style="background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;padding:4px 10px;border-radius:6px;font-size:0.75rem;cursor:pointer;">削除</button></td>
       </tr>`).join('');
   }
+
+  document.getElementById('watchlist-tbody').addEventListener('click', (e) => {
+    const btn = e.target.closest('.wl-remove-btn');
+    if (btn) removeWatchlistEntry(btn.dataset.code);
+  });
 
   async function addWatchlistEntry() {
     const code = document.getElementById('wl-code').value.trim();
@@ -569,7 +664,7 @@
   async function initBacktest() {
     const entries = await fetchJson('/api/watchlist');
     const sel = document.getElementById('bt-symbol');
-    sel.innerHTML = entries.map(e => `<option value="${e.code}">${symLabel(e.code)}</option>`).join('');
+    sel.innerHTML = entries.map(e => `<option value="${escapeHtml(e.code)}">${symLabel(e.code)}</option>`).join('');
     await loadBtRuns();
   }
 
@@ -759,7 +854,7 @@
         <td>${p.latest_price != null ? '¥' + p.latest_price.toLocaleString() : '-'}</td>
         <td style="color:${urColor};font-weight:600;">${urPnl != null ? (urPnl >= 0 ? '+¥' : '¥') + urPnl.toLocaleString() : '-'}</td>
         <td style="color:${retColor};font-weight:600;">${retPct}</td>
-        <td>${p.sector || '-'}</td>
+        <td>${escapeHtml(p.sector || '-')}</td>
       </tr>`;
     }).join('');
   }
@@ -769,7 +864,8 @@
     const tbody = document.getElementById('signals-tbody');
     if (!list.length) { tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">なし</td></tr>'; return; }
     tbody.innerHTML = list.map(s => {
-      const t = s.generated_at ? new Date(s.generated_at + 'Z').toLocaleTimeString('ja-JP') : '-';
+      // generated_at は JST naive（末尾Zを付けない＝ローカル=JSTとして解釈する）
+      const t = s.generated_at ? new Date(s.generated_at).toLocaleTimeString('ja-JP') : '-';
       return `<tr>
         <td><strong>${symLabel(s.symbol)}</strong></td>
         <td style="font-size:0.75rem;color:#64748b">${t}</td>
@@ -893,9 +989,11 @@
     initBacktest();
     loadWatchlistManager();
   });
+  loadRiskProfile();
   loadModelMetrics();
   loadDailyPnlChart();
   setInterval(loadAll, 10000);
+  setInterval(loadRiskProfile, 30000);
   setInterval(loadModelMetrics, 60000);
   setInterval(loadDailyPnlChart, 60000);
 </script>

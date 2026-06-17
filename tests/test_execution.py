@@ -128,7 +128,71 @@ class TestCanPlaceOrderTuple:
         falsy_tuple = (False, "limit reached")
         assert bool(falsy_tuple) is True
         ok, _ = falsy_tuple
-        assert ok is False
+
+
+# ─── increment_order_count は成功確定後にのみ呼ばれる ────────────────────
+
+
+class TestIncrementOrderCountTiming:
+    def test_live_rejected_order_does_not_increment(self):
+        """ライブ注文がAPIに拒否された場合（Result!=0）はカウントを消費しない"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            client.send_order.return_value = {"Result": 1, "Message": "rejected"}
+            result = om.buy("7203", 1000.0, 100)
+
+        assert result is None
+        risk.increment_order_count.assert_not_called()
+
+    def test_live_missing_order_id_does_not_increment(self):
+        """OrderIdが取得できない場合もカウントを消費しない"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            client.send_order.return_value = {"Result": 0}
+            result = om.sell("7203", 1100.0, 100)
+
+        assert result is None
+        risk.increment_order_count.assert_not_called()
+
+    def test_live_success_increments_once(self):
+        """ライブ注文が成功（Result==0かつOrderId取得）した場合のみカウントする"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            client.send_order.return_value = {"Result": 0, "OrderId": "LIVE-1"}
+            result = om.buy("7203", 1000.0, 100)
+
+        assert result == "LIVE-1"
+        risk.increment_order_count.assert_called_once()
+
+
+# ─── close_all_positions の価格ガード（M-1）─────────────────────────────
+
+
+class TestCloseAllPositionsPriceGuard:
+    def _pos(self, symbol="7203", qty=100):
+        p = MagicMock()
+        p.symbol = symbol
+        p.quantity = qty
+        return p
+
+    def test_zero_price_skips_sell(self):
+        """現在値が取得できない（price=0）場合は sell を呼ばない（0円指値防止）"""
+        with _make_om(mode="paper") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = [self._pos()]
+            session.scalars.return_value = scal
+            client.get_board.return_value = {}  # CurrentPrice も Sell1 も無い
+            om.sell = MagicMock()
+            om.close_all_positions()
+        om.sell.assert_not_called()
+
+    def test_valid_price_calls_sell(self):
+        """現在値が取得できれば sell が呼ばれる"""
+        with _make_om(mode="paper") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = [self._pos(qty=200)]
+            session.scalars.return_value = scal
+            client.get_board.return_value = {"CurrentPrice": 1500.0}
+            om.sell = MagicMock()
+            om.close_all_positions()
+        om.sell.assert_called_once_with("7203", 1500.0, 200)
 
 
 # ─── Critical #3: ライブモード約定後のポジション更新 ─────────────────────

@@ -22,7 +22,7 @@ from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from src.core import config as cfg, watchlist as watchlist_store
+from src.core import config as cfg, watchlist as watchlist_store, risk_profile as risk_profile_store
 from src.data.database import (
     BacktestRun, BacktestTradeRecord, ModelMetrics, OHLCV, Position, Signal, Trade, get_session,
 )
@@ -68,7 +68,7 @@ def set_order_manager(om) -> None:
 
 
 async def _verify_emergency_token(x_emergency_token: str = Header(...)) -> None:
-    if _emergency_token is None or x_emergency_token != _emergency_token:
+    if _emergency_token is None or not secrets.compare_digest(x_emergency_token, _emergency_token):
         raise HTTPException(status_code=403, detail="Invalid emergency token")
 
 
@@ -76,7 +76,7 @@ def update_status(running: bool, ws_connected: bool, mode: str) -> None:
     _system_status.update({
         "running": running,
         "ws_connected": ws_connected,
-        "last_update": datetime.utcnow().isoformat(),
+        "last_update": datetime.now().isoformat(),  # JST naive
         "mode": mode,
     })
 
@@ -118,7 +118,31 @@ async def root():
 
 @app.get("/api/status")
 async def get_status():
-    return _system_status
+    return {**_system_status, "risk_profile": risk_profile_store.get_active()}
+
+
+@app.get("/api/risk_profile")
+async def get_risk_profile():
+    """アクティブなリスクプロファイルと選択可能な全プロファイルを返す"""
+    return {
+        "active": risk_profile_store.get_active(),
+        "profiles": risk_profile_store.get_profiles(),
+    }
+
+
+class RiskProfileRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/risk_profile")
+async def set_risk_profile(req: RiskProfileRequest):
+    """リスクプロファイルを切り替える（ハイリスク⇔ローリスク）。
+    発注サイズ・損切り幅・売買閾値などに即座に反映される。"""
+    try:
+        result = risk_profile_store.set_active(req.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
 
 
 @app.get("/api/positions")
@@ -263,7 +287,7 @@ async def get_pnl_daily(days: int = 90):
 @app.get("/api/pnl/enhanced_summary")
 async def get_pnl_enhanced_summary():
     """今日/MTD/YTD/シャープレシオ/最大ドローダウン/含み損益合計を返す"""
-    today = datetime.utcnow().date()
+    today = datetime.now().date()  # filled_at（JST naive）と同じ基準で当日判定する
     month_start = today.replace(day=1)
     year_start = today.replace(month=1, day=1)
 
@@ -425,13 +449,18 @@ async def add_watchlist_entry(entry: WatchlistEntry):
         result = watchlist_store.add(entry.code, entry.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    from src.data.market_data import update_symbol
+    from src.data.market_data import lookup_sector, update_symbol
     code = watchlist_store.normalize_code(entry.code)
     years = cfg.get_section("data").get("history_years", 3)
     try:
         await asyncio.to_thread(update_symbol, code, years)
     except Exception as e:
         logger.error(f"過去データ取得失敗: {code} {e}")
+    try:
+        sector = await asyncio.to_thread(lookup_sector, code)
+        watchlist_store.update_sector(code, sector)
+    except Exception as e:
+        logger.warning(f"セクター取得失敗: {code} {e}")
     return result
 
 

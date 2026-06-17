@@ -1,50 +1,62 @@
 [
   {
     "code": "8306",
-    "name": "三菱UFJフィナンシャル・グループ"
+    "name": "三菱UFJフィナンシャル・グループ",
+    "sector": "Financial Services"
   },
   {
     "code": "8316",
-    "name": "三井住友フィナンシャルグループ"
+    "name": "三井住友フィナンシャルグループ",
+    "sector": "Financial Services"
   },
   {
     "code": "7203",
-    "name": "トヨタ自動車"
+    "name": "トヨタ自動車",
+    "sector": "Consumer Cyclical"
   },
   {
     "code": "7267",
-    "name": "ホンダ"
+    "name": "ホンダ",
+    "sector": "Consumer Cyclical"
   },
   {
     "code": "9432",
-    "name": "NTT"
+    "name": "NTT",
+    "sector": "Communication Services"
   },
   {
     "code": "9433",
-    "name": "KDDI"
+    "name": "KDDI",
+    "sector": "Communication Services"
   },
   {
     "code": "9984",
-    "name": "ソフトバンクグループ"
+    "name": "ソフトバンクグループ",
+    "sector": "Communication Services"
   },
   {
     "code": "6702",
-    "name": "富士通"
+    "name": "富士通",
+    "sector": "Technology"
   },
   {
     "code": "6758",
-    "name": "ソニーグループ"
+    "name": "ソニーグループ",
+    "sector": "Technology"
   },
   {
     "code": "8058",
-    "name": "三菱商事"
+    "name": "三菱商事",
+    "sector": "Industrials"
   },
   {
     "code": "3489",
-    "name": "FaithNetwork Co.,Ltd"
+    "name": "FaithNetwork Co.,Ltd",
+    "sector": "Real Estate"
   },
   {
     "code": "4755",
-    "name": "Rakuten Group, Inc."
+    "name": "Rakuten Group, Inc.",
+    "sector": "Consumer Cyclical"
   }
 ]

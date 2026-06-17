@@ -4,8 +4,8 @@
 kabuステーションAPIは板情報のリアルタイム取得に使用し、
 過去データはyfinanceで補完する（権利修正済み）。
 """
+import time
 from datetime import date, timedelta
-from typing import List, Optional
 
 import pandas as pd
 import yfinance as yf
@@ -20,11 +20,22 @@ def _to_yf_symbol(symbol: str) -> str:
     return f"{symbol}.T"
 
 
-def fetch_ohlcv(symbol: str, start: date, end: date) -> pd.DataFrame:
-    """yfinanceから権利修正済みOHLCVを取得する"""
+def fetch_ohlcv(symbol: str, start: date, end: date, retries: int = 2) -> pd.DataFrame:
+    """yfinanceから権利修正済みOHLCVを取得する（一時的な通信エラーは指定回数までリトライ）"""
     yf_sym = _to_yf_symbol(symbol)
-    df = yf.download(yf_sym, start=start.isoformat(), end=end.isoformat(),
-                     auto_adjust=True, progress=False)
+    df = pd.DataFrame()
+    for attempt in range(retries + 1):
+        try:
+            df = yf.download(yf_sym, start=start.isoformat(), end=end.isoformat(),
+                             auto_adjust=True, progress=False)
+            break
+        except Exception as e:
+            if attempt < retries:
+                logger.warning(f"yfinance取得失敗 (リトライ {attempt + 1}/{retries}): {symbol} {e}")
+                time.sleep(2)
+            else:
+                logger.error(f"yfinance取得失敗（リトライ上限到達）: {symbol} {e}")
+                return pd.DataFrame()
     if df.empty:
         logger.warning(f"データ取得なし: {symbol} ({start} ~ {end})")
         return df
@@ -118,9 +129,13 @@ def lookup_company_name(symbol: str) -> str:
     return info.get("longName") or info.get("shortName") or ""
 
 
-def get_watchlist() -> List[str]:
-    """ウォッチリスト銘柄を返す（現在はDBに保有ポジションのある銘柄）"""
-    from src.data.database import Position
-    with get_session() as session:
-        positions = session.scalars(select(Position)).all()
-    return [p.symbol for p in positions]
+def lookup_sector(symbol: str) -> str:
+    """yfinanceから銘柄コードに対応するセクターを取得する（取得失敗時は空文字）。
+    RiskManager.check_sector_concentration() のセクター集中リスク判定に使用する。
+    """
+    try:
+        info = yf.Ticker(_to_yf_symbol(symbol)).info
+    except Exception as e:
+        logger.warning(f"セクター取得失敗: {symbol} {e}")
+        return ""
+    return info.get("sector") or ""

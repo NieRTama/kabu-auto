@@ -98,9 +98,9 @@ class OrderManager:
             logger.warning(f"未約定注文あり、重複発注スキップ: {symbol}")
             return None
 
-        self._risk.increment_order_count()
-
         if self._is_paper:
+            # ペーパーモードは常に即時成立するため、ここでカウントを確定する
+            self._risk.increment_order_count()
             order_id = f"PAPER-BUY-{symbol}-{uuid.uuid4().hex[:8]}"
             now = datetime.now()
             logger.info(f"[ペーパー] 買い: {symbol} {quantity}株 @{price:.0f}円")
@@ -136,6 +136,7 @@ class OrderManager:
             if not order_id:
                 logger.error(f"買い注文: OrderId 未取得: {symbol} {result}")
                 return None
+            self._risk.increment_order_count()
             self._record_trade(order_id, symbol, "BUY", quantity, price)
             self._set_cancel_timer(order_id)
             return order_id
@@ -157,9 +158,9 @@ class OrderManager:
             logger.warning(f"未約定注文あり、重複発注スキップ: {symbol}")
             return None
 
-        self._risk.increment_order_count()
-
         if self._is_paper:
+            # ペーパーモードは常に即時成立するため、ここでカウントを確定する
+            self._risk.increment_order_count()
             order_id = f"PAPER-SELL-{symbol}-{uuid.uuid4().hex[:8]}"
             now = datetime.now()
             logger.info(f"[ペーパー] 売り: {symbol} {quantity}株 @{price:.0f}円")
@@ -195,6 +196,7 @@ class OrderManager:
             if not order_id:
                 logger.error(f"売り注文: OrderId 未取得: {symbol} {result}")
                 return None
+            self._risk.increment_order_count()
             self._record_trade(order_id, symbol, "SELL", quantity, price)
             self._set_cancel_timer(order_id)
             return order_id
@@ -213,7 +215,11 @@ class OrderManager:
             try:
                 board = self._client.get_board(pos.symbol)
                 price = board.get("CurrentPrice") or board.get("Sell1", {}).get("Price", 0)
-                self.sell(pos.symbol, price, pos.quantity)
+                if not price or price <= 0:
+                    # 価格取得失敗時に 0円指値を送ると異常注文・損益破損になるためスキップ
+                    logger.error(f"緊急決済スキップ（現在値取得失敗）: {pos.symbol}")
+                    continue
+                self.sell(pos.symbol, float(price), pos.quantity)
             except Exception as e:
                 logger.error(f"緊急決済失敗: {pos.symbol} {e}")
 
@@ -322,4 +328,9 @@ class OrderManager:
                     trade.pnl = pnl
                 # 損失を RiskManager に記録（当日損失上限チェック用）
                 self._risk.record_loss(pnl)
+            elif side == "SELL" and not pos:
+                logger.warning(
+                    f"SELL約定だが保有ポジション無し: {symbol} {quantity}株 "
+                    f"（PnL未集計・リスク管理に反映されません）"
+                )
             session.commit()

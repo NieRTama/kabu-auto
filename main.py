@@ -14,14 +14,17 @@ import pandas as pd
 import uvicorn
 from dotenv import load_dotenv
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from src.core import config as cfg, logger as log_setup, watchlist as watchlist_store
+from src.core import (
+    config as cfg, logger as log_setup, watchlist as watchlist_store,
+    risk_profile as risk_profile_store,
+)
 from src.core.alerts import alert
 from src.core.scheduler import TradingScheduler
 from src.api.kabu_client import KabuClient
 from src.data import database as db
-from src.data.database import Position, Signal, get_session
+from src.data.database import Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
 from src.execution.order_manager import OrderManager
 from src.risk.manager import RiskManager
@@ -36,6 +39,7 @@ def main() -> None:
     load_dotenv()  # .env の KABU_API_PASSWORD などを読み込む（任意・存在しなければ無視）
     cfg.load("config.yaml")
     watchlist_store.load("watchlist.json")
+    risk_profile_store.load("risk_profile.json")  # アクティブなリスクプロファイルを config に適用
     log_setup.setup()
     db.init()
 
@@ -55,6 +59,7 @@ def main() -> None:
 
     client = KabuClient()
     risk = RiskManager()
+    risk.restore_daily_state()  # 再起動しても当日の損失上限・注文数カウンタを引き継ぐ
     order_mgr = OrderManager(client, risk)
     scheduler = TradingScheduler()
 
@@ -119,23 +124,35 @@ def main() -> None:
     def stop_loss_check():
         if not TradingScheduler.is_market_open():
             return
+        is_paper = trading_conf.get("mode", "paper") == "paper"
         for sym in watchlist_store.get_codes():
             try:
-                board = client.get_board(sym)
-                price = board.get("CurrentPrice", 0)
+                qty = _get_position_qty(sym)
+                if qty <= 0:
+                    continue  # 保有していない銘柄の板取得は無駄なのでスキップ
+                if is_paper:
+                    # ペーパーモードはリアルタイム板が無いため日足終値で損切り判定する
+                    df = load_ohlcv(sym)
+                    price = float(df["close"].iloc[-1]) if len(df) else 0
+                else:
+                    board = client.get_board(sym)
+                    price = board.get("CurrentPrice", 0)
                 if price and risk.should_stop_loss(sym, price):
                     logger.warning(f"損切り発動: {sym}")
-                    order_mgr.sell(sym, price, _get_position_qty(sym))
+                    order_mgr.sell(sym, float(price), qty)
                     alert("損切り実行", f"{sym} @{price:.0f}円")
             except Exception as e:
                 logger.error(f"損切りチェックエラー: {sym} {e}")
 
     def signal_scan():
-        """15:35 に翌営業日の売買候補をスキャン。ペーパーモードは終値で即時シミュレート"""
+        """16:20（data_update完了後）に翌営業日の売買候補をスキャン。
+        ペーパーモードは終値で即時シミュレート"""
         if TradingScheduler.is_maintenance_window():
             return
         logger.info("シグナルスキャン開始...")
         is_paper = trading_conf.get("mode", "paper") == "paper"
+        sectors = watchlist_store.get_sectors()
+        paper_base = float(trading_conf.get("paper_initial_capital", 500_000))
         for sym in watchlist_store.get_codes():
             try:
                 df = load_ohlcv(sym)
@@ -150,9 +167,16 @@ def main() -> None:
                     # ペーパーモード: 当日終値でシミュレート
                     close_price = float(df["close"].iloc[-1])
                     if sig.action == "BUY":
-                        qty = risk.calc_position_size(sym, close_price, 500_000)
+                        sector = sectors.get(sym, "")
+                        # 固定額ではなく仮想ウォレット残高で発注サイズを決める
+                        cash = _paper_available_cash(paper_base)
+                        ok, reason = risk.validate_buy(sym, close_price, cash, sector)
+                        if not ok:
+                            logger.info(f"買い見送り: {sym} - {reason}")
+                            continue
+                        qty = risk.calc_position_size(sym, close_price, cash)
                         if qty > 0:
-                            order_mgr.buy(sym, close_price, qty)
+                            order_mgr.buy(sym, close_price, qty, sector=sector)
                     elif sig.action == "SELL":
                         qty = _get_position_qty(sym)
                         if qty > 0:
@@ -210,15 +234,21 @@ def main() -> None:
         except Exception as e:
             logger.error(f"余力取得失敗: {e}")
             return
+        sectors = watchlist_store.get_sectors()
         for sig in buy_signals:
             try:
                 board = client.get_board(sig.symbol)
                 price = board.get("CurrentPrice") or board.get("Sell1", {}).get("Price", 0)
                 if not price:
                     continue
+                sector = sectors.get(sig.symbol, "")
+                ok, reason = risk.validate_buy(sig.symbol, float(price), cash, sector)
+                if not ok:
+                    logger.info(f"朝買い見送り: {sig.symbol} - {reason}")
+                    continue
                 qty = risk.calc_position_size(sig.symbol, float(price), cash)
                 if qty > 0:
-                    order_mgr.buy(sig.symbol, float(price), qty)
+                    order_mgr.buy(sig.symbol, float(price), qty, sector=sector)
                     logger.info(f"朝買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
             except Exception as e:
                 logger.error(f"朝買い発注失敗: {sig.symbol} {e}")
@@ -226,6 +256,7 @@ def main() -> None:
     set_ml_retrain_fn(ml_retrain)
     set_data_update_fn(data_update)
 
+    scheduler.register("risk_reset", risk.reset_daily_counters)
     scheduler.register("token_refresh", token_refresh)
     scheduler.register("data_update", data_update)
     scheduler.register("db_backup", db_backup)
@@ -286,7 +317,26 @@ def _get_lan_ip() -> str:
 def _get_position_qty(symbol: str) -> int:
     with get_session() as session:
         pos = session.scalar(select(Position).where(Position.symbol == symbol))
-    return pos.quantity if pos else 0
+        qty = pos.quantity if pos else 0
+    return qty
+
+
+def _paper_available_cash(base_capital: float) -> float:
+    """ペーパーモードの利用可能資金を算出する。
+
+    利用可能資金 = 初期資金 + 累積実現損益 − 現在の建玉簿価（avg_cost × 数量）。
+    固定額50万だと複数銘柄で資金制約が効かず、実現損益も反映されないため、
+    実際の口座挙動に近づける。
+    """
+    with get_session() as session:
+        realized = session.scalar(
+            select(func.sum(Trade.pnl)).where(Trade.pnl.isnot(None))
+        ) or 0.0
+        positions = session.scalars(
+            select(Position).where(Position.quantity > 0)
+        ).all()
+        invested = sum(p.avg_cost * p.quantity for p in positions)
+    return max(0.0, base_capital + float(realized) - invested)
 
 
 def _save_signal(sig: TradeSignal) -> None:

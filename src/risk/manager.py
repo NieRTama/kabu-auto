@@ -6,13 +6,14 @@
 - セクター集中制限
 - ギャップリスク考慮
 """
+from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 from sqlalchemy import func, select
 
 from src.core import config as cfg
-from src.data.database import Position, get_session
+from src.data.database import Position, Trade, get_session
 
 
 class RiskManager:
@@ -24,6 +25,32 @@ class RiskManager:
     def reset_daily_counters(self) -> None:
         self._daily_order_count = 0
         self._daily_loss_yen = 0.0
+
+    def restore_daily_state(self) -> None:
+        """起動時に当日の注文数・実現損失をDBから復元する。
+
+        日次カウンタはメモリ上のみのため、当日損失上限に達して停止した後に
+        プロセスを再起動するとセーフティが消えてしまう。これを防ぐため、
+        当日（JST）約定済みTradeから注文数と損失額を再構築する。
+        """
+        today = datetime.now().date()
+        with get_session() as session:
+            trades = session.scalars(
+                select(Trade).where(Trade.filled_at.isnot(None))
+            ).all()
+            order_count = 0
+            loss_yen = 0.0
+            for t in trades:
+                if t.filled_at and t.filled_at.date() == today:
+                    order_count += 1
+                    if t.pnl is not None and t.pnl < 0:
+                        loss_yen += abs(t.pnl)
+        self._daily_order_count = order_count
+        self._daily_loss_yen = loss_yen
+        if order_count or loss_yen:
+            logger.info(
+                f"日次リスク状態を復元: 当日注文数={order_count} 当日実現損失={loss_yen:,.0f}円"
+            )
 
     def record_loss(self, pnl: float) -> None:
         """損益を記録する（損失のみ累積）"""

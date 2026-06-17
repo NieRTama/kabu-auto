@@ -55,15 +55,18 @@ class Position(Base):
     quantity = Column(Integer, nullable=False, default=0)
     avg_cost = Column(Float, nullable=False, default=0.0)
     sector = Column(String(50))
-    opened_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # 日時はプロジェクト全体で JST naive に統一する（scheduler・order・ml も datetime.now()=JST）。
+    # 旧 datetime.utcnow と混在すると morning_execution の cutoff 比較が9時間ずれて
+    # 前日シグナルを取りこぼすため、必ず datetime.now を使うこと。
+    opened_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
 class Signal(Base):
     __tablename__ = "signals"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(10), nullable=False)
-    generated_at = Column(DateTime, default=datetime.utcnow)
+    generated_at = Column(DateTime, default=datetime.now)  # JST naive（morning_executionのcutoffと統一）
     rule_score = Column(Float)
     ml_score = Column(Float)
     combined_score = Column(Float)

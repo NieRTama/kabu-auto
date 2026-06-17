@@ -55,6 +55,11 @@ def get_names() -> dict[str, str]:
     return {e["code"]: e.get("name", "") for e in _get()}
 
 
+def get_sectors() -> dict[str, str]:
+    """{"7203": "Consumer Cyclical", ...} のセクターマッピングを返す（セクター集中リスクチェック用）"""
+    return {e["code"]: e.get("sector", "") for e in _get()}
+
+
 def add(code: str, name: str = "") -> list[dict]:
     code = normalize_code(code)
     if not code:
@@ -65,9 +70,22 @@ def add(code: str, name: str = "") -> list[dict]:
             e["name"] = name or e["name"]
             break
     else:
-        entries.append({"code": code, "name": name})
+        entries.append({"code": code, "name": name, "sector": ""})
     _save(entries)
     return entries
+
+
+def update_sector(code: str, sector: str) -> None:
+    """銘柄のセクターを更新する（取得失敗時は空文字を渡せば何もしない）"""
+    if not sector:
+        return
+    code = normalize_code(code)
+    entries = _get()
+    for e in entries:
+        if e["code"] == code:
+            e["sector"] = sector
+            break
+    _save(entries)
 
 
 def remove(code: str) -> list[dict]:
