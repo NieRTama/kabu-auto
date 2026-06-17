@@ -6,8 +6,8 @@ kabu_station:
 trading:
   mode: "paper"  # "paper" (仮想) or "live" (本番)
   max_positions: 5  # 最大同時保有銘柄数
-  max_position_ratio: 0.20  # 1銘柄あたり最大資金比率 (20%)
-  stop_loss_pct: -0.05  # 損切りライン (-5%)
+  max_position_ratio: 0.25  # 1銘柄あたり最大資金比率 (25%)。20%→25%でややハイリスク・ハイリターン化
+  stop_loss_pct: -0.07  # 損切りライン (-7%)。-5%→-7%で早すぎる損切りを減らし上昇を取りやすくする
   max_sector_ratio: 0.40  # 同一セクター最大集中率
   order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
   daily_order_limit: 100  # 1日の最大注文数

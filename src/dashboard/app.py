@@ -420,11 +420,19 @@ async def get_watchlist():
 
 @app.post("/api/watchlist")
 async def add_watchlist_entry(entry: WatchlistEntry):
-    """ウォッチリストに銘柄を追加（既存コードなら会社名を更新）"""
+    """ウォッチリストに銘柄を追加（既存コードなら会社名を更新）し、過去データを自動取得する"""
     try:
-        return watchlist_store.add(entry.code, entry.name)
+        result = watchlist_store.add(entry.code, entry.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    from src.data.market_data import update_symbol
+    code = watchlist_store.normalize_code(entry.code)
+    years = cfg.get_section("data").get("history_years", 3)
+    try:
+        await asyncio.to_thread(update_symbol, code, years)
+    except Exception as e:
+        logger.error(f"過去データ取得失敗: {code} {e}")
+    return result
 
 
 @app.delete("/api/watchlist/{code}")
@@ -443,6 +451,7 @@ async def get_symbol_names():
 async def lookup_symbol_name(code: str):
     """yfinanceから銘柄コードに対応する会社名を取得する（ウォッチリスト追加フォームの自動入力用）"""
     from src.data.market_data import lookup_company_name
+    code = watchlist_store.normalize_code(code)
     name = await asyncio.to_thread(lookup_company_name, code)
     return {"code": code, "name": name}
 

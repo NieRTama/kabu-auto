@@ -177,7 +177,7 @@
         <input id="wl-name" type="text" placeholder="例: トヨタ自動車" oninput="onWlNameInput()"
           style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:200px;">
       </div>
-      <button onclick="addWatchlistEntry()"
+      <button id="wl-add-btn" onclick="addWatchlistEntry()"
         style="background:#065f46;color:#6ee7b7;border:1px solid #059669;padding:6px 16px;border-radius:6px;font-size:0.85rem;font-weight:600;cursor:pointer;">
         追加
       </button>
@@ -514,8 +514,11 @@
     const code = document.getElementById('wl-code').value.trim();
     const name = document.getElementById('wl-name').value.trim();
     const msg = document.getElementById('wl-msg');
+    const btn = document.getElementById('wl-add-btn');
     msg.textContent = '';
     if (!code) { msg.textContent = '銘柄コードを入力してください'; return; }
+    btn.textContent = '追加中...（過去データ取得中）';
+    btn.disabled = true;
     try {
       const r = await fetch(API + '/api/watchlist', {
         method: 'POST',
@@ -535,6 +538,9 @@
       await initBacktest();
     } catch(e) {
       msg.textContent = 'エラー: ' + e.message;
+    } finally {
+      btn.textContent = '追加';
+      btn.disabled = false;
     }
   }
 
