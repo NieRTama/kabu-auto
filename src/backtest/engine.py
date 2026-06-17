@@ -83,6 +83,12 @@ def run_backtest(
     pos_entry_date: Optional[date] = None
     sim_trades = []
     equity_curve = []
+    # 診断用: 各日の生スコアを記録してあとで分布をログ出力する
+    rule_scores: list[float] = []
+    ml_scores: list[float] = []
+    combined_scores: list[float] = []
+    # 診断用: 単元未満で見送られたBUYシグナルを記録する（資金不足の検出用）
+    budget_blocked_prices: list[float] = []
 
     for dt in full_df.index[mask]:
         dt_date = dt.date()
@@ -134,6 +140,9 @@ def run_backtest(
                 pass
 
         combined = r_score * effective_rule_weight + ml_s * effective_ml_weight
+        rule_scores.append(r_score)
+        ml_scores.append(ml_s)
+        combined_scores.append(combined)
 
         # ── 売り判定 ──────────────────────────────────────────────
         if combined <= sell_thr and pos_qty > 0:
@@ -154,6 +163,9 @@ def run_backtest(
                 pos_qty = qty
                 pos_avg_cost = close_price
                 pos_entry_date = dt_date
+            else:
+                # 1単元（100株）の購入に必要な額が資金配分上限を超えている
+                budget_blocked_prices.append(close_price)
 
         equity_curve.append({
             "date": dt_date.isoformat(),
@@ -170,6 +182,11 @@ def run_backtest(
             symbol, pos_entry_date, pos_avg_cost,
             last_idx.date(), last_close, pos_qty, pnl, "END_OF_PERIOD",
         ))
+
+    # ── スコア分布診断（取引が出ない原因を数値で特定する）──────────
+    _log_score_diagnostics(symbol, rule_scores, ml_scores, combined_scores,
+                           buy_thr, sell_thr)
+    _log_budget_diagnostics(symbol, budget_blocked_prices, initial_capital, max_pos_ratio)
 
     # ── パフォーマンス指標 ────────────────────────────────────────
     pnls = [t["pnl"] for t in sim_trades]
@@ -208,6 +225,78 @@ def run_backtest(
         f"シャープ={sharpe:.2f} 取引数={len(sim_trades)}"
     )
     return run_id
+
+
+def _log_score_diagnostics(
+    symbol: str,
+    rule_scores: list,
+    ml_scores: list,
+    combined_scores: list,
+    buy_thr: float,
+    sell_thr: float,
+) -> None:
+    """各日の合成スコア分布をログ出力し、取引が出ない原因を数値で示す。
+
+    どの閾値なら何回シグナルが出るかを表で示すことで、
+    勘ではなく実データに基づいて閾値を決められるようにする。
+    """
+    if not combined_scores:
+        logger.warning(f"[診断] {symbol}: スコア計算対象日が0件（データ不足）")
+        return
+
+    arr = np.array(combined_scores)
+    rule_arr = np.array(rule_scores)
+    ml_arr = np.array(ml_scores)
+    n = len(arr)
+
+    logger.info(
+        f"[診断] {symbol} スコア分布（{n}日）: "
+        f"合成 min={arr.min():.3f} max={arr.max():.3f} "
+        f"平均={arr.mean():.3f} 標準偏差={arr.std():.3f}"
+    )
+    logger.info(
+        f"[診断] {symbol} 内訳: "
+        f"ルール[min={rule_arr.min():.2f} max={rule_arr.max():.2f}] "
+        f"ML[min={ml_arr.min():.2f} max={ml_arr.max():.2f}]"
+    )
+
+    # 候補閾値ごとに BUY/SELL シグナル発生回数を集計
+    parts = []
+    for thr in (0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6):
+        buys = int((arr >= thr).sum())
+        sells = int((arr <= -thr).sum())
+        parts.append(f"±{thr}: BUY={buys}/SELL={sells}")
+    logger.info(f"[診断] {symbol} 閾値別シグナル数 → " + " | ".join(parts))
+    logger.info(
+        f"[診断] {symbol} 現在の閾値 BUY>={buy_thr} / SELL<={sell_thr} → "
+        f"BUY={int((arr >= buy_thr).sum())}回 "
+        f"SELL={int((arr <= sell_thr).sum())}回"
+    )
+
+
+def _log_budget_diagnostics(
+    symbol: str,
+    budget_blocked_prices: list,
+    initial_capital: float,
+    max_pos_ratio: float,
+) -> None:
+    """BUYシグナルが出たのに1単元（100株）すら買えず見送られた回数をログ出力する。
+
+    max_position_ratio による1銘柄あたりの予算が、東証の単元株制度（100株単位）の
+    最低購入額に届かない場合、シグナルが何回出ても永遠に取引数0になる。
+    閾値ではなく資金配分の設定が原因であることを区別できるようにする。
+    """
+    if not budget_blocked_prices:
+        return
+    budget = initial_capital * max_pos_ratio
+    min_price = min(budget_blocked_prices)
+    logger.warning(
+        f"[診断] {symbol}: BUYシグナルが{len(budget_blocked_prices)}回発生したが、"
+        f"1単元(100株)の購入に必要な額（最安値時で{min_price * 100:,.0f}円）が"
+        f"資金配分上限（{budget:,.0f}円 = 資金{initial_capital:,.0f}円 × "
+        f"max_position_ratio {max_pos_ratio:.0%}）を超えるため見送られた。"
+        f"このままでは{symbol}は約{min_price:,.0f}円/株以下に下がらない限り取引されない。"
+    )
 
 
 def _make_trade(

@@ -22,7 +22,7 @@ from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from src.core import config as cfg
+from src.core import config as cfg, watchlist as watchlist_store
 from src.data.database import (
     BacktestRun, BacktestTradeRecord, ModelMetrics, OHLCV, Position, Signal, Trade, get_session,
 )
@@ -404,6 +404,49 @@ async def update_market_data():
     return {"status": "ok", "message": "データ更新が完了しました"}
 
 
+# ─── ウォッチリスト ──────────────────────────────────────────────────
+
+
+class WatchlistEntry(BaseModel):
+    code: str
+    name: str = ""
+
+
+@app.get("/api/watchlist")
+async def get_watchlist():
+    """ウォッチリスト銘柄（コード・会社名）を返す"""
+    return watchlist_store.get_all()
+
+
+@app.post("/api/watchlist")
+async def add_watchlist_entry(entry: WatchlistEntry):
+    """ウォッチリストに銘柄を追加（既存コードなら会社名を更新）"""
+    try:
+        return watchlist_store.add(entry.code, entry.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/watchlist/{code}")
+async def delete_watchlist_entry(code: str):
+    """ウォッチリストから銘柄を削除"""
+    return watchlist_store.remove(code)
+
+
+@app.get("/api/symbol_names")
+async def get_symbol_names():
+    """銘柄コード→会社名マッピングを返す（ダッシュボード表示用）"""
+    return watchlist_store.get_names()
+
+
+@app.get("/api/symbol_lookup/{code}")
+async def lookup_symbol_name(code: str):
+    """yfinanceから銘柄コードに対応する会社名を取得する（ウォッチリスト追加フォームの自動入力用）"""
+    from src.data.market_data import lookup_company_name
+    name = await asyncio.to_thread(lookup_company_name, code)
+    return {"code": code, "name": name}
+
+
 # ─── バックテスト ──────────────────────────────────────────────────
 
 
@@ -413,12 +456,6 @@ class BacktestRequest(BaseModel):
     end: str          # "YYYY-MM-DD"
     initial_capital: float = 500_000.0
     use_ml: bool = False
-
-
-@app.get("/api/watchlist")
-async def get_watchlist():
-    """config.yaml のウォッチリスト銘柄を返す"""
-    return cfg.get_section("trading").get("watchlist", [])
 
 
 @app.post("/api/backtest/run")
