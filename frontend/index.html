@@ -357,18 +357,17 @@
     ]);
   }
 
-  // ── リスクプロファイル ──────────────────────────────────────────────
+  // ── リスクプロファイル（ローリスク・ローリターン ⇔ ハイリスク・ハイリターン の2択） ──
   const RP_META = {
-    conservative: { label: 'ローリスク', color: '#0ea5e9', desc: 'ローリスク・ローリターン' },
-    balanced:     { label: 'バランス',   color: '#22c55e', desc: '中庸' },
-    aggressive:   { label: 'ハイリスク', color: '#f97316', desc: 'ハイリスク・ハイリターン' },
+    low_risk:  { label: 'ローリスク・ローリターン', color: '#0ea5e9', desc: 'ローリスク・ローリターン' },
+    high_risk: { label: 'ハイリスク・ハイリターン', color: '#f97316', desc: 'ハイリスク・ハイリターン' },
   };
 
   async function loadRiskProfile() {
     const d = await fetchJson('/api/risk_profile');
     const wrap = document.getElementById('risk-profile-buttons');
     const profiles = d.profiles || {};
-    const order = ['conservative', 'balanced', 'aggressive'];
+    const order = ['low_risk', 'high_risk'];
     const names = order.filter(n => n in profiles).concat(
       Object.keys(profiles).filter(n => !order.includes(n)));
     wrap.innerHTML = names.map(name => {

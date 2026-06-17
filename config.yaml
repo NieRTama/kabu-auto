@@ -18,35 +18,28 @@ trading:
   # ウォッチリスト・銘柄名は watchlist.json で管理する（ダッシュボードのGUIから追加・削除可能）
 
 # ─── リスクプロファイル ────────────────────────────────────────────────────
-# 日次の成績を見て「ハイリスク・ハイリターン」⇔「ローリスク・ローリターン」を
-# ダッシュボードから切り替えられる。アクティブなプロファイルは risk_profile.json に
+# 日次の成績を見て「ハイリスク・ハイリターン」⇔「ローリスク・ローリターン」の
+# 2択をダッシュボードから切り替えられる。アクティブなプロファイルは risk_profile.json に
 # 永続化され、各プロファイルの値が trading / strategy の該当パラメータを上書きする。
-active_risk_profile: "balanced"  # 起動時の既定（risk_profile.json があればそちら優先）
+# 既定はローリスク側（live運用に進んだ場合の安全側デフォルト）。
+active_risk_profile: "low_risk"  # 起動時の既定（risk_profile.json があればそちら優先）
 risk_profiles:
-  conservative:   # ローリスク・ローリターン：小さく張り、早めに損切り、強いシグナルのみ
-    max_position_ratio: 0.10
-    stop_loss_pct: -0.05
-    max_positions: 3
-    max_sector_ratio: 0.34
-    max_daily_loss: 15000
-    buy_threshold: 0.30
-    sell_threshold: -0.30
-  balanced:       # 中庸（現行設定相当）
-    max_position_ratio: 0.25
-    stop_loss_pct: -0.07
-    max_positions: 5
-    max_sector_ratio: 0.40
-    max_daily_loss: 30000
-    buy_threshold: 0.25
-    sell_threshold: -0.25
-  aggressive:     # ハイリスク・ハイリターン：大きく張り、損切りを広げ、より多く取引
-    max_position_ratio: 0.35
-    stop_loss_pct: -0.10
-    max_positions: 6
-    max_sector_ratio: 0.50
-    max_daily_loss: 50000
-    buy_threshold: 0.20
-    sell_threshold: -0.20
+  low_risk:    # ローリスク・ローリターン：小さく張り、早めに損切り、広く分散、強いシグナルのみ
+    max_position_ratio: 0.12   # 1銘柄最大12%（資金を多めに分散）
+    stop_loss_pct: -0.04       # -4%で早めに損切り（被弾を小さく抑える）
+    max_positions: 6           # 多めの銘柄数に分散してポジション集中を避ける
+    max_sector_ratio: 0.30     # セクター集中を厳しく制限
+    max_daily_loss: 15000      # 当日損失上限を低く設定
+    buy_threshold: 0.32        # 閾値を高くし、強いシグナルのみ採用（取引頻度を抑える）
+    sell_threshold: -0.32
+  high_risk:   # ハイリスク・ハイリターン：大きく張り、損切りを広げて伸ばし、集中投資・高頻度取引
+    max_position_ratio: 0.35   # 1銘柄最大35%（集中投資でリターンを狙う）
+    stop_loss_pct: -0.10       # -10%まで許容し、値動きの伸びを取りやすくする
+    max_positions: 4           # 銘柄数を絞り1銘柄あたりの規模を大きくする
+    max_sector_ratio: 0.55     # セクター集中の制約を緩める
+    max_daily_loss: 60000      # 当日損失上限を高く設定（その分ドローダウン許容度も上がる）
+    buy_threshold: 0.18        # 閾値を下げて取引機会を増やす
+    sell_threshold: -0.18
 
 strategy:
   ma_short: 5

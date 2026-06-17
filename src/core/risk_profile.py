@@ -1,8 +1,9 @@
 """
 リスクプロファイル（ハイリスク・ハイリターン ⇔ ローリスク・ローリターン）の切替管理。
 
-config.yaml の `risk_profiles` に複数のプロファイル（例: conservative / balanced /
-aggressive）を定義しておき、ダッシュボードから日次の成績を見て切り替えられるようにする。
+config.yaml の `risk_profiles` に "low_risk"（ローリスク・ローリターン）と
+"high_risk"（ハイリスク・ハイリターン）の2プロファイルを定義しておき、ダッシュボードから
+日次の成績を見て切り替えられるようにする。
 アクティブなプロファイル名は risk_profile.json に永続化し、プロセス再起動後も維持する。
 
 切替時は、プロファイルのパラメータを config の trading / strategy セクション辞書へ
@@ -36,12 +37,10 @@ def get_profiles() -> dict:
 
 def _default_profile_name() -> str:
     profiles = get_profiles()
-    # config の active_risk_profile → balanced → 最初に定義されたもの の順で既定を決める
+    # config の active_risk_profile → 最初に定義されたもの の順で既定を決める
     configured = cfg.get().get("active_risk_profile")
     if configured and configured in profiles:
         return configured
-    if "balanced" in profiles:
-        return "balanced"
     return next(iter(profiles), "")
 
 
