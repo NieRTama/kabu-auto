@@ -11,10 +11,11 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import uvicorn
+from dotenv import load_dotenv
 from loguru import logger
 from sqlalchemy import select
 
-from src.core import config as cfg, logger as log_setup
+from src.core import config as cfg, logger as log_setup, watchlist as watchlist_store
 from src.core.alerts import alert
 from src.core.scheduler import TradingScheduler
 from src.api.kabu_client import KabuClient
@@ -31,7 +32,9 @@ from src.dashboard.app import (
 
 
 def main() -> None:
+    load_dotenv()  # .env の KABU_API_PASSWORD などを読み込む（任意・存在しなければ無視）
     cfg.load("config.yaml")
+    watchlist_store.load("watchlist.json")
     log_setup.setup()
     db.init()
 
@@ -70,10 +73,9 @@ def main() -> None:
     if model is None:
         logger.info("学習済みモデルなし。十分なデータが揃い次第 /retrain を実行してください。")
 
-    # ─── ウォッチリスト（設定から読み込み）────────────────
-    watchlist: list[str] = trading_conf.get("watchlist", [])
-
     # ─── スケジューラのコールバック登録 ──────────────────────
+    # ウォッチリストは watchlist_store.get_codes() で毎回最新を取得する。
+    # GUIでの追加・削除がプロセス再起動なしで次回実行から反映される。
 
     def token_refresh():
         try:
@@ -83,7 +85,7 @@ def main() -> None:
 
     def data_update():
         years = data_conf.get("history_years", 3)
-        for sym in watchlist:
+        for sym in watchlist_store.get_codes():
             try:
                 update_symbol(sym, years=years)
             except Exception as e:
@@ -99,7 +101,7 @@ def main() -> None:
         nonlocal model
         logger.info("MLモデル週次再学習を開始...")
         combined_df = None
-        for sym in watchlist:
+        for sym in watchlist_store.get_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 200:
@@ -116,7 +118,7 @@ def main() -> None:
     def stop_loss_check():
         if not TradingScheduler.is_market_open():
             return
-        for sym in watchlist:
+        for sym in watchlist_store.get_codes():
             try:
                 board = client.get_board(sym)
                 price = board.get("CurrentPrice", 0)
@@ -133,7 +135,7 @@ def main() -> None:
             return
         logger.info("シグナルスキャン開始...")
         is_paper = trading_conf.get("mode", "paper") == "paper"
-        for sym in watchlist:
+        for sym in watchlist_store.get_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 30:

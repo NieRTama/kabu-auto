@@ -1,6 +1,6 @@
 kabu_station:
   base_url: "http://localhost:18080/kabusapi"
-  password: ""  # kabuステーション ログインパスワード
+  password: ""  # 非推奨: .env の KABU_API_PASSWORD を使用すること（漏洩防止のためgit管理しない）
   token_refresh_time: "08:30"  # 毎朝トークン再取得
 
 trading:
@@ -12,29 +12,7 @@ trading:
   order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
   daily_order_limit: 100  # 1日の最大注文数
   max_daily_loss: 30000  # 当日損失上限（円）。0 で無効
-  watchlist:
-    # 金融
-    - "8306"   # 三菱UFJフィナンシャル
-    - "8316"   # 三井住友FG
-    # 自動車
-    - "7203"   # トヨタ自動車
-    - "7267"   # ホンダ
-    # 通信
-    - "9432"   # NTT
-    - "9433"   # KDDI
-    # IT
-    - "6702"   # 富士通
-    # 商社
-    - "8058"   # 三菱商事
-  symbol_names:  # ダッシュボード表示用の銘柄コード→会社名マッピング
-    "8306": "三菱UFJフィナンシャル・グループ"
-    "8316": "三井住友フィナンシャルグループ"
-    "7203": "トヨタ自動車"
-    "7267": "ホンダ"
-    "9432": "NTT"
-    "9433": "KDDI"
-    "6702": "富士通"
-    "8058": "三菱商事"
+  # ウォッチリスト・銘柄名は watchlist.json で管理する（ダッシュボードのGUIから追加・削除可能）
 
 strategy:
   ma_short: 5

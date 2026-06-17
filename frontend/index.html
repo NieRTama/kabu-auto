@@ -163,6 +163,34 @@
     </div>
   </div>
 
+  <!-- ─── ウォッチリスト管理 ────────────────────────────────────── -->
+  <div class="card" style="margin-bottom:24px;">
+    <h2>🔖 ウォッチリスト管理</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;">
+      <div>
+        <div class="label" style="margin-bottom:4px;">銘柄コード</div>
+        <input id="wl-code" type="text" placeholder="例: 7203"
+          style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:120px;">
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:4px;">会社名（任意）</div>
+        <input id="wl-name" type="text" placeholder="例: トヨタ自動車"
+          style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:200px;">
+      </div>
+      <button onclick="addWatchlistEntry()"
+        style="background:#065f46;color:#6ee7b7;border:1px solid #059669;padding:6px 16px;border-radius:6px;font-size:0.85rem;font-weight:600;cursor:pointer;">
+        追加
+      </button>
+      <span id="wl-msg" style="font-size:0.8rem;color:#f87171;"></span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table style="font-size:0.82rem;">
+        <thead><tr><th>銘柄コード</th><th>会社名</th><th></th></tr></thead>
+        <tbody id="watchlist-tbody"><tr><td colspan="3" style="color:#64748b">なし</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- ─── MLモデル ──────────────────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
@@ -439,12 +467,61 @@
     }
   }
 
+  // ── ウォッチリスト管理 ──────────────────────────────────────────
+
+  async function loadWatchlistManager() {
+    const entries = await fetchJson('/api/watchlist');
+    const tbody = document.getElementById('watchlist-tbody');
+    if (!entries.length) { tbody.innerHTML = '<tr><td colspan="3" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = entries.map(e => `<tr>
+        <td><strong>${e.code}</strong></td>
+        <td>${e.name || ''}</td>
+        <td><button onclick="removeWatchlistEntry('${e.code}')"
+          style="background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;padding:4px 10px;border-radius:6px;font-size:0.75rem;cursor:pointer;">削除</button></td>
+      </tr>`).join('');
+  }
+
+  async function addWatchlistEntry() {
+    const code = document.getElementById('wl-code').value.trim();
+    const name = document.getElementById('wl-name').value.trim();
+    const msg = document.getElementById('wl-msg');
+    msg.textContent = '';
+    if (!code) { msg.textContent = '銘柄コードを入力してください'; return; }
+    try {
+      const r = await fetch(API + '/api/watchlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, name }),
+      });
+      if (!r.ok) {
+        const err = await r.json();
+        msg.textContent = 'エラー: ' + (err.detail || r.statusText);
+        return;
+      }
+      document.getElementById('wl-code').value = '';
+      document.getElementById('wl-name').value = '';
+      await loadWatchlistManager();
+      await loadSymbolNames();
+      await initBacktest();
+    } catch(e) {
+      msg.textContent = 'エラー: ' + e.message;
+    }
+  }
+
+  async function removeWatchlistEntry(code) {
+    if (!confirm(`${code} をウォッチリストから削除しますか？`)) return;
+    await fetch(API + '/api/watchlist/' + encodeURIComponent(code), { method: 'DELETE' });
+    await loadWatchlistManager();
+    await loadSymbolNames();
+    await initBacktest();
+  }
+
   // ── バックテスト ────────────────────────────────────────────────
 
   async function initBacktest() {
-    const symbols = await fetchJson('/api/watchlist');
+    const entries = await fetchJson('/api/watchlist');
     const sel = document.getElementById('bt-symbol');
-    sel.innerHTML = symbols.map(s => `<option value="${s}">${symLabel(s)}</option>`).join('');
+    sel.innerHTML = entries.map(e => `<option value="${e.code}">${symLabel(e.code)}</option>`).join('');
     await loadBtRuns();
   }
 
@@ -766,6 +843,7 @@
   loadSymbolNames().then(() => {
     loadAll();
     initBacktest();
+    loadWatchlistManager();
   });
   loadModelMetrics();
   loadDailyPnlChart();
