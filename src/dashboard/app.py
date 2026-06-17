@@ -439,6 +439,14 @@ async def get_symbol_names():
     return watchlist_store.get_names()
 
 
+@app.get("/api/symbol_lookup/{code}")
+async def lookup_symbol_name(code: str):
+    """yfinanceから銘柄コードに対応する会社名を取得する（ウォッチリスト追加フォームの自動入力用）"""
+    from src.data.market_data import lookup_company_name
+    name = await asyncio.to_thread(lookup_company_name, code)
+    return {"code": code, "name": name}
+
+
 # ─── バックテスト ──────────────────────────────────────────────────
 
 

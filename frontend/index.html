@@ -169,12 +169,12 @@
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;">
       <div>
         <div class="label" style="margin-bottom:4px;">銘柄コード</div>
-        <input id="wl-code" type="text" placeholder="例: 7203"
+        <input id="wl-code" type="text" placeholder="例: 7203" oninput="onWlCodeInput()"
           style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:120px;">
       </div>
       <div>
-        <div class="label" style="margin-bottom:4px;">会社名（任意）</div>
-        <input id="wl-name" type="text" placeholder="例: トヨタ自動車"
+        <div class="label" style="margin-bottom:4px;">会社名（自動入力・編集可）</div>
+        <input id="wl-name" type="text" placeholder="例: トヨタ自動車" oninput="onWlNameInput()"
           style="background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 10px;font-size:0.85rem;width:200px;">
       </div>
       <button onclick="addWatchlistEntry()"
@@ -469,6 +469,35 @@
 
   // ── ウォッチリスト管理 ──────────────────────────────────────────
 
+  let wlNameAutoFilled = false;
+  let wlLookupTimer = null;
+
+  function onWlNameInput() {
+    wlNameAutoFilled = false;  // 手入力されたら以後の自動上書きを止める
+  }
+
+  function onWlCodeInput() {
+    clearTimeout(wlLookupTimer);
+    const code = document.getElementById('wl-code').value.trim();
+    const nameInput = document.getElementById('wl-name');
+    if (!code) return;
+    if (nameInput.value.trim() && !wlNameAutoFilled) return;  // 手入力済みの会社名は上書きしない
+    wlLookupTimer = setTimeout(() => lookupCompanyName(code), 500);
+  }
+
+  async function lookupCompanyName(code) {
+    try {
+      const d = await fetchJson('/api/symbol_lookup/' + encodeURIComponent(code));
+      const nameInput = document.getElementById('wl-name');
+      if (d.name && document.getElementById('wl-code').value.trim() === code) {
+        nameInput.value = d.name;
+        wlNameAutoFilled = true;
+      }
+    } catch (e) {
+      // 取得失敗時は何もしない（手動入力で続行可能）
+    }
+  }
+
   async function loadWatchlistManager() {
     const entries = await fetchJson('/api/watchlist');
     const tbody = document.getElementById('watchlist-tbody');
@@ -500,6 +529,7 @@
       }
       document.getElementById('wl-code').value = '';
       document.getElementById('wl-name').value = '';
+      wlNameAutoFilled = false;
       await loadWatchlistManager();
       await loadSymbolNames();
       await initBacktest();

@@ -108,6 +108,16 @@ def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
     return df
 
 
+def lookup_company_name(symbol: str) -> str:
+    """yfinanceから銘柄コードに対応する会社名を取得する（取得失敗時は空文字）"""
+    try:
+        info = yf.Ticker(_to_yf_symbol(symbol)).info
+    except Exception as e:
+        logger.warning(f"会社名取得失敗: {symbol} {e}")
+        return ""
+    return info.get("longName") or info.get("shortName") or ""
+
+
 def get_watchlist() -> List[str]:
     """ウォッチリスト銘柄を返す（現在はDBに保有ポジションのある銘柄）"""
     from src.data.database import Position
