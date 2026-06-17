@@ -4,6 +4,7 @@ kabu-auto メインエントリポイント
 ダッシュボード: http://localhost:8080
 """
 import os
+import socket
 import sys
 import threading
 import time
@@ -252,7 +253,10 @@ def main() -> None:
         daemon=True,
     )
     dash_thread.start()
-    logger.info(f"ダッシュボード起動: http://localhost:{dash_conf.get('port', 8080)}")
+    dash_port = dash_conf.get("port", 8080)
+    logger.info(f"ダッシュボード起動: http://localhost:{dash_port}")
+    if dash_conf.get("host", "127.0.0.1") == "0.0.0.0":
+        logger.info(f"LANからのアクセス: http://{_get_lan_ip()}:{dash_port}")
 
     # ─── メインループ ────────────────────────────────────────
     logger.info("kabu-auto 起動完了。Ctrl+C で終了。")
@@ -265,6 +269,18 @@ def main() -> None:
         client.stop_websocket()
         update_status(running=False, ws_connected=False, mode=trading_conf.get("mode", "paper"))
         logger.info("終了しました")
+
+
+def _get_lan_ip() -> str:
+    """LAN内からアクセス可能なIPアドレスを自動検出する（実際には通信しない）"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def _get_position_qty(symbol: str) -> int:
