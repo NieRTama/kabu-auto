@@ -47,6 +47,18 @@ class TestSetupUsesConfig:
         assert captured["kwargs"]["retention"] == "15 days"
         assert captured["kwargs"]["rotation"] == "00:00"
 
+    def test_setup_creates_log_directory(self, tmp_path):
+        """設定されたログ格納フォルダ（例: log/）が無ければ作成される"""
+        log_dir = tmp_path / "log"
+        assert not log_dir.exists()
+        conf = {"logging": {"level": "INFO", "file": str(log_dir / "kabu_auto.log")}}
+        with patch.object(log_setup.cfg, "get_section", lambda s: conf.get(s, {})):
+            with patch.object(log_setup.logger, "add", return_value=1), \
+                 patch.object(log_setup.logger, "remove"), \
+                 patch.object(log_setup.logger, "info"):
+                log_setup.setup()
+        assert log_dir.is_dir()
+
     def test_setup_respects_custom_retention(self, tmp_path):
         captured = {}
 

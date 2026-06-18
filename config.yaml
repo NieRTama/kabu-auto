@@ -82,6 +82,7 @@ alerts:
 
 logging:
   level: "INFO"
-  # ログは1日単位で区切られ、ファイル名末尾に日付が付く（例: data/kabu_auto_2026-06-18.log）。
-  file: "data/kabu_auto.log"
+  # ログは log/ フォルダに格納され、1日単位で区切られ、ファイル名末尾に日付が付く
+  # （例: log/kabu_auto_2026-06-18.log）。
+  file: "log/kabu_auto.log"
   retention: "15 days"  # ログの保持期間（この周期で古いログを自動削除）

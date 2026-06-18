@@ -23,6 +23,9 @@ def setup() -> None:
     log_file = conf.get("file", "data/kabu_auto.log")
     retention = conf.get("retention", "15 days")
 
+    # ログ格納フォルダ（例: log/）が無ければ作成する
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+
     logger.remove()
     logger.add(sys.stderr, level=level, colorize=True,
                format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:<8}</level> | {message}")

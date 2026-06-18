@@ -12,6 +12,7 @@ data/*.db-shm
 data/*.log
 data/backups/*.db
 models/*.pkl
+log/
 
 # 環境変数
 .env
