@@ -18,6 +18,9 @@ log/
 .env
 .env.local
 
+# 認証情報（ログインのユーザーID・パスワードハッシュ）
+data/auth.json
+
 # 旧形式ウォッチリスト（watchlists.json に移行済み。後方互換のため残置するが追跡しない）
 watchlist.json
 

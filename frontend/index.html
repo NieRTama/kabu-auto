@@ -73,7 +73,10 @@
 <body>
 <header>
   <h1>📈 kabu-auto</h1>
-  <div id="mode-badge" class="badge paper">PAPER</div>
+  <div style="display:flex; align-items:center; gap:12px;">
+    <div id="mode-badge" class="badge paper">PAPER</div>
+    <button id="logout-btn" onclick="logout()" style="display:none; background:#334155; color:#e2e8f0; border:1px solid #475569; border-radius:6px; padding:6px 12px; cursor:pointer; font-size:0.8rem;">ログアウト</button>
+  </div>
 </header>
 <main>
 
@@ -1040,6 +1043,19 @@
     document.getElementById('live-banner').style.display = 'none';
   }
 
+  // 認証が有効な構成のときだけログアウトボタンを表示する
+  async function initLogoutButton() {
+    try {
+      const s = await fetchJson('/api/auth_status');
+      if (s.auth_required) document.getElementById('logout-btn').style.display = 'inline-block';
+    } catch (e) { /* 認証不要構成では無視 */ }
+  }
+
+  async function logout() {
+    try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+    location.href = '/login';
+  }
+
   async function loadPnlEnhancedSummary() {
     const d = await fetchJson('/api/pnl/enhanced_summary');
 
@@ -1224,6 +1240,7 @@
   loadRiskProfile();
   loadModelMetrics();
   loadDailyPnlChart();
+  initLogoutButton();
   setInterval(loadAll, 10000);
   setInterval(loadRiskProfile, 30000);
   setInterval(loadModelMetrics, 60000);

@@ -257,6 +257,16 @@ class TestWatchlistMultiList:
         with pytest.raises(ValueError):
             watchlist_mod.add("abc;DROP TABLE")
 
+    def test_get_all_codes_unions_all_lists_deduped(self, tmp_path):
+        """get_all_codes はアクティブ以外のリストも含め重複除去して返す（MLモデル学習データ確保用）"""
+        self._isolated_path(tmp_path)
+        watchlist_mod.add("7203", "トヨタ自動車")
+        watchlist_mod.create_list("高配当株")
+        watchlist_mod.add("8306", "三菱UFJ")
+        watchlist_mod.add("7203", "トヨタ自動車")  # 別リストにも同コード（重複）
+        codes = watchlist_mod.get_all_codes()
+        assert sorted(codes) == ["7203", "8306"]
+
     def test_legacy_single_list_file_migrates(self, tmp_path):
         """旧形式（フラットなリストのみ）の watchlist.json から自動移行する"""
         legacy = tmp_path / "watchlist.json"

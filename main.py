@@ -91,7 +91,8 @@ def main() -> None:
 
     def data_update():
         years = data_conf.get("history_years", 3)
-        for sym in watchlist_store.get_codes():
+        # 全リストの銘柄を更新する（非アクティブリストもMLモデル学習データとして使うため）
+        for sym in watchlist_store.get_all_codes():
             try:
                 update_symbol(sym, years=years)
             except Exception as e:
@@ -107,7 +108,8 @@ def main() -> None:
         nonlocal model
         logger.info("MLモデル週次再学習を開始...")
         combined_df = None
-        for sym in watchlist_store.get_codes():
+        # 学習データはアクティブリストに限定せず全リストの銘柄を対象にする（サンプル数確保のため）
+        for sym in watchlist_store.get_all_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 200:

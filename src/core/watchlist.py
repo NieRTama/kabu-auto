@@ -176,6 +176,24 @@ def get_list_names() -> list[str]:
     return list(_get_data()["lists"].keys())
 
 
+def get_all_codes() -> list[str]:
+    """全リスト（アクティブ以外も含む）の銘柄コードを重複除去して返す。
+
+    MLモデルの学習はアクティブリストだけに限定すると、リスト切替のたびに
+    学習データの銘柄数が変動し、サンプル数が不足しやすい。学習データの母集団は
+    取引対象（アクティブリスト）より広く取る方が安定するため、これを使う。
+    """
+    d = _get_data()
+    codes: list[str] = []
+    seen: set = set()
+    for entries in d["lists"].values():
+        for e in entries:
+            if e["code"] not in seen:
+                seen.add(e["code"])
+                codes.append(e["code"])
+    return codes
+
+
 def get_active_list_name() -> str:
     return _get_data()["active"]
 

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>kabu-auto ログイン</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #0f172a; color: #e2e8f0;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px;
+      padding: 32px; width: 100%; max-width: 360px; }
+    h1 { font-size: 1.4rem; color: #38bdf8; letter-spacing: 0.05em; margin-bottom: 4px; }
+    .subtitle { font-size: 0.85rem; color: #94a3b8; margin-bottom: 20px; }
+    label { display: block; font-size: 0.8rem; color: #cbd5e1; margin: 14px 0 4px; }
+    input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid #475569;
+      background: #0f172a; color: #e2e8f0; font-size: 0.95rem; }
+    input:focus { outline: none; border-color: #38bdf8; }
+    button { width: 100%; margin-top: 20px; padding: 11px; border: none; border-radius: 8px;
+      background: #38bdf8; color: #0f172a; font-weight: 700; font-size: 0.95rem; cursor: pointer; }
+    button:hover { background: #0ea5e9; }
+    button:disabled { background: #475569; color: #94a3b8; cursor: not-allowed; }
+    .msg { margin-top: 14px; font-size: 0.85rem; min-height: 1.2em; }
+    .msg.error { color: #f87171; }
+    .msg.ok { color: #4ade80; }
+    .hint { margin-top: 8px; font-size: 0.75rem; color: #64748b; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>📈 kabu-auto</h1>
+    <div class="subtitle" id="subtitle">読み込み中...</div>
+
+    <form id="auth-form" onsubmit="return submitForm(event)">
+      <label for="username">ユーザーID</label>
+      <input id="username" type="text" autocomplete="username" autofocus />
+
+      <label for="password">パスワード</label>
+      <input id="password" type="password" autocomplete="current-password" />
+
+      <div id="pw2-wrap" style="display:none;">
+        <label for="password2">パスワード（確認）</label>
+        <input id="password2" type="password" autocomplete="new-password" />
+      </div>
+
+      <button id="submit-btn" type="submit">ログイン</button>
+      <div class="msg" id="msg"></div>
+      <div class="hint" id="hint"></div>
+    </form>
+  </div>
+
+  <script>
+    let isSetup = false;
+
+    async function init() {
+      try {
+        const r = await fetch('/api/auth_status');
+        const s = await r.json();
+        if (!s.auth_required) {
+          // 認証不要構成（localhost等）ではダッシュボードへ
+          location.href = '/';
+          return;
+        }
+        isSetup = !s.configured;
+        applyMode();
+      } catch (e) {
+        document.getElementById('subtitle').textContent = '接続できませんでした';
+      }
+    }
+
+    function applyMode() {
+      const subtitle = document.getElementById('subtitle');
+      const btn = document.getElementById('submit-btn');
+      const pw2 = document.getElementById('pw2-wrap');
+      const hint = document.getElementById('hint');
+      const pwInput = document.getElementById('password');
+      if (isSetup) {
+        subtitle.textContent = '初期設定：ログイン情報を作成してください';
+        btn.textContent = '作成してログイン';
+        pw2.style.display = 'block';
+        pwInput.setAttribute('autocomplete', 'new-password');
+        hint.textContent = 'パスワードは8文字以上。この情報は暗号化（PBKDF2ハッシュ）して保存され、復元できません。忘れないよう管理してください。';
+      } else {
+        subtitle.textContent = 'ユーザーID・パスワードでログイン';
+        btn.textContent = 'ログイン';
+        pw2.style.display = 'none';
+        hint.textContent = '';
+      }
+    }
+
+    function setMsg(text, cls) {
+      const el = document.getElementById('msg');
+      el.textContent = text;
+      el.className = 'msg ' + (cls || '');
+    }
+
+    async function submitForm(ev) {
+      ev.preventDefault();
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      if (!username || !password) { setMsg('ユーザーIDとパスワードを入力してください', 'error'); return false; }
+      if (isSetup) {
+        const pw2 = document.getElementById('password2').value;
+        if (password !== pw2) { setMsg('パスワード（確認）が一致しません', 'error'); return false; }
+        if (password.length < 8) { setMsg('パスワードは8文字以上にしてください', 'error'); return false; }
+      }
+      const btn = document.getElementById('submit-btn');
+      btn.disabled = true;
+      setMsg('');
+      try {
+        const r = await fetch(isSetup ? '/api/setup' : '/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password }),
+        });
+        if (r.ok) {
+          setMsg('成功しました。移動します...', 'ok');
+          location.href = '/';
+        } else {
+          const d = await r.json().catch(() => ({}));
+          setMsg(d.detail || 'エラーが発生しました', 'error');
+          btn.disabled = false;
+        }
+      } catch (e) {
+        setMsg('通信エラー: ' + e, 'error');
+        btn.disabled = false;
+      }
+      return false;
+    }
+
+    init();
+  </script>
+</body>
+</html>

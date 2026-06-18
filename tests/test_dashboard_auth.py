@@ -10,21 +10,25 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+import src.core.auth as auth_store
 import src.dashboard.app as dash
 
 
 @pytest.fixture
-def auth_enabled():
-    """認証を有効化した状態を作る。テスト後に必ず無効へ戻す。"""
+def auth_enabled(tmp_path):
+    """認証を有効化した状態を作る。Authファイル・セッションも隔離し、テスト後に戻す。"""
     orig_required = dash._auth_required
     orig_token = dash._dashboard_token
     dash._auth_required = True
     dash._dashboard_token = "testtoken123"
+    auth_store.load(str(tmp_path / "auth.json"))  # 未設定状態から開始
+    auth_store._sessions.clear()
     try:
         yield "testtoken123"
     finally:
         dash._auth_required = orig_required
         dash._dashboard_token = orig_token
+        auth_store._sessions.clear()
 
 
 class TestDashboardAuth:
@@ -115,3 +119,67 @@ class TestInitAuth:
         finally:
             dash._auth_required = False
             dash._dashboard_token = None
+
+
+class TestLoginFlow:
+    def test_auth_status_exempt_and_reports_unconfigured(self, auth_enabled):
+        """/api/auth_status は認証なしでアクセスでき、初回は configured:false"""
+        client = TestClient(dash.app)
+        r = client.get("/api/auth_status")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["configured"] is False
+        assert body["auth_required"] is True
+
+    def test_login_page_reachable_without_auth(self, auth_enabled):
+        client = TestClient(dash.app)
+        # /login は素通しパス（認証必須でもアクセスできる）
+        assert client.get("/login").status_code == 200
+
+    def test_html_navigation_redirects_to_login(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.get("/", headers={"accept": "text/html"}, follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/login"
+
+    def test_setup_then_access_granted(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.post("/api/setup", json={"username": "trader", "password": "s3cretpw!"})
+        assert r.status_code == 200
+        assert "kabu_session" in r.cookies
+        # セッションCookieを保持したまま保護APIにアクセスできる
+        assert client.get("/api/status").status_code == 200
+
+    def test_setup_twice_rejected(self, auth_enabled):
+        client = TestClient(dash.app)
+        client.post("/api/setup", json={"username": "trader", "password": "s3cretpw!"})
+        r = client.post("/api/setup", json={"username": "x", "password": "y2345678"})
+        assert r.status_code == 400
+
+    def test_login_wrong_and_correct(self, auth_enabled):
+        # 事前に作成（別clientで）
+        setup_client = TestClient(dash.app)
+        setup_client.post("/api/setup", json={"username": "trader", "password": "s3cretpw!"})
+
+        client = TestClient(dash.app)  # セッションCookieを持たない新規client
+        bad = client.post("/api/login", json={"username": "trader", "password": "wrong"})
+        assert bad.status_code == 401
+        good = client.post("/api/login", json={"username": "trader", "password": "s3cretpw!"})
+        assert good.status_code == 200
+        assert "kabu_session" in good.cookies
+        assert client.get("/api/status").status_code == 200
+
+    def test_logout_invalidates_session(self, auth_enabled):
+        client = TestClient(dash.app)
+        client.post("/api/setup", json={"username": "trader", "password": "s3cretpw!"})
+        assert client.get("/api/status").status_code == 200
+        client.post("/api/logout")
+        # ログアウト後はセッションが無効化され、再びアクセス不可
+        r = client.get("/api/status")
+        assert r.status_code == 401
+
+    def test_api_token_still_works_alongside_login(self, auth_enabled):
+        """ログイン導入後も X-API-Token（curl用）は併用できる"""
+        client = TestClient(dash.app)
+        r = client.get("/api/status", headers={"X-API-Token": auth_enabled})
+        assert r.status_code == 200

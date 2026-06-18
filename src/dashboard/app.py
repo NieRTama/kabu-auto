@@ -18,13 +18,16 @@ from urllib.parse import quote
 import numpy as np
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from src.core import config as cfg, watchlist as watchlist_store, risk_profile as risk_profile_store
+from src.core import (
+    config as cfg, watchlist as watchlist_store, risk_profile as risk_profile_store,
+    auth as auth_store,
+)
 from src.data.database import (
     BacktestRun, BacktestTradeRecord, ModelMetrics, OHLCV, Position, Signal, Trade, get_session,
 )
@@ -62,6 +65,11 @@ def init_auth() -> None:
     """
     global _dashboard_token, _auth_required
     dash = cfg.get_section("dashboard")
+    # ログイン認証情報（Authファイル）を読み込む
+    auth_store.load(
+        dash.get("auth_file", "data/auth.json"),
+        session_ttl_hours=dash.get("session_ttl_hours"),
+    )
     token = os.environ.get("KABU_DASHBOARD_TOKEN") or dash.get("api_token", "")
     host = dash.get("host", "127.0.0.1")
     is_local = host in ("127.0.0.1", "localhost", "::1")
@@ -82,40 +90,67 @@ def init_auth() -> None:
     if _auth_required:
         port = dash.get("port", 8080)
         display_host = "localhost" if is_local else host
+        setup_hint = (
+            "  初回はログイン画面でユーザーID・パスワードを作成してください（初期設定）。\n"
+            if not auth_store.is_configured()
+            else "  ブラウザで上記URLを開き、ユーザーID・パスワードでログインしてください。\n"
+        )
         # トークンはログ平文に残さず、コンソールへ一度だけ表示する
         print(
-            "\n==== ダッシュボードへのアクセスにトークンが必要です ====\n"
-            f"  URL: http://{display_host}:{port}/?token={_dashboard_token}\n"
-            "  （ブラウザで上記URLを一度開くとCookieに保存され、以後はトークン不要）\n"
-            "  curl等では X-API-Token ヘッダーに同じトークンを指定してください。\n"
+            "\n==== ダッシュボードへのアクセスには認証が必要です ====\n"
+            f"  URL: http://{display_host}:{port}/\n"
+            f"{setup_hint}"
+            f"  curl等のプログラムアクセスは X-API-Token ヘッダーにトークンを指定:\n"
+            f"    {_dashboard_token}\n"
             "=======================================================\n",
             flush=True,
         )
 
 
-@app.middleware("http")
-async def _auth_middleware(request: Request, call_next):
-    """トークン認証ミドルウェア。
+# ログインなしでアクセスできる（認証の入口となる）パス
+_AUTH_EXEMPT_PATHS = ("/login", "/api/login", "/api/setup", "/api/auth_status")
 
-    認証が有効な場合、X-API-Token ヘッダー / ?token= クエリ / Cookie のいずれかで
-    正しいトークンが提示されたリクエストのみ通す。クエリで提示された場合は Cookie に
-    保存し、以後の同一オリジン fetch（フロントエンドJS）は無改修で通る。
 
-    認証有効時は /docs・/openapi.json も保護対象とし、未認証の第三者にAPI仕様
-    （緊急決済・リスク変更等の存在）を露出させない。
-    """
-    if not _auth_required:
-        return await call_next(request)
+def _has_valid_token(request: Request) -> bool:
+    """X-API-Token ヘッダー / ?token= クエリ / kabu_token Cookie のいずれかが有効か。"""
     provided = (
         request.headers.get("X-API-Token")
         or request.query_params.get("token")
         or request.cookies.get("kabu_token")
     )
-    if not provided or _dashboard_token is None or not secrets.compare_digest(provided, _dashboard_token):
+    return bool(provided and _dashboard_token is not None
+                and secrets.compare_digest(provided, _dashboard_token))
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """認証ミドルウェア。
+
+    認証が有効な場合（LAN公開時など）、以下のいずれかでのみ通す:
+      - 有効なログインセッション Cookie（kabu_session）
+      - 有効な X-API-Token / ?token= / kabu_token Cookie（curl等プログラム用）
+    未認証のHTMLナビゲーションは /login へリダイレクトし、API/XHRは401を返す。
+    認証有効時は /docs・/openapi.json も保護対象とし、未認証の第三者にAPI仕様を露出させない。
+    """
+    if not _auth_required:
+        return await call_next(request)
+
+    path = request.url.path
+    if path in _AUTH_EXEMPT_PATHS:
+        return await call_next(request)
+
+    session_token = request.cookies.get("kabu_session")
+    authorized = auth_store.validate_session(session_token) or _has_valid_token(request)
+
+    if not authorized:
+        accepts_html = "text/html" in request.headers.get("accept", "")
+        if accepts_html and not path.startswith("/api/"):
+            return RedirectResponse(url="/login", status_code=303)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
     response = await call_next(request)
     if request.query_params.get("token"):
-        # ブラウザでURL直開きした場合、以後の fetch 用に Cookie へ保存する
+        # ブラウザでトークン付きURLを直開きした場合、以後の fetch 用に Cookie へ保存する
         response.set_cookie("kabu_token", _dashboard_token, httponly=True, samesite="strict")
     return response
 
@@ -194,6 +229,64 @@ async def root():
     if index.exists():
         return HTMLResponse(index.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>kabu-auto Dashboard</h1><p>frontend/index.html が見つかりません</p>")
+
+
+# ─── ログイン認証 ──────────────────────────────────────────────────────────
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    """ログイン（初回はID・パスワード作成）画面を返す。"""
+    page = FRONTEND_DIR / "login.html"
+    if page.exists():
+        return HTMLResponse(page.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>kabu-auto ログイン</h1><p>frontend/login.html が見つかりません</p>")
+
+
+@app.get("/api/auth_status")
+async def auth_status():
+    """認証が必要か・認証情報が登録済みかを返す（ログイン画面の表示切替用）。"""
+    return {"configured": auth_store.is_configured(), "auth_required": _auth_required}
+
+
+class CredentialsRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _issue_session(response: JSONResponse) -> JSONResponse:
+    token = auth_store.create_session()
+    response.set_cookie("kabu_session", token, httponly=True, samesite="strict")
+    return response
+
+
+@app.post("/api/setup")
+async def setup_credentials(req: CredentialsRequest):
+    """初期設定：ユーザーID・パスワードを作成する（未設定時のみ）。成功時はログイン状態にする。"""
+    try:
+        auth_store.create_user(req.username, req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _issue_session(JSONResponse({"status": "ok", "message": "初期設定が完了しました"}))
+
+
+@app.post("/api/login")
+async def login(req: CredentialsRequest):
+    """ユーザーID・パスワードでログインする。"""
+    if not auth_store.is_configured():
+        raise HTTPException(status_code=400, detail="初期設定が未完了です")
+    if not auth_store.verify(req.username, req.password):
+        raise HTTPException(status_code=401, detail="ユーザーIDまたはパスワードが違います")
+    return _issue_session(JSONResponse({"status": "ok", "message": "ログインしました"}))
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    """ログアウト（セッション破棄・Cookie削除）。"""
+    auth_store.destroy_session(request.cookies.get("kabu_session"))
+    response = JSONResponse({"status": "ok", "message": "ログアウトしました"})
+    response.delete_cookie("kabu_session")
+    return response
 
 
 @app.get("/api/status")

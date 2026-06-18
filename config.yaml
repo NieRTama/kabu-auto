@@ -30,16 +30,20 @@ risk_profiles:
     max_positions: 6           # 多めの銘柄数に分散してポジション集中を避ける
     max_sector_ratio: 0.30     # セクター集中を厳しく制限
     max_daily_loss: 15000      # 当日損失上限を低く設定
-    buy_threshold: 0.32        # 閾値を高くし、強いシグナルのみ採用（取引頻度を抑える）
-    sell_threshold: -0.32
+    # 閾値は実際の combined_score 分布（過去実績: 平均0.043・標準偏差0.043）に基づき再調整。
+    # 0.14 ≈ 平均+2.3σ で、high_risk より明確に選別的（=取引頻度を抑える）。
+    buy_threshold: 0.14
+    sell_threshold: -0.14
   high_risk:   # ハイリスク・ハイリターン：大きく張り、損切りを広げて伸ばし、集中投資・高頻度取引
     max_position_ratio: 0.35   # 1銘柄最大35%（集中投資でリターンを狙う）
     stop_loss_pct: -0.10       # -10%まで許容し、値動きの伸びを取りやすくする
     max_positions: 4           # 銘柄数を絞り1銘柄あたりの規模を大きくする
     max_sector_ratio: 0.55     # セクター集中の制約を緩める
     max_daily_loss: 60000      # 当日損失上限を高く設定（その分ドローダウン許容度も上がる）
-    buy_threshold: 0.18        # 閾値を下げて取引機会を増やす
-    sell_threshold: -0.18
+    # 0.08 ≈ 平均+0.8σ。旧値0.18は実際のスコア値域（最大0.074。2026-06時点の実績）を
+    # 大きく超えており取引が一切発生しなかったため、実測分布に合わせて引き下げた。
+    buy_threshold: 0.08
+    sell_threshold: -0.08
 
 strategy:
   ma_short: 5
@@ -73,6 +77,10 @@ dashboard:
   # 環境変数 KABU_DASHBOARD_TOKEN でも指定可能。恒久運用ではここに固定値を設定すること。
   api_token: ""
   emergency_token: ""  # 緊急決済用。空の場合は起動時にランダム生成してコンソールに一度だけ表示
+  # ログイン認証（認証が有効な構成のとき使用）。認証情報は data/auth.json に
+  # PBKDF2ハッシュで保存される（初回はブラウザのログイン画面で作成）。
+  auth_file: "data/auth.json"
+  session_ttl_hours: 168  # ログインセッションの有効期間（時間。既定7日）
 
 alerts:
   # LINE Notify トークン（任意）。設定すると取引情報がLINEへ送信される。
@@ -82,7 +90,8 @@ alerts:
 
 logging:
   level: "INFO"
-  # ログは log/ フォルダに格納され、1日単位で区切られ、ファイル名末尾に日付が付く
-  # （例: log/kabu_auto_2026-06-18.log）。
+  # ログは log/ フォルダに格納され、1日単位で区切られ、ファイル名末尾に日付が付く。
+  # INFO以下（DEBUG/INFO）と WARNING以上（WARNING/ERROR/CRITICAL）を別ファイルに分ける。
+  # 例: log/kabu_auto_2026-06-18.log（INFO以下） / log/kabu_auto_warning_2026-06-18.log（WARNING以上）
   file: "log/kabu_auto.log"
   retention: "15 days"  # ログの保持期間（この周期で古いログを自動削除）

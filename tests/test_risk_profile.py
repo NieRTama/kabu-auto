@@ -22,7 +22,7 @@ class TestRiskProfile:
         """安全側のローリスクが既定であること（live運用前提のデフォルト方針）"""
         assert rp.get_active() == "low_risk"
         assert cfg.get_section("trading")["max_position_ratio"] == 0.12
-        assert cfg.get_section("strategy")["buy_threshold"] == 0.32
+        assert cfg.get_section("strategy")["buy_threshold"] == 0.14
 
     def test_set_high_risk_applies_to_config(self):
         rp.set_active("high_risk")
@@ -31,14 +31,14 @@ class TestRiskProfile:
         assert cfg.get_section("trading")["stop_loss_pct"] == -0.10
         assert cfg.get_section("trading")["max_positions"] == 4
         assert cfg.get_section("trading")["max_daily_loss"] == 60000
-        assert cfg.get_section("strategy")["buy_threshold"] == 0.18
-        assert cfg.get_section("strategy")["sell_threshold"] == -0.18
+        assert cfg.get_section("strategy")["buy_threshold"] == 0.08
+        assert cfg.get_section("strategy")["sell_threshold"] == -0.08
 
     def test_set_low_risk_applies_to_config(self):
         rp.set_active("low_risk")
         assert cfg.get_section("trading")["max_position_ratio"] == 0.12
         assert cfg.get_section("trading")["stop_loss_pct"] == -0.04
-        assert cfg.get_section("strategy")["sell_threshold"] == -0.32
+        assert cfg.get_section("strategy")["sell_threshold"] == -0.14
 
     def test_high_risk_is_riskier_than_low_risk(self):
         """high_risk は low_risk より一貫してリスクが大きい方向に設定されていること"""
