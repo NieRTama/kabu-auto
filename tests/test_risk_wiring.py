@@ -210,6 +210,53 @@ class TestWatchlistMultiList:
         )
         assert watchlist_mod.get_codes() == ["9984"]
 
+    def test_import_rejects_non_list_entries(self, tmp_path):
+        """entries がリストでない不正な取込は弾く（C-1/H-1 入力検証）"""
+        self._isolated_path(tmp_path)
+        with pytest.raises(ValueError):
+            watchlist_mod.import_list("不正", {"code": "9984"})
+
+    def test_import_rejects_non_dict_entry(self, tmp_path):
+        self._isolated_path(tmp_path)
+        with pytest.raises(ValueError):
+            watchlist_mod.import_list("不正", ["9984", "7203"])
+
+    def test_import_rejects_too_many_entries(self, tmp_path):
+        self._isolated_path(tmp_path)
+        huge = [{"code": str(1000 + i)} for i in range(watchlist_mod.MAX_ENTRIES_PER_LIST + 1)]
+        with pytest.raises(ValueError):
+            watchlist_mod.import_list("巨大", huge)
+
+    def test_import_rejects_malformed_code(self, tmp_path):
+        self._isolated_path(tmp_path)
+        with pytest.raises(ValueError):
+            watchlist_mod.import_list("不正コード", [{"code": "abc;DROP TABLE"}])
+
+    def test_import_dedupes_and_skips_empty(self, tmp_path):
+        self._isolated_path(tmp_path)
+        watchlist_mod.import_list("整理", [
+            {"code": "9984"}, {"code": "9984"}, {"code": ""}, {"code": "7203"},
+        ])
+        assert watchlist_mod.get_codes() == ["9984", "7203"]
+
+    def test_import_rejects_unicode_code(self, tmp_path):
+        """NFKC正規化後もASCII以外の文字が残るコードは弾く（M-C）"""
+        self._isolated_path(tmp_path)
+        with pytest.raises(ValueError):
+            watchlist_mod.import_list("不正", [{"code": "株式４"}])
+
+    def test_add_normalizes_fullwidth_code(self, tmp_path):
+        """全角数字コードはNFKCで半角化されて登録される"""
+        self._isolated_path(tmp_path)
+        watchlist_mod.add("７２０３", "トヨタ自動車")
+        assert watchlist_mod.get_codes() == ["7203"]
+
+    def test_add_rejects_malformed_code(self, tmp_path):
+        """単体追加(add)でも不正な銘柄コードを弾く（M-C）"""
+        self._isolated_path(tmp_path)
+        with pytest.raises(ValueError):
+            watchlist_mod.add("abc;DROP TABLE")
+
     def test_legacy_single_list_file_migrates(self, tmp_path):
         """旧形式（フラットなリストのみ）の watchlist.json から自動移行する"""
         legacy = tmp_path / "watchlist.json"

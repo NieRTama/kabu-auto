@@ -1,0 +1,117 @@
+"""
+ダッシュボードのアクセス認証（C-1）のテスト
+
+販売に向けたセキュリティ強化として、ダッシュボードに無認証でアクセスできない
+ことを確認する。認証はトークン（X-API-Token ヘッダー / ?token= クエリ / Cookie）で行う。
+既定（localhost かつトークン未設定）では認証なしで動く後方互換も確認する。
+"""
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+
+import src.dashboard.app as dash
+
+
+@pytest.fixture
+def auth_enabled():
+    """認証を有効化した状態を作る。テスト後に必ず無効へ戻す。"""
+    orig_required = dash._auth_required
+    orig_token = dash._dashboard_token
+    dash._auth_required = True
+    dash._dashboard_token = "testtoken123"
+    try:
+        yield "testtoken123"
+    finally:
+        dash._auth_required = orig_required
+        dash._dashboard_token = orig_token
+
+
+class TestDashboardAuth:
+    def test_no_token_is_unauthorized(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.get("/api/status")
+        assert r.status_code == 401
+
+    def test_wrong_token_is_unauthorized(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.get("/api/status", headers={"X-API-Token": "wrong"})
+        assert r.status_code == 401
+
+    def test_header_token_allows_access(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.get("/api/status", headers={"X-API-Token": auth_enabled})
+        assert r.status_code == 200
+
+    def test_query_token_allows_and_sets_cookie(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.get(f"/api/status?token={auth_enabled}")
+        assert r.status_code == 200
+        # 以後の fetch 用に Cookie が払い出される
+        assert "kabu_token" in r.cookies
+
+    def test_mutating_endpoint_also_protected(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.post("/api/risk_profile", json={"name": "low_risk"})
+        assert r.status_code == 401
+
+    def test_openapi_protected_when_auth_enabled(self, auth_enabled):
+        """認証有効時は /openapi.json も保護され、API仕様を露出しない（M-D）"""
+        client = TestClient(dash.app)
+        assert client.get("/openapi.json").status_code == 401
+        assert client.get("/docs").status_code == 401
+
+    def test_cookie_persists_across_requests(self, auth_enabled):
+        """?token= で一度通すと Cookie が保存され、以後トークン無しでも通る"""
+        client = TestClient(dash.app)
+        first = client.get(f"/api/status?token={auth_enabled}")
+        assert first.status_code == 200
+        # 同じclientは払い出されたCookieを保持するので、token無しでも通る
+        second = client.get("/api/status")
+        assert second.status_code == 200
+
+
+class TestAuthDisabledByDefault:
+    def test_localhost_without_token_disables_auth(self):
+        """host=127.0.0.1 かつトークン未設定なら認証なし（ローカル専用の後方互換）"""
+        fake = {"dashboard": {"host": "127.0.0.1", "api_token": "", "port": 8080}}
+        with patch.object(dash.cfg, "get_section", lambda s: fake.get(s, {})):
+            with patch.dict("os.environ", {}, clear=False):
+                # KABU_DASHBOARD_TOKEN を確実に未設定にする
+                import os
+                os.environ.pop("KABU_DASHBOARD_TOKEN", None)
+                dash.init_auth()
+        try:
+            assert dash._auth_required is False
+            client = TestClient(dash.app)
+            assert client.get("/api/status").status_code == 200
+        finally:
+            dash._auth_required = False
+            dash._dashboard_token = None
+
+
+class TestInitAuth:
+    def test_configured_token_enables_auth(self):
+        fake = {"dashboard": {"host": "127.0.0.1", "api_token": "mytoken", "port": 8080}}
+        with patch.object(dash.cfg, "get_section", lambda s: fake.get(s, {})):
+            dash.init_auth()
+        try:
+            assert dash._auth_required is True
+            assert dash._dashboard_token == "mytoken"
+        finally:
+            dash._auth_required = False
+            dash._dashboard_token = None
+
+    def test_lan_host_without_token_autogenerates(self):
+        """host=0.0.0.0（LAN公開）でトークン未設定なら自動生成して認証を強制する"""
+        fake = {"dashboard": {"host": "0.0.0.0", "api_token": "", "port": 8080}}
+        import os
+        os.environ.pop("KABU_DASHBOARD_TOKEN", None)
+        with patch.object(dash.cfg, "get_section", lambda s: fake.get(s, {})):
+            dash.init_auth()
+        try:
+            assert dash._auth_required is True
+            assert dash._dashboard_token  # 自動生成された非空トークン
+        finally:
+            dash._auth_required = False
+            dash._dashboard_token = None

@@ -8,7 +8,16 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 本番ターゲットは Windows（kabuステーションがWindows専用）。
+        # Linux でも基本動作を担保するため両方で実行する。
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash  # Windowsでも bash（grep/パイプ）を使えるようにする
     steps:
       - uses: actions/checkout@v4
 

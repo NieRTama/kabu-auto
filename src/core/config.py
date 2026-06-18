@@ -23,6 +23,12 @@ def _apply_env_overrides(config: dict) -> None:
     env_password = os.environ.get("KABU_API_PASSWORD")
     if env_password:
         config.setdefault("kabu_station", {})["password"] = env_password
+    env_line_token = os.environ.get("LINE_NOTIFY_TOKEN")
+    if env_line_token:
+        config.setdefault("alerts", {})["line_notify_token"] = env_line_token
+    env_dash_token = os.environ.get("KABU_DASHBOARD_TOKEN")
+    if env_dash_token:
+        config.setdefault("dashboard", {})["api_token"] = env_dash_token
 
 
 def get() -> dict:

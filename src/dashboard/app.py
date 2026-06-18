@@ -8,6 +8,7 @@ Webダッシュボード（FastAPI）
 """
 import asyncio
 import json
+import os
 import secrets
 from datetime import date, datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from urllib.parse import quote
 
 import numpy as np
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
@@ -34,6 +35,8 @@ _order_manager = None
 _ml_retrain_fn = None
 _data_update_fn = None
 _emergency_token: Optional[str] = None
+_dashboard_token: Optional[str] = None
+_auth_required: bool = False
 _system_status = {
     "running": False,
     "ws_connected": False,
@@ -44,6 +47,77 @@ _system_status = {
 FRONTEND_DIR = Path(__file__).parent.parent.parent / "frontend"
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+
+
+def init_auth() -> None:
+    """ダッシュボードのアクセス認証を初期化する。
+
+    - `dashboard.api_token`（または環境変数 KABU_DASHBOARD_TOKEN）が設定されていれば
+      その値で認証を有効化する。
+    - 未設定でも host が localhost 以外（例: 0.0.0.0 = LAN公開）ならトークンを自動生成して
+      認証を強制する（無認証でLANに建玉・損益を晒さないため）。
+    - host が localhost かつトークン未設定なら、利便性のため認証なし（ローカル専用）。
+
+    トークンはログには出さず、コンソールに一度だけアクセスURLとして表示する。
+    """
+    global _dashboard_token, _auth_required
+    dash = cfg.get_section("dashboard")
+    token = os.environ.get("KABU_DASHBOARD_TOKEN") or dash.get("api_token", "")
+    host = dash.get("host", "127.0.0.1")
+    is_local = host in ("127.0.0.1", "localhost", "::1")
+    if token:
+        _dashboard_token = token
+        _auth_required = True
+    elif not is_local:
+        _dashboard_token = secrets.token_urlsafe(16)
+        _auth_required = True
+        logger.warning(
+            "ダッシュボードをLAN公開(host={})していますが api_token 未設定のため"
+            "アクセストークンを自動生成しました。".format(host)
+        )
+    else:
+        _auth_required = False
+        _dashboard_token = None
+
+    if _auth_required:
+        port = dash.get("port", 8080)
+        display_host = "localhost" if is_local else host
+        # トークンはログ平文に残さず、コンソールへ一度だけ表示する
+        print(
+            "\n==== ダッシュボードへのアクセスにトークンが必要です ====\n"
+            f"  URL: http://{display_host}:{port}/?token={_dashboard_token}\n"
+            "  （ブラウザで上記URLを一度開くとCookieに保存され、以後はトークン不要）\n"
+            "  curl等では X-API-Token ヘッダーに同じトークンを指定してください。\n"
+            "=======================================================\n",
+            flush=True,
+        )
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """トークン認証ミドルウェア。
+
+    認証が有効な場合、X-API-Token ヘッダー / ?token= クエリ / Cookie のいずれかで
+    正しいトークンが提示されたリクエストのみ通す。クエリで提示された場合は Cookie に
+    保存し、以後の同一オリジン fetch（フロントエンドJS）は無改修で通る。
+
+    認証有効時は /docs・/openapi.json も保護対象とし、未認証の第三者にAPI仕様
+    （緊急決済・リスク変更等の存在）を露出させない。
+    """
+    if not _auth_required:
+        return await call_next(request)
+    provided = (
+        request.headers.get("X-API-Token")
+        or request.query_params.get("token")
+        or request.cookies.get("kabu_token")
+    )
+    if not provided or _dashboard_token is None or not secrets.compare_digest(provided, _dashboard_token):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    response = await call_next(request)
+    if request.query_params.get("token"):
+        # ブラウザでURL直開きした場合、以後の fetch 用に Cookie へ保存する
+        response.set_cookie("kabu_token", _dashboard_token, httponly=True, samesite="strict")
+    return response
 
 
 def set_ml_retrain_fn(fn) -> None:
@@ -61,11 +135,16 @@ def set_order_manager(om) -> None:
     _order_manager = om
     conf_token = cfg.get_section("dashboard").get("emergency_token", "")
     _emergency_token = conf_token if conf_token else secrets.token_urlsafe(16)
-    log_path = cfg.get_section("logging").get("file", "data/kabu_auto.log")
-    logger.warning(
-        f"緊急決済トークン: {_emergency_token}  "
-        f"← X-Emergency-Token ヘッダーに使用。ログファイル({log_path})へのアクセスを制限してください"
-    )
+    if not conf_token:
+        # 自動生成したトークンはログ平文に残さず、コンソールへ一度だけ表示する
+        print(
+            "\n==== 緊急決済トークン（X-Emergency-Token ヘッダー用）====\n"
+            f"  {_emergency_token}\n"
+            "  恒久運用する場合は config.yaml の dashboard.emergency_token に設定してください。\n"
+            "=====================================================\n",
+            flush=True,
+        )
+    init_auth()
 
 
 async def _verify_emergency_token(x_emergency_token: str = Header(...)) -> None:

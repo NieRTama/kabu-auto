@@ -66,14 +66,22 @@ data:
   history_years: 7  # 取得する過去データ年数
 
 dashboard:
-  host: "0.0.0.0"  # LAN内からアクセスする場合は "0.0.0.0" に変更
+  host: "127.0.0.1"  # 既定はローカルのみ。LAN内の他端末から使う場合だけ "0.0.0.0" に変更する
   port: 8080
-  emergency_token: ""  # 空の場合は起動時にランダム生成してログに記録
+  # ダッシュボードのアクセストークン。空でも host が 127.0.0.1 なら認証なし（ローカル専用）。
+  # host を 0.0.0.0 にすると（=LAN公開）、未設定でも起動時にトークンを自動生成して認証を強制する。
+  # 環境変数 KABU_DASHBOARD_TOKEN でも指定可能。恒久運用ではここに固定値を設定すること。
+  api_token: ""
+  emergency_token: ""  # 緊急決済用。空の場合は起動時にランダム生成してコンソールに一度だけ表示
 
 alerts:
-  line_notify_token: ""  # LINE Notify トークン（任意）
-  email: ""  # アラート送信先メール（任意）
+  # LINE Notify トークン（任意）。設定すると取引情報がLINEへ送信される。
+  # 環境変数 LINE_NOTIFY_TOKEN でも指定可能（平文をconfigに残さないため推奨）。
+  # ※ LINE Notify はサービス提供元による終了が告知されているため、利用可否に注意。
+  line_notify_token: ""
 
 logging:
   level: "INFO"
+  # ログは1日単位で区切られ、ファイル名末尾に日付が付く（例: data/kabu_auto_2026-06-18.log）。
   file: "data/kabu_auto.log"
+  retention: "15 days"  # ログの保持期間（この周期で古いログを自動削除）
