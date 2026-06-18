@@ -44,6 +44,18 @@ class TestCredentials:
         assert "s3cretpw!" not in content
         assert "hash" in content and "salt" in content
 
+    def test_username_not_stored_in_plaintext(self, tmp_path):
+        """ユーザーIDも平文で保存しない（ハッシュ化）"""
+        auth.create_user("super_secret_user", "s3cretpw!")
+        content = (tmp_path / "auth.json").read_text(encoding="utf-8")
+        assert "super_secret_user" not in content
+        assert "username_hash" in content and "username_salt" in content
+
+    def test_username_hash_uses_own_salt_distinct_from_password_salt(self):
+        auth.create_user("trader", "s3cretpw!")
+        assert auth._data["username_salt"] != auth._data["salt"]
+        assert auth._data["username_hash"] != auth._data["hash"]
+
     def test_short_password_rejected(self):
         with pytest.raises(ValueError):
             auth.create_user("trader", "short")

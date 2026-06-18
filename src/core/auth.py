@@ -2,8 +2,9 @@
 ダッシュボードのログイン認証（認証情報の保存とセッション管理）
 
 認証情報（ユーザーID・パスワード）は Authファイル（既定: data/auth.json）に保存する。
-パスワードは復号可能な「暗号化」ではなく、ソルト付きの PBKDF2-HMAC-SHA256 ハッシュとして
-保存する（一方向ハッシュ。Authファイルが漏えいしても元パスワードを復元できず、鍵管理も不要）。
+ユーザーID・パスワードのいずれも、復号可能な「暗号化」ではなく、それぞれ専用のソルトを
+持つ PBKDF2-HMAC-SHA256 ハッシュとして保存する（一方向ハッシュ。Authファイルが漏えいしても
+元のユーザーID・パスワードを復元できず、鍵管理も不要。ファイルを見てもユーザーIDは判別できない）。
 
 セッションはメモリ上で管理する（プロセス再起動で無効化され、再ログインが必要）。
 いずれも Python 標準ライブラリ（hashlib / hmac / secrets）のみで実装し、追加依存はない。
@@ -38,7 +39,8 @@ def load(path: str = "data/auth.json", session_ttl_hours: Optional[int] = None) 
         try:
             with open(_path, encoding="utf-8") as f:
                 _data = json.load(f)
-            logger.info(f"認証情報を読み込み: ユーザー='{_data.get('username')}' ({_path})")
+            # ユーザーIDも値を出さない（ハッシュ化しているため平文では保持していない）
+            logger.info(f"認証情報を読み込み: 設定済み ({_path})")
         except Exception as e:
             logger.error(f"認証ファイルの読み込みに失敗: {e}")
             _data = None
@@ -48,18 +50,19 @@ def load(path: str = "data/auth.json", session_ttl_hours: Optional[int] = None) 
 
 
 def is_configured() -> bool:
-    """認証情報（ユーザーID・パスワードハッシュ）が登録済みか。"""
-    return bool(_data and _data.get("username") and _data.get("hash"))
+    """認証情報（ユーザーID・パスワードのハッシュ）が登録済みか。"""
+    return bool(_data and _data.get("username_hash") and _data.get("hash"))
 
 
-def _hash(password: str, salt: bytes, iterations: int) -> str:
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+def _hash(value: str, salt: bytes, iterations: int) -> str:
+    dk = hashlib.pbkdf2_hmac("sha256", value.encode("utf-8"), salt, iterations)
     return dk.hex()
 
 
 def create_user(username: str, password: str) -> None:
     """初期設定：認証情報を作成しAuthファイルへPBKDF2ハッシュで保存する。
 
+    ユーザーID・パスワードのいずれも平文では保存しない（それぞれ専用ソルトでハッシュ化）。
     既に登録済みの場合は ValueError（初期設定は1度だけ）。
     """
     global _data
@@ -70,11 +73,13 @@ def create_user(username: str, password: str) -> None:
         raise ValueError("ユーザーIDを入力してください")
     if not password or len(password) < 8:
         raise ValueError("パスワードは8文字以上にしてください")
-    salt = secrets.token_bytes(_SALT_BYTES)
+    username_salt = secrets.token_bytes(_SALT_BYTES)
+    password_salt = secrets.token_bytes(_SALT_BYTES)
     _data = {
-        "username": username,
-        "salt": salt.hex(),
-        "hash": _hash(password, salt, _ITERATIONS),
+        "username_salt": username_salt.hex(),
+        "username_hash": _hash(username, username_salt, _ITERATIONS),
+        "salt": password_salt.hex(),
+        "hash": _hash(password, password_salt, _ITERATIONS),
         "iterations": _ITERATIONS,
         "algo": _ALGO,
         "created_at": datetime.now().isoformat(),
@@ -82,19 +87,20 @@ def create_user(username: str, password: str) -> None:
     _path.parent.mkdir(parents=True, exist_ok=True)
     with open(_path, "w", encoding="utf-8") as f:
         json.dump(_data, f, ensure_ascii=False, indent=2)
-    logger.warning(f"認証情報を作成しました: ユーザー='{username}' ({_path})")
+    logger.warning(f"認証情報を作成しました ({_path})")
 
 
 def verify(username: str, password: str) -> bool:
-    """ユーザーID・パスワードを照合する（定数時間比較）。"""
+    """ユーザーID・パスワードを照合する（いずれもハッシュ再計算＋定数時間比較）。"""
     if not is_configured():
         return False
-    salt = bytes.fromhex(_data["salt"])
     iterations = int(_data.get("iterations", _ITERATIONS))
-    expected = _data["hash"]
-    candidate = _hash(password or "", salt, iterations)
-    user_ok = hmac.compare_digest((username or "").strip(), _data["username"])
-    pw_ok = hmac.compare_digest(candidate, expected)
+    username_salt = bytes.fromhex(_data["username_salt"])
+    password_salt = bytes.fromhex(_data["salt"])
+    user_candidate = _hash((username or "").strip(), username_salt, iterations)
+    pw_candidate = _hash(password or "", password_salt, iterations)
+    user_ok = hmac.compare_digest(user_candidate, _data["username_hash"])
+    pw_ok = hmac.compare_digest(pw_candidate, _data["hash"])
     return user_ok and pw_ok
 
 

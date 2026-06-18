@@ -120,6 +120,34 @@ class TestInitAuth:
             dash._auth_required = False
             dash._dashboard_token = None
 
+    def test_wildcard_host_console_message_shows_real_lan_ip_not_0000(self, capsys):
+        """host=0.0.0.0 のとき、コンソール表示URLは到達不能な 0.0.0.0 ではなく実際のLAN IPにする"""
+        fake = {"dashboard": {"host": "0.0.0.0", "api_token": "", "port": 8080}}
+        import os
+        os.environ.pop("KABU_DASHBOARD_TOKEN", None)
+        with patch.object(dash.cfg, "get_section", lambda s: fake.get(s, {})):
+            with patch.object(dash, "_get_lan_ip", return_value="192.168.1.50"):
+                dash.init_auth()
+        try:
+            out = capsys.readouterr().out
+            assert "http://192.168.1.50:8080/" in out
+            assert "http://0.0.0.0:8080/" not in out
+        finally:
+            dash._auth_required = False
+            dash._dashboard_token = None
+
+    def test_specific_lan_ip_host_used_as_is(self):
+        """host が具体的なLAN IPの場合は、それをそのまま表示する（0.0.0.0変換は不要）"""
+        fake = {"dashboard": {"host": "192.168.1.50", "api_token": "", "port": 8080}}
+        import os
+        os.environ.pop("KABU_DASHBOARD_TOKEN", None)
+        with patch.object(dash.cfg, "get_section", lambda s: fake.get(s, {})):
+            with patch.object(dash, "_get_lan_ip") as mock_lan_ip:
+                dash.init_auth()
+                mock_lan_ip.assert_not_called()
+        dash._auth_required = False
+        dash._dashboard_token = None
+
 
 class TestLoginFlow:
     def test_auth_status_exempt_and_reports_unconfigured(self, auth_enabled):

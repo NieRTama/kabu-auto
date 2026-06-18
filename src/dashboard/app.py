@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import secrets
+import socket
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -52,6 +53,18 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
+def _get_lan_ip() -> str:
+    """LAN内からアクセス可能なIPアドレスを自動検出する（実際には通信しない）"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 def init_auth() -> None:
     """ダッシュボードのアクセス認証を初期化する。
 
@@ -89,7 +102,14 @@ def init_auth() -> None:
 
     if _auth_required:
         port = dash.get("port", 8080)
-        display_host = "localhost" if is_local else host
+        if is_local:
+            display_host = "localhost"
+        elif host == "0.0.0.0":
+            # 0.0.0.0 はワイルドカード待受アドレスであり、LAN端末からは接続できない。
+            # 実際にLAN内から到達可能な自機IPを解決して表示する。
+            display_host = _get_lan_ip()
+        else:
+            display_host = host
         setup_hint = (
             "  初回はログイン画面でユーザーID・パスワードを作成してください（初期設定）。\n"
             if not auth_store.is_configured()
