@@ -40,14 +40,17 @@ kabu-auto/
 │   ├── execution/     # 発注・ポジション管理・約定確認
 │   ├── risk/          # リスク管理（損切り・集中制限・日次カウンタ復元）
 │   ├── backtest/      # ウォークフォワードバックテストエンジン（閾値オーバーライド対応）
-│   ├── dashboard/     # FastAPI バックエンド
+│   ├── dashboard/     # FastAPI バックエンド（トークン認証付き）
 │   └── core/          # 設定・ウォッチリスト（複数管理）・リスクプロファイル・ログ・スケジューラ・アラート
 ├── frontend/
 │   └── index.html     # ダッシュボードUI（Chart.js）
 ├── models/            # 学習済み LightGBM モデル（.pkl）
-├── data/              # SQLite DB・ログ・バックアップ
+├── data/              # SQLite DB・バックアップ
+├── log/               # ログ（日付別・既定15日保持。自動生成）
 ├── docs/              # 概要設計書・詳細設計書
 ├── config.yaml        # 設定ファイル
+├── LICENSE            # 使用許諾契約
+├── SETUP-CHECKLIST.md # 購入者向けセットアップ・チェックリスト
 ├── requirements.txt
 └── main.py            # エントリポイント
 ```
