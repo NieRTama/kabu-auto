@@ -101,11 +101,38 @@ def get_sample_weights(t_ends: np.ndarray) -> np.ndarray:
     return weights
 
 
+def _assert_single_symbol_timeseries(df: pd.DataFrame) -> None:
+    """df が単一銘柄の時系列（日付インデックスが重複なく昇順）であることを検査する。
+
+    本モジュールの triple_barrier_labels()/get_daily_volatility() は行番号を
+    「N日後」として扱うため、複数銘柄のOHLCVを単純に連結したDataFrame（日付の
+    重複・逆順が生じる）を渡すと、移動平均やラベルが銘柄境界をまたいで破壊される。
+    複数銘柄を学習する場合は、銘柄ごとに build_training_set() を呼んでから
+    結果（X, y, weights）を連結すること（ml_model.train_multi() を参照）。
+    """
+    if df.index.has_duplicates:
+        raise ValueError(
+            "build_training_set: 日付インデックスに重複があります。"
+            "複数銘柄のOHLCVを連結してから渡していませんか？"
+            "銘柄ごとに個別に呼び出してください。"
+        )
+    if not df.index.is_monotonic_increasing:
+        raise ValueError(
+            "build_training_set: 日付インデックスが昇順ではありません。"
+            "複数銘柄のOHLCVを連結してから渡していませんか？"
+            "銘柄ごとに個別に呼び出してください。"
+        )
+
+
 def build_training_set(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
     """特徴量・トリプルバリアラベル・サンプル重みを生成する。
 
+    df は単一銘柄の時系列（日付インデックス・重複なし・昇順）であること。
+    複数銘柄を学習する場合は ml_model.train_multi() を使う。
+
     戻り値: (X, y, sample_weights)
     """
+    _assert_single_symbol_timeseries(df)
     conf = cfg.get_section("strategy")
     pt_mult = conf.get("tb_profit_mult", 2.0)
     sl_mult = conf.get("tb_stop_mult", 2.0)

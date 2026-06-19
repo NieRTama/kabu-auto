@@ -30,20 +30,25 @@ def _exec_morning(
     wallet_cash: float = 500_000.0,
     board_price: float = 1000.0,
     calc_qty: int = 100,
+    buy_side_effect=None,
 ) -> MagicMock:
     """
     morning_execution のロジックをインラインで実行し、
     order_mgr モックを返す。
 
     main.py のクロージャは直接テストできないため、
-    同一ロジックをここで再現する。
+    同一ロジックをここで再現する（buyループのcash逐次減算を含む。
+    シグナルの銘柄ごとdedup自体は main._select_latest_signals() 側で別途テストする）。
     """
     client = MagicMock()
     client.get_board.return_value = {"CurrentPrice": board_price}
     client.get_wallet.return_value = {"StockAccountWallet": wallet_cash}
 
     order_mgr = MagicMock()
-    order_mgr.buy.return_value = "BUY-ORD"
+    if buy_side_effect is not None:
+        order_mgr.buy.side_effect = buy_side_effect
+    else:
+        order_mgr.buy.return_value = "BUY-ORD"
     order_mgr.sell.return_value = "SELL-ORD"
 
     risk = MagicMock()
@@ -61,9 +66,7 @@ def _exec_morning(
     if not market_open:
         return order_mgr
 
-    cutoff = datetime.now() - timedelta(hours=20)
-
-    # シグナルを取得（モック: 渡されたリストをそのまま使用）
+    # シグナルを取得（モック: 渡されたリストをそのまま使用。dedupは別関数の責務）
     seen: set = set()
     pending: list = []
     for s in signals:
@@ -92,15 +95,20 @@ def _exec_morning(
 
     wallet = client.get_wallet()
     cash = float(wallet.get("StockAccountWallet", 0))
+    order_mgr.cash_log = []  # 各BUY判定時点のcashを記録（テスト用）
 
     for sig in buy_signals:
         board = client.get_board(sig.symbol)
         price = board.get("CurrentPrice") or board.get("Sell1", {}).get("Price", 0)
         if not price:
             continue
+        order_mgr.cash_log.append(cash)
         qty = risk.calc_position_size(sig.symbol, float(price), cash)
-        if qty > 0:
-            order_mgr.buy(sig.symbol, float(price), qty)
+        if qty <= 0:
+            continue
+        order_id = order_mgr.buy(sig.symbol, float(price), qty)
+        if order_id:
+            cash -= float(price) * qty
 
     return order_mgr
 
@@ -251,3 +259,61 @@ class TestMorningExecutionGuards:
         om = _exec_morning(signals=[], positions={})
         om.buy.assert_not_called()
         om.sell.assert_not_called()
+
+
+# ─── 余力の逐次減算のテスト（#3） ─────────────────────────────────────────
+
+
+class TestMorningExecutionCashDecrement:
+    def test_cash_decreases_after_successful_buy(self):
+        """1件目のBUY成功後、2件目の判定時のcashは1件目の発注額だけ減っている"""
+        signals = [
+            _make_signal("7203", "BUY"),
+            _make_signal("6758", "BUY"),
+        ]
+        om = _exec_morning(
+            signals=signals,
+            positions={},
+            wallet_cash=500_000.0,
+            board_price=1000.0,
+            calc_qty=100,
+        )
+        assert om.buy.call_count == 2
+        assert om.cash_log[0] == 500_000.0
+        # 1件目: 1000円×100株=100,000円 発注成功 → 2件目の判定時は400,000円のはず
+        assert om.cash_log[1] == 400_000.0
+
+    def test_cash_not_decremented_when_buy_fails(self):
+        """buy()がNone（注文拒否）を返した場合、cashは減算されない"""
+        signals = [
+            _make_signal("7203", "BUY"),
+            _make_signal("6758", "BUY"),
+        ]
+        om = _exec_morning(
+            signals=signals,
+            positions={},
+            wallet_cash=500_000.0,
+            board_price=1000.0,
+            calc_qty=100,
+            buy_side_effect=[None, "BUY-ORD"],  # 1件目は拒否
+        )
+        assert om.cash_log[0] == 500_000.0
+        # 1件目が失敗したのでcashは減らず、2件目も同じ500,000円で判定される
+        assert om.cash_log[1] == 500_000.0
+
+    def test_three_buys_decrement_sequentially(self):
+        """3件のBUYが成功するごとにcashが逐次減算される"""
+        signals = [
+            _make_signal("7203", "BUY"),
+            _make_signal("6758", "BUY"),
+            _make_signal("9984", "BUY"),
+        ]
+        om = _exec_morning(
+            signals=signals,
+            positions={},
+            wallet_cash=300_000.0,
+            board_price=500.0,
+            calc_qty=100,
+        )
+        # 各回 500円×100株=50,000円ずつ減算される
+        assert om.cash_log == [300_000.0, 250_000.0, 200_000.0]

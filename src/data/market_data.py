@@ -10,7 +10,7 @@ from datetime import date, timedelta
 import pandas as pd
 import yfinance as yf
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.data.database import OHLCV, get_session
 
@@ -117,6 +117,30 @@ def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
     df = pd.DataFrame(data).set_index("date")
     df.index = pd.to_datetime(df.index)
     return df
+
+
+def latest_closes(symbols: list[str]) -> dict[str, float]:
+    """指定銘柄群の最新終値を1クエリでまとめて取得する。
+
+    保有銘柄ごとに最新OHLCVを個別取得する（N+1クエリ）パターンを避けるための
+    ヘルパ。window関数で銘柄ごとの最新行（date降順1位）だけを抜き出す。
+    戻り値: {"7203": 2500.0, ...}（データが無い銘柄はキーに含まれない）
+    """
+    if not symbols:
+        return {}
+    with get_session() as session:
+        rn = func.row_number().over(
+            partition_by=OHLCV.symbol, order_by=OHLCV.date.desc()
+        ).label("rn")
+        subq = (
+            select(OHLCV.symbol, OHLCV.close, rn)
+            .where(OHLCV.symbol.in_(symbols))
+            .subquery()
+        )
+        rows = session.execute(
+            select(subq.c.symbol, subq.c.close).where(subq.c.rn == 1)
+        ).all()
+    return {r.symbol: r.close for r in rows if r.close is not None}
 
 
 def lookup_company_name(symbol: str) -> str:

@@ -4,13 +4,11 @@ kabu-auto メインエントリポイント
 ダッシュボード: http://localhost:8080
 """
 import os
-import socket
 import sys
 import threading
 import time
 from datetime import datetime, timedelta
 
-import pandas as pd
 import uvicorn
 from dotenv import load_dotenv
 from loguru import logger
@@ -32,6 +30,7 @@ from src.strategy import ml_model
 from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 from src.dashboard.app import (
     app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn, update_status,
+    _get_lan_ip,
 )
 
 
@@ -107,19 +106,22 @@ def main() -> None:
     def ml_retrain():
         nonlocal model
         logger.info("MLモデル週次再学習を開始...")
-        combined_df = None
-        # 学習データはアクティブリストに限定せず全リストの銘柄を対象にする（サンプル数確保のため）
+        # 学習データはアクティブリストに限定せず全リストの銘柄を対象にする（サンプル数確保のため）。
+        # 各銘柄のOHLCVは単純結合せず、銘柄ごとに train_multi() 内で特徴量・ラベルを
+        # 作ってから連結する（移動平均/RSI/トリプルバリア法が銘柄境界をまたいで
+        # 壊れるのを防ぐため。詳細は ml_model.train_multi() のdocstring参照）。
+        dfs = []
         for sym in watchlist_store.get_all_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 200:
                     continue
-                combined_df = df if combined_df is None else pd.concat([combined_df, df])
+                dfs.append(df)
             except Exception as e:
                 logger.error(f"データ読み込み失敗: {sym} {e}")
-        if combined_df is not None and len(combined_df) >= 200:
+        if dfs:
             try:
-                model = ml_model.train(combined_df, trigger="weekly_schedule")
+                model = ml_model.train_multi(dfs, trigger="weekly_schedule")
             except Exception as e:
                 logger.error(f"再学習失敗: {e}")
 
@@ -187,24 +189,13 @@ def main() -> None:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
 
     def morning_execution():
-        """9:05 に前日のBUY/SELLシグナルを元に発注（ライブモードのみ）"""
+        """9:05 に前営業日のBUY/SELLシグナルを元に発注（ライブモードのみ）"""
         if trading_conf.get("mode", "paper") != "live":
             return
         if not TradingScheduler.is_market_open():
             return
-        cutoff = datetime.now() - timedelta(hours=20)
         with get_session() as session:
-            signals = session.scalars(
-                select(Signal)
-                .where(Signal.action.in_(["BUY", "SELL"]), Signal.generated_at >= cutoff)
-                .order_by(Signal.generated_at.desc())
-            ).all()
-            seen: set = set()
-            pending: list = []
-            for s in signals:
-                if s.symbol not in seen:
-                    seen.add(s.symbol)
-                    pending.append(s)
+            pending = _select_latest_signals(session)
 
         if not pending:
             return
@@ -249,9 +240,16 @@ def main() -> None:
                     logger.info(f"朝買い見送り: {sig.symbol} - {reason}")
                     continue
                 qty = risk.calc_position_size(sig.symbol, float(price), cash)
-                if qty > 0:
-                    order_mgr.buy(sig.symbol, float(price), qty, sector=sector)
+                if qty <= 0:
+                    continue
+                order_id = order_mgr.buy(sig.symbol, float(price), qty, sector=sector)
+                if order_id:
+                    # 同一スキャン内の以降の銘柄が同じ余力を前提に判定しないよう、
+                    # 発注成功分をその場で減算する（複数銘柄の資金二重計上を防ぐ）
+                    cash -= float(price) * qty
                     logger.info(f"朝買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
+                else:
+                    logger.warning(f"朝買い発注失敗（注文拒否）: {sig.symbol}")
             except Exception as e:
                 logger.error(f"朝買い発注失敗: {sig.symbol} {e}")
 
@@ -304,16 +302,41 @@ def main() -> None:
         logger.info("終了しました")
 
 
-def _get_lan_ip() -> str:
-    """LAN内からアクセス可能なIPアドレスを自動検出する（実際には通信しない）"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
+def _select_latest_signals(session, max_age_days: int = 5) -> list:
+    """直近のシグナル生成日（最新の signal_scan バッチの日付）のBUY/SELLシグナルを、
+    銘柄ごと最新1件にdedupして返す。
+
+    「now - 20時間」のような固定時間窓では、土日・祝日を挟むと前営業日（例: 金曜16:20）の
+    シグナルを月曜9:05の発注時に取りこぼす（20時間を超えるため）。そのため「最新のシグナル
+    生成日そのもの」を基準にすることで、休場日数に関わらず前営業日分を正しく拾う。
+    生成日が max_age_days を超えて古い場合は陳腐化したシグナルとみなし空リストを返す
+    （長期間ジョブが止まっていた場合の誤発注を防ぐ）。
+    """
+    latest_at = session.scalar(
+        select(func.max(Signal.generated_at)).where(Signal.action.in_(["BUY", "SELL"]))
+    )
+    if latest_at is None:
+        return []
+    if (datetime.now() - latest_at).days > max_age_days:
+        return []
+    day_start = datetime.combine(latest_at.date(), datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    signals = session.scalars(
+        select(Signal)
+        .where(
+            Signal.action.in_(["BUY", "SELL"]),
+            Signal.generated_at >= day_start,
+            Signal.generated_at < day_end,
+        )
+        .order_by(Signal.generated_at.desc())
+    ).all()
+    seen: set = set()
+    pending: list = []
+    for s in signals:
+        if s.symbol not in seen:
+            seen.add(s.symbol)
+            pending.append(s)
+    return pending
 
 
 def _get_position_qty(symbol: str) -> int:

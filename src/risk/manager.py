@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 
 from src.core import config as cfg
 from src.data.database import Position, Trade, get_session
+from src.data.market_data import latest_closes
 
 
 class RiskManager:
@@ -104,14 +105,29 @@ class RiskManager:
         return True, ""
 
     def check_sector_concentration(self, sector: str) -> tuple[bool, str]:
-        """同一セクターの集中投資チェック"""
+        """同一セクターの集中投資チェック（建玉の時価評価額ベース）。
+
+        銘柄数の比率ではなく、quantity × 最新終値 のエクスポージャー金額で判定する
+        （小口1銘柄と大型1銘柄が同じ「1銘柄」として扱われる粗さを避けるため）。
+        最新終値が取得できない銘柄は avg_cost（取得平均単価）で代用する。
+        """
         max_ratio = self._conf.get("max_sector_ratio", 0.40)
         with get_session() as session:
             all_pos = session.scalars(select(Position).where(Position.quantity > 0)).all()
         if not all_pos:
             return True, ""
-        same_sector = [p for p in all_pos if p.sector == sector]
-        ratio = len(same_sector) / len(all_pos)
+        closes = latest_closes([p.symbol for p in all_pos])
+        total_value = 0.0
+        same_sector_value = 0.0
+        for p in all_pos:
+            price = closes.get(p.symbol) or p.avg_cost
+            value = p.quantity * price
+            total_value += value
+            if p.sector == sector:
+                same_sector_value += value
+        if total_value <= 0:
+            return True, ""
+        ratio = same_sector_value / total_value
         if ratio >= max_ratio:
             return False, f"セクター集中率が上限({max_ratio:.0%})超: {sector}"
         return True, ""

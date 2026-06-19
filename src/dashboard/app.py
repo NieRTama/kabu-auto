@@ -30,8 +30,9 @@ from src.core import (
     auth as auth_store,
 )
 from src.data.database import (
-    BacktestRun, BacktestTradeRecord, ModelMetrics, OHLCV, Position, Signal, Trade, get_session,
+    BacktestRun, BacktestTradeRecord, ModelMetrics, Position, Signal, Trade, get_session,
 )
+from src.data.market_data import latest_closes
 
 app = FastAPI(title="kabu-auto Dashboard")
 
@@ -344,30 +345,29 @@ async def get_positions():
         positions = session.scalars(
             select(Position).where(Position.quantity > 0)
         ).all()
-        result = []
-        for p in positions:
-            latest = session.scalar(
-                select(OHLCV).where(OHLCV.symbol == p.symbol).order_by(OHLCV.date.desc())
-            )
-            latest_price = latest.close if latest else None
-            unrealized_pnl = (
-                round((latest_price - p.avg_cost) * p.quantity, 0)
-                if latest_price and p.avg_cost else None
-            )
-            return_pct = (
-                round((latest_price - p.avg_cost) / p.avg_cost, 4)
-                if latest_price and p.avg_cost else None
-            )
-            result.append({
-                "symbol": p.symbol,
-                "quantity": p.quantity,
-                "avg_cost": p.avg_cost,
-                "sector": p.sector,
-                "opened_at": p.opened_at.isoformat() if p.opened_at else None,
-                "latest_price": latest_price,
-                "unrealized_pnl": unrealized_pnl,
-                "return_pct": return_pct,
-            })
+    # 銘柄ごとに最新終値を個別取得する(N+1クエリ)のを避け、まとめて1クエリで取得する
+    closes = latest_closes([p.symbol for p in positions])
+    result = []
+    for p in positions:
+        latest_price = closes.get(p.symbol)
+        unrealized_pnl = (
+            round((latest_price - p.avg_cost) * p.quantity, 0)
+            if latest_price and p.avg_cost else None
+        )
+        return_pct = (
+            round((latest_price - p.avg_cost) / p.avg_cost, 4)
+            if latest_price and p.avg_cost else None
+        )
+        result.append({
+            "symbol": p.symbol,
+            "quantity": p.quantity,
+            "avg_cost": p.avg_cost,
+            "sector": p.sector,
+            "opened_at": p.opened_at.isoformat() if p.opened_at else None,
+            "latest_price": latest_price,
+            "unrealized_pnl": unrealized_pnl,
+            "return_pct": return_pct,
+        })
     return result
 
 
@@ -490,13 +490,13 @@ async def get_pnl_enhanced_summary():
             .order_by(Trade.filled_at)
         ).all()
         positions = session.scalars(select(Position).where(Position.quantity > 0)).all()
-        total_unrealized = 0.0
-        for p in positions:
-            latest = session.scalar(
-                select(OHLCV).where(OHLCV.symbol == p.symbol).order_by(OHLCV.date.desc())
-            )
-            if latest and latest.close and p.avg_cost:
-                total_unrealized += (latest.close - p.avg_cost) * p.quantity
+    # 銘柄ごとに最新終値を個別取得する(N+1クエリ)のを避け、まとめて1クエリで取得する
+    closes = latest_closes([p.symbol for p in positions])
+    total_unrealized = 0.0
+    for p in positions:
+        close = closes.get(p.symbol)
+        if close and p.avg_cost:
+            total_unrealized += (close - p.avg_cost) * p.quantity
 
     daily: dict = {}
     for t in trades:
