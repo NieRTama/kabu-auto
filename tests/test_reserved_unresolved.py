@@ -32,11 +32,11 @@ def _add_position(symbol, quantity, avg_cost, sector=""):
         session.commit()
 
 
-def _add_trade(symbol, side, status, quantity, price, filled_quantity=None):
+def _add_trade(symbol, side, status, quantity, price, filled_quantity=None, sector=None):
     with get_session() as session:
         session.add(Trade(
-            order_id=f"{symbol}-{side}-{status}-{quantity}",
-            symbol=symbol, side=side, status=status,
+            order_id=f"{symbol}-{side}-{status}-{quantity}-{sector}",
+            symbol=symbol, side=side, status=status, sector=sector,
             quantity=quantity, price=price, filled_quantity=filled_quantity,
         ))
         session.commit()
@@ -99,3 +99,28 @@ class TestReservedInSectorConcentration:
         ok, reason = risk.check_sector_concentration("A")
         assert ok is False
         assert "A" in reason
+
+
+class TestTradeSectorForNewSymbol:
+    """再レビュー P1-3: Position未作成の新規銘柄でも、Trade.sectorから
+    未約定BUYのセクター引当が正しく解決できることの検証"""
+
+    def test_new_symbol_pending_buy_counted_via_trade_sector(self, isolated_db):
+        """9999は保有も無い完全新規銘柄。Trade.sector='D'だけでセクター引当が機能する"""
+        _add_position("1111", 100, 1000.0, sector="A")  # 既存保有（10万円）
+        _add_trade("9999", "BUY", st.PENDING, 100, 1000.0, sector="D")  # 新規10万円
+
+        risk = RiskManager()
+        risk._conf = {"max_sector_ratio": 0.40}
+        # 総額20万のうちセクターD=10万 → 50% ≥ 40% → NG
+        ok, reason = risk.check_sector_concentration("D")
+        assert ok is False
+        assert "D" in reason
+
+    def test_new_symbol_without_trade_sector_not_misattributed(self, isolated_db):
+        """sector未記録（旧データ等）の新規銘柄は合計には入るがどのセクターにも属さない"""
+        _add_trade("9999", "BUY", st.PENDING, 100, 1000.0, sector=None)
+        risk = RiskManager()
+        risk._conf = {"max_sector_ratio": 0.40}
+        ok, _ = risk.check_sector_concentration("D")
+        assert ok is True  # Dセクターには何も計上されない

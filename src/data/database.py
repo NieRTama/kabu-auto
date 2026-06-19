@@ -41,6 +41,8 @@ class Trade(Base):
     order_id = Column(String(50), unique=True)
     symbol = Column(String(10), nullable=False)
     side = Column(String(4), nullable=False)  # "BUY" or "SELL"
+    sector = Column(String(50))  # 発注時点のセクター（新規銘柄はPosition未作成のため、
+    # 未約定BUYのセクター引当をPosition経由でなくここから直接解決できるようにする）
     quantity = Column(Integer, nullable=False)  # 発注数量
     price = Column(Float)  # 発注時の指値（成行は0）。実約定価格は filled_price を使う
     filled_price = Column(Float)  # 実約定単価（約定イベント/注文照会から取得）

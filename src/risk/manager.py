@@ -95,8 +95,9 @@ class RiskManager:
     def _reserved_buy_by_sector(self) -> tuple[float, dict[str, float]]:
         """未約定BUY注文の引当金額 (総額, セクター別内訳) を返す。
 
-        price × 残数（発注数量 - 約定済数量）で算定する。セクターは保有Positionから
-        解決し、解決できない（新規銘柄等）分は総額のみに計上する。
+        price × 残数（発注数量 - 約定済数量）で算定する。セクターは発注時に記録した
+        `Trade.sector` を優先する（新規銘柄はPositionが未作成のため、Position経由の
+        解決では漏れる）。`Trade.sector` が無い古いレコードのみPositionへフォールバック。
         """
         with get_session() as session:
             trades = session.scalars(
@@ -117,7 +118,7 @@ class RiskManager:
                 continue
             notional = t.price * remaining
             total += notional
-            sec = pos_sector.get(t.symbol)
+            sec = t.sector or pos_sector.get(t.symbol)
             if sec:
                 by_sector[sec] = by_sector.get(sec, 0.0) + notional
         return total, by_sector
@@ -142,34 +143,58 @@ class RiskManager:
         logger.debug(f"{symbol}: 購入可能数={quantity}株 (価格={price:.0f}, 上限={max_amount:.0f}円)")
         return quantity
 
-    def check_max_positions(self) -> tuple[bool, str]:
-        """最大保有銘柄数チェック"""
+    def check_max_positions(self, candidate_symbol: Optional[str] = None) -> tuple[bool, str]:
+        """最大保有銘柄数チェック。
+
+        保有Positionの数だけでなく、未約定BUYの銘柄（まだPosition化されていない
+        新規銘柄も含む）も合算した銘柄集合で判定する。保有3/上限4のときに未約定BUYが
+        2件あると、どちらも個別には通って合計5銘柄になってしまう抜けを防ぐ
+        （再レビュー P1-1）。`candidate_symbol` を渡すと、その銘柄を追加した場合を
+        含めて判定する（既に保有/未約定の銘柄であれば集合は増えないため通る）。
+        """
         max_pos = self._conf.get("max_positions", 5)
         with get_session() as session:
-            active = session.scalar(
-                select(func.count(Position.id)).where(Position.quantity > 0)
-            ) or 0
-        if active >= max_pos:
+            active_symbols = {
+                p.symbol for p in session.scalars(
+                    select(Position).where(Position.quantity > 0)
+                ).all()
+            }
+            reserved_symbols = {
+                t.symbol for t in session.scalars(
+                    select(Trade).where(
+                        Trade.side == "BUY",
+                        Trade.status.in_(tuple(st.OPEN_STATUSES)),
+                    )
+                ).all()
+            }
+        after_symbols = active_symbols | reserved_symbols
+        if candidate_symbol:
+            after_symbols = after_symbols | {candidate_symbol}
+        if len(after_symbols) > max_pos:
             return False, f"最大保有銘柄数({max_pos})に達しています"
         return True, ""
 
-    def check_sector_concentration(self, sector: str) -> tuple[bool, str]:
+    def check_sector_concentration(self, sector: str,
+                                   candidate_notional: float = 0.0) -> tuple[bool, str]:
         """同一セクターの集中投資チェック（建玉の時価評価額ベース）。
 
         銘柄数の比率ではなく、quantity × 最新終値 のエクスポージャー金額で判定する
         （小口1銘柄と大型1銘柄が同じ「1銘柄」として扱われる粗さを避けるため）。
         最新終値が取得できない銘柄は avg_cost（取得平均単価）で代用する。
+        `candidate_notional` には**これから出す注文自体の金額**を渡す（再レビュー P1-2）。
+        既存保有・未約定BUYの引当だけでは「この注文を加えたら超過する」ケースを
+        発注前に弾けないため、判定対象の候補金額も合算してから比較する。
         """
         max_ratio = self._conf.get("max_sector_ratio", 0.40)
         with get_session() as session:
             all_pos = session.scalars(select(Position).where(Position.quantity > 0)).all()
         # 未約定BUYの引当も「買った後の集中度」として加味する（発注前に上限超過を防ぐ）
         reserved_total, reserved_by_sector = self._reserved_buy_by_sector()
-        if not all_pos and reserved_total <= 0:
+        if not all_pos and reserved_total <= 0 and candidate_notional <= 0:
             return True, ""
         closes = latest_closes([p.symbol for p in all_pos])
-        total_value = reserved_total
-        same_sector_value = reserved_by_sector.get(sector, 0.0)
+        total_value = reserved_total + candidate_notional
+        same_sector_value = reserved_by_sector.get(sector, 0.0) + candidate_notional
         for p in all_pos:
             price = closes.get(p.symbol) or p.avg_cost
             value = p.quantity * price
@@ -202,14 +227,15 @@ class RiskManager:
         ok, reason = self.can_place_order()
         if not ok:
             return False, reason
-        ok, reason = self.check_max_positions()
+        ok, reason = self.check_max_positions(candidate_symbol=symbol)
         if not ok:
             return False, reason
-        if sector:
-            ok, reason = self.check_sector_concentration(sector)
-            if not ok:
-                return False, reason
         quantity = self.calc_position_size(symbol, price, cash_balance)
         if quantity <= 0:
             return False, f"余力不足: {symbol}"
+        if sector:
+            # この注文自体の金額もセクター集中度に加味する（発注前に超過を弾く。再レビュー P1-2）
+            ok, reason = self.check_sector_concentration(sector, candidate_notional=price * quantity)
+            if not ok:
+                return False, reason
         return True, ""
