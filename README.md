@@ -331,14 +331,19 @@ curl -X POST http://localhost:8080/api/backtest/run \
 ```yaml
 trading:
   max_positions: 5           # 最大同時保有銘柄数
-  max_position_ratio: 0.20   # 1銘柄最大投資額（総資金比 20%）
-  stop_loss_pct: -0.05       # 損切りライン（-5%）
+  max_position_ratio: 0.25   # 1銘柄最大投資額（総資金比 25%）
+  stop_loss_pct: -0.07       # 損切りライン（-7%）
   max_sector_ratio: 0.40     # 同一セクター集中率上限（40%）
   order_timeout_seconds: 300 # 未約定注文の自動キャンセル（秒）
   daily_order_limit: 100     # 1日の最大注文数
   max_daily_loss: 30000      # 当日損失上限（円）。0 で無効
   paper_initial_capital: 500000  # ペーパーモードの初期資金（仮想ウォレットの基準額）
 ```
+
+> ここに示した `max_positions`/`max_position_ratio`/`stop_loss_pct`/`max_sector_ratio`/`max_daily_loss`
+> は、アクティブなリスクプロファイル（既定 `low_risk`）の値で起動時・切替時に上書きされる。
+> プロファイルを使わず固定したい場合は `config.yaml` の `active_risk_profile` と
+> `risk_profiles` を調整するか、`risk_profile.json` を削除する。
 
 当日の注文数・実現損失カウンタはプロセスのメモリ上だけでなくDBからも復元されるため、
 当日損失上限に達した後にプロセスを再起動しても、セーフティが無効化されることはない。
@@ -378,7 +383,8 @@ strategy:
 | 16:00 | 日次OHLCVデータ更新 |
 | 16:20 | シグナルスキャン・翌営業日の売買候補をスキャン（必ずデータ更新の後） |
 | 17:00 | SQLite 日次バックアップ |
-| 毎週末 | LightGBM モデル自動再学習 |
+| 毎週日曜 02:00 | LightGBM モデル自動再学習（週次） |
+| 15秒ごと | 未約定注文の状態照合（reconcile_orders。市場時間中のみ実働） |
 
 > シグナルスキャンはデータ更新より後の時刻に固定している。前に実行すると、当日分の
 > 終値がまだDBに反映されておらず前日終値でシグナルを生成してしまうため。

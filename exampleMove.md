@@ -10,8 +10,8 @@
 
 | 項目 | ローリスク (low_risk) | ハイリスク (high_risk) |
 |---|---|---|
-| 買い閾値 (combined_score ≥) | 0.32 | 0.18 |
-| 売り閾値 (combined_score ≤) | −0.32 | −0.18 |
+| 買い閾値 (combined_score ≥) | 0.14 | 0.08 |
+| 売り閾値 (combined_score ≤) | −0.14 | −0.08 |
 | 1銘柄あたり最大投資比率 | 余力の12% | 余力の35% |
 | 損切りライン | −4% | −10% |
 | 最大同時保有銘柄数 | 6銘柄 | 4銘柄 |
@@ -102,8 +102,8 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 
 | 項目 | 値 |
 |---|---|
-| 買い閾値 | combined_score ≥ 0.18 |
-| 売り閾値 | combined_score ≤ −0.18 |
+| 買い閾値 | combined_score ≥ 0.08 |
+| 売り閾値 | combined_score ≤ −0.08 |
 | 1銘柄あたり最大投資額 | 175,000円（余力の35%） |
 | 損切りライン | −10% |
 | 最大同時保有銘柄数 | 4銘柄 |
