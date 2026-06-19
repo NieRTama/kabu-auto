@@ -5,9 +5,10 @@ RiskManager.restore_daily_state() のテスト
 無効化されるため、起動時に当日（JST）の約定TradeからDBで再構築することを検証する。
 """
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import src.core.clock as clock
 import src.risk.manager as mod
 
 
@@ -39,7 +40,7 @@ def _trade(filled_at, pnl):
 
 class TestRestoreDailyState:
     def test_counts_today_orders_and_losses(self):
-        now = datetime.now()
+        now = clock.now()
         risk = _make_risk_with_trades([
             _trade(now, -1000),   # 損失
             _trade(now, 500),     # 利益（損失カウンタには入らない）
@@ -49,7 +50,7 @@ class TestRestoreDailyState:
         assert risk._daily_loss_yen == 3000.0
 
     def test_ignores_other_days(self):
-        now = datetime.now()
+        now = clock.now()
         yesterday = now - timedelta(days=1)
         risk = _make_risk_with_trades([
             _trade(yesterday, -5000),  # 前日 → 無視
@@ -67,7 +68,7 @@ class TestRestoreDailyState:
 
     def test_restored_loss_blocks_new_orders(self):
         """復元した当日損失が上限超なら can_place_order が発注を止める"""
-        now = datetime.now()
+        now = clock.now()
         risk = _make_risk_with_trades([_trade(now, -40000)])
         ok, reason = risk.can_place_order()
         assert ok is False

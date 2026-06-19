@@ -12,9 +12,16 @@ class TestClock:
         """clock.now() は tzinfo を持たない naive datetime を返す"""
         assert clock.now().tzinfo is None
 
-    def test_now_close_to_system(self):
-        """JSTホストでは clock.now() は datetime.now() とほぼ一致する"""
-        delta = abs((clock.now() - datetime.now()).total_seconds())
+    def test_now_close_to_jst_wall_clock(self):
+        """clock.now() は実際のJST壁時計（zoneinfo基準）とほぼ一致する
+
+        システムのローカル時刻と比較すると、CI(UTC)とJST環境で結果が変わってしまうため、
+        zoneinfo で直接JSTを求めた値と比較する。
+        """
+        from zoneinfo import ZoneInfo
+
+        jst_now = datetime.now(ZoneInfo("Asia/Tokyo")).replace(tzinfo=None)
+        delta = abs((clock.now() - jst_now).total_seconds())
         assert delta < 5
 
     def test_today_is_date(self):
