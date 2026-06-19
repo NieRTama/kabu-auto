@@ -2,10 +2,13 @@
 OrderManager の成行発注・キャンセル失敗処理・実約定価格反映のテスト（再レビュー対応）
 
 カバー範囲:
-  A-1: sell_market が成行注文(FrontOrderType=10, Price=0)を送る
-  A-2: _timeout_cancel がキャンセル失敗時に CANCELLED にせず CANCEL_FAILED にする
-  A-3: _extract_fill / _resolve_fill が実約定単価(VWAP)・数量を取り出す
-       on_order_event が部分約定を PARTIALLY_FILLED にする
+  A-1/P0-3,4,5: sell_market が成行注文(FrontOrderType=10, Price=0)を送る。
+       reason="stop_loss"/"emergency" は新規発注ゲートをバイパスし退出を優先する
+  A-2: _timeout_cancel/_cancel_order_now がキャンセル失敗時に CANCELLED にせず CANCEL_FAILED にする
+  A-3/P0-2: _extract_fill が実約定単価(VWAP)・数量を取り出す（cum_qty=0を誤ってNone扱いしない）。
+       _sync_trade_with_order が OrderState==5 を無条件でFILLED扱いせず、
+       cum_qty に応じて FILLED/PARTIALLY_FILLED/CANCELLED を正しく区別する。
+  P0-1: reconcile_open_orders / _reconcile_trade が /orders 照会でDBをブローカー状態へ収束させる
 """
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
@@ -79,6 +82,88 @@ class TestSellMarket:
         assert oid is None
 
 
+# ─── sell_market の reason によるリスクゲートバイパス（再レビュー P0-3/4/5）─────
+
+
+class TestSellMarketExitBypass:
+    def test_normal_reason_blocked_by_can_place_order(self):
+        """reason='normal'（既定）は新規発注と同じゲートに従う"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            risk.can_place_order.return_value = (False, "当日損失上限に達しました")
+            oid = om.sell_market("7203", 100)
+        assert oid is None
+        client.send_order.assert_not_called()
+
+    def test_stop_loss_bypasses_daily_loss_limit(self):
+        """reason='stop_loss' は当日損失上限到達中でも発注を続行する"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            risk.can_place_order.return_value = (False, "当日損失上限に達しました")
+            om._cancel_open_orders_for_symbol = MagicMock()
+            oid = om.sell_market("7203", 100, reason="stop_loss")
+        assert oid == "ORD-1"
+        client.send_order.assert_called_once()
+
+    def test_emergency_bypasses_daily_loss_limit(self):
+        """reason='emergency' も同様に当日損失上限をバイパスする"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            risk.can_place_order.return_value = (False, "当日損失上限に達しました")
+            om._cancel_open_orders_for_symbol = MagicMock()
+            oid = om.sell_market("7203", 100, reason="emergency")
+        assert oid == "ORD-1"
+
+    def test_exit_reason_cancels_conflicting_pending_orders_first(self):
+        """退出系は新規ゲートで弾かれず、同銘柄の未約定注文を先にキャンセルする"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            om._cancel_open_orders_for_symbol = MagicMock()
+            om.sell_market("7203", 100, reason="emergency")
+        om._cancel_open_orders_for_symbol.assert_called_once_with("7203")
+
+    def test_normal_reason_does_not_cancel_conflicting_orders(self):
+        """通常売却(reason='normal')は競合キャンセルを行わない（_has_pending_orderでスキップのみ）"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            om._cancel_open_orders_for_symbol = MagicMock()
+            om.sell_market("7203", 100)
+        om._cancel_open_orders_for_symbol.assert_not_called()
+
+    def test_exit_reason_skips_pending_check_in_live(self):
+        """退出系は _has_pending_order によるスキップを行わない（常に決済を試みる）"""
+        with _make_om(mode="live") as (om, client, risk, _):
+            om._has_pending_order = MagicMock(return_value=True)
+            om._cancel_open_orders_for_symbol = MagicMock()
+            oid = om.sell_market("7203", 100, reason="stop_loss")
+        assert oid == "ORD-1"
+
+    def test_paper_mode_exit_reason_still_fills(self):
+        """ペーパーモードでも reason='emergency' は通常通り即時約定する"""
+        with _make_om(mode="paper") as (om, _, risk, _):
+            risk.can_place_order.return_value = (False, "ブロック理由")
+            with patch.object(mod, "latest_closes", return_value={"7203": 1000.0}):
+                oid = om.sell_market("7203", 100, reason="emergency")
+        assert oid is not None
+
+
+class TestCancelOpenOrdersForSymbol:
+    def test_cancels_all_open_trades_for_symbol(self):
+        """同銘柄の未約定注文をすべて _cancel_order_now に渡す"""
+        with _make_om(mode="live") as (om, client, _, session):
+            t1, t2 = MagicMock(order_id="O1"), MagicMock(order_id="O2")
+            scal = MagicMock()
+            scal.all.return_value = [t1, t2]
+            session.scalars.return_value = scal
+            om._cancel_order_now = MagicMock()
+            om._cancel_open_orders_for_symbol("7203")
+        assert om._cancel_order_now.call_args_list == [(("O1",),), (("O2",),)]
+
+    def test_no_open_trades_does_nothing(self):
+        with _make_om(mode="live") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = []
+            session.scalars.return_value = scal
+            om._cancel_order_now = MagicMock()
+            om._cancel_open_orders_for_symbol("7203")
+        om._cancel_order_now.assert_not_called()
+
+
 # ─── A-2: キャンセル失敗 ──────────────────────────────────────────────────
 
 
@@ -142,47 +227,167 @@ class TestExtractFill:
         assert mod.OrderManager._extract_fill({}) == (None, None)
 
 
-class TestResolveFill:
-    def test_uses_event_when_available(self):
-        """イベントに約定明細があればAPI照会しない"""
-        with _make_om(mode="live") as (om, client, _, _):
-            event = {"CumQty": 100, "Details": [{"RecType": 8, "Price": 1200, "Qty": 100}]}
-            price, qty = om._resolve_fill("ORD-1", event)
-        assert (price, qty) == (1200.0, 100)
-        client.get_orders.assert_not_called()
+class TestFindOrder:
+    def test_finds_by_id_field(self):
+        orders = [{"ID": "A"}, {"ID": "ORD-1", "CumQty": 1}]
+        assert mod.OrderManager._find_order(orders, "ORD-1")["CumQty"] == 1
 
-    def test_falls_back_to_get_orders(self):
-        """イベントに明細が無ければ get_orders で当該注文を照会"""
-        with _make_om(mode="live") as (om, client, _, _):
-            client.get_orders.return_value = [
-                {"ID": "OTHER", "CumQty": 50, "Price": 999},
-                {"ID": "ORD-1", "CumQty": 100, "Price": 1300},
-            ]
-            price, qty = om._resolve_fill("ORD-1", {})
-        assert (price, qty) == (1300.0, 100)
+    def test_finds_by_orderid_field(self):
+        orders = [{"OrderId": "ORD-1", "CumQty": 2}]
+        assert mod.OrderManager._find_order(orders, "ORD-1")["CumQty"] == 2
+
+    def test_not_found_returns_none(self):
+        assert mod.OrderManager._find_order([{"ID": "OTHER"}], "ORD-1") is None
 
 
-class TestOnOrderEventPartialFill:
-    def test_partial_fill_marks_partially_filled(self):
+class TestSyncTradeWithOrderZeroFillBug:
+    """再レビュー P0-2: cum_qty=0（取消/失効で0株約定終了）を誤ってFILLEDにしないことの検証"""
+
+    def _trade(self, quantity=100, filled_quantity=None, status="PENDING", price=1000.0):
+        return MagicMock(order_id="ORD-1", symbol="7203", side="BUY",
+                         quantity=quantity, filled_quantity=filled_quantity,
+                         status=status, price=price)
+
+    def test_state5_zero_fill_becomes_cancelled_not_filled(self):
+        """OrderState/State=5 だが CumQty=0 → CANCELLED（旧バグでは誤ってFILLEDになっていた）"""
+        trade = self._trade()
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            om._update_position = MagicMock()
+            om._sync_trade_with_order(trade, {"State": 5, "CumQty": 0})
+        assert om._record_fill.call_args[0][1] == st.CANCELLED
+        om._update_position.assert_not_called()
+
+    def test_state5_full_fill_becomes_filled(self):
+        trade = self._trade(quantity=100)
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            om._update_position = MagicMock()
+            om._sync_trade_with_order(
+                trade, {"State": 5, "CumQty": 100, "Price": 1010},
+            )
+        assert om._record_fill.call_args[0][1] == st.FILLED
+        om._update_position.assert_called_once_with("7203", "BUY", 100, 1010.0, order_id=None)
+
+    def test_partial_fill_marks_partially_filled_and_applies_delta_only(self):
         """累計約定 < 発注数量 なら PARTIALLY_FILLED とし、増分のみ反映"""
-        trade = MagicMock()
-        trade.status = "PENDING"
-        trade.symbol = "7203"
-        trade.side = "BUY"
-        trade.quantity = 300
-        trade.filled_quantity = None
-        trade.price = 1000.0
-
-        with _make_om(mode="live") as (om, _, _, session):
-            session.scalar.return_value = trade
-            om._resolve_fill = MagicMock(return_value=(1005.0, 100))  # 100/300のみ約定
+        trade = self._trade(quantity=300)
+        with _make_om(mode="live") as (om, _, _, _):
             om._record_fill = MagicMock()
             om._update_position = MagicMock()
             om._cancel_timeout_timer = MagicMock()
-            om.on_order_event({"OrderID": "ORD-1", "OrderState": 5})
-
-        # 部分約定: ステータスは PARTIALLY_FILLED、タイマーは解除しない
+            om._sync_trade_with_order(
+                trade, {"State": 3, "CumQty": 100, "Price": 1005},
+            )
         assert om._record_fill.call_args[0][1] == st.PARTIALLY_FILLED
         om._cancel_timeout_timer.assert_not_called()
-        # 増分100のみ反映
         om._update_position.assert_called_once_with("7203", "BUY", 100, 1005.0, order_id=None)
+
+    def test_second_partial_only_applies_new_delta(self):
+        """既に100約定済みのTradeに累計200の通知が来たら増分100のみ反映する"""
+        trade = self._trade(quantity=300, filled_quantity=100)
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            om._update_position = MagicMock()
+            om._sync_trade_with_order(
+                trade, {"State": 3, "CumQty": 200, "Price": 1005},
+            )
+        om._update_position.assert_called_once_with("7203", "BUY", 100, 1005.0, order_id=None)
+
+    def test_no_change_is_noop(self):
+        """状態・約定数量に変化が無ければ何も更新しない"""
+        trade = self._trade(quantity=100, filled_quantity=100, status=st.FILLED)
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            om._sync_trade_with_order(
+                trade, {"State": 5, "CumQty": 100, "Price": 1000},
+            )
+        om._record_fill.assert_not_called()
+
+    def test_order_not_found_marks_unknown_and_alerts(self):
+        trade = self._trade(status="PENDING")
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            with patch.object(mod, "alert") as alert_mock:
+                om._sync_trade_with_order(trade, None)
+        om._record_fill.assert_called_once_with("ORD-1", st.UNKNOWN, None, None)
+        alert_mock.assert_called_once()
+
+    def test_already_unknown_order_not_found_does_not_realert(self):
+        """既にUNKNOWNなら毎回アラートしない（同じ照合結果での重複通知を避ける）"""
+        trade = self._trade(status=st.UNKNOWN)
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            with patch.object(mod, "alert") as alert_mock:
+                om._sync_trade_with_order(trade, None)
+        om._record_fill.assert_not_called()
+        alert_mock.assert_not_called()
+
+    def test_rejected_state_cancels_timer(self):
+        trade = self._trade(status="PENDING")
+        with _make_om(mode="live") as (om, _, _, _):
+            om._record_fill = MagicMock()
+            om._cancel_timeout_timer = MagicMock()
+            # REJECTEDは_status_from_api_orderの戻り値に無いため直接FILLED系以外を想定し、
+            # CANCELLED系の終了パスでタイマー解除されることを確認する
+            om._sync_trade_with_order(trade, {"State": 5, "CumQty": 0})
+        om._cancel_timeout_timer.assert_called_once_with("ORD-1")
+
+
+class TestReconcileTrade:
+    def test_fetches_orders_and_syncs(self):
+        trade = MagicMock(order_id="ORD-1")
+        with _make_om(mode="live") as (om, client, _, _):
+            client.get_orders.return_value = [{"ID": "ORD-1", "State": 5, "CumQty": 0}]
+            om._sync_trade_with_order = MagicMock()
+            om._reconcile_trade(trade)
+        om._sync_trade_with_order.assert_called_once_with(
+            trade, {"ID": "ORD-1", "State": 5, "CumQty": 0},
+        )
+
+    def test_api_failure_is_swallowed(self):
+        trade = MagicMock(order_id="ORD-1")
+        with _make_om(mode="live") as (om, client, _, _):
+            client.get_orders.side_effect = RuntimeError("network")
+            om._sync_trade_with_order = MagicMock()
+            om._reconcile_trade(trade)  # raiseしない
+        om._sync_trade_with_order.assert_not_called()
+
+
+class TestReconcileOpenOrders:
+    def test_paper_mode_does_nothing(self):
+        with _make_om(mode="paper") as (om, client, _, _):
+            om.reconcile_open_orders()
+        client.get_orders.assert_not_called()
+
+    def test_no_open_trades_skips_api_call(self):
+        with _make_om(mode="live") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = []
+            session.scalars.return_value = scal
+            om.reconcile_open_orders()
+        client.get_orders.assert_not_called()
+
+    def test_syncs_each_open_trade_with_single_api_call(self):
+        t1 = MagicMock(order_id="O1")
+        t2 = MagicMock(order_id="O2")
+        with _make_om(mode="live") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = [t1, t2]
+            session.scalars.return_value = scal
+            client.get_orders.return_value = [
+                {"ID": "O1", "State": 5, "CumQty": 100},
+                {"ID": "O2", "State": 5, "CumQty": 0},
+            ]
+            om._sync_trade_with_order = MagicMock()
+            om.reconcile_open_orders()
+        assert client.get_orders.call_count == 1
+        assert om._sync_trade_with_order.call_count == 2
+
+    def test_api_failure_does_not_raise(self):
+        with _make_om(mode="live") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = [MagicMock(order_id="O1")]
+            session.scalars.return_value = scal
+            client.get_orders.side_effect = RuntimeError("down")
+            om.reconcile_open_orders()  # raiseしない

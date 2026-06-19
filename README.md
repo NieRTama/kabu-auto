@@ -91,7 +91,9 @@ pip install -r requirements.txt
 
 ### 3. パスワードの設定（.env）
 
-kabuステーションのログインパスワードは `config.yaml` には書かず、`.env` ファイルで管理する
+kabuステーションの**APIパスワード**（kabuステーションアプリの「APIシステム設定」画面で
+発行・設定するもの。**証券口座のログインパスワード・取引暗証番号とは別物**）は
+`config.yaml` には書かず、`.env` ファイルで管理する
 （`.env` は `.gitignore` 済みのため誤ってgitにコミットされる心配がない）。
 `config.yaml` には `password` 項目を**置かない**こと。もし記載があると起動時に警告が出る。
 
@@ -102,7 +104,7 @@ copy .env.example .env   # Windows。Mac/Linuxは cp .env.example .env
 `.env` を開いて以下のように編集する。
 
 ```
-KABU_API_PASSWORD=ここにkabuステーションのログインパスワード
+KABU_API_PASSWORD=ここにkabuステーションのAPIパスワード（証券口座ログインPWではない）
 ```
 
 ### 4. config.yaml の編集

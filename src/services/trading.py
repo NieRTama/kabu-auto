@@ -143,6 +143,17 @@ class TradingServices:
             except Exception as e:
                 logger.error(f"再学習失敗: {e}")
 
+    # ─── 注文状態の定期照合 ─────────────────────────────
+    def reconcile_orders(self) -> None:
+        """WebSocketイベントの取り逃し・切断・再起動に備え、未約定注文をブローカーの
+        /orders 照会結果へ定期的に収束させる（市場時間外は何もしない）。"""
+        if not TradingScheduler.is_market_open():
+            return
+        try:
+            self.order_mgr.reconcile_open_orders()
+        except Exception as e:
+            logger.error(f"注文照合エラー: {e}")
+
     # ─── 損切り監視 ─────────────────────────────────────
     def stop_loss_check(self) -> None:
         if not TradingScheduler.is_market_open():
@@ -162,8 +173,10 @@ class TradingServices:
                     price = board.get("CurrentPrice", 0)
                 if price and self.risk.should_stop_loss(sym, price):
                     logger.warning(f"損切り発動: {sym}")
-                    # 損切りは確実な約定を優先し成行で発注する（指値だと急変時に約定しない）
-                    self.order_mgr.sell_market(sym, qty)
+                    # 損切りは確実な約定を優先し成行で発注する（指値だと急変時に約定しない）。
+                    # reason="stop_loss" により日次上限・損失上限等の新規発注ゲートを
+                    # バイパスする（損切りは既存リスクを減らす退出操作のため止めてはいけない）
+                    self.order_mgr.sell_market(sym, qty, reason="stop_loss")
                     alert("損切り実行", f"{sym} @{price:.0f}円")
             except Exception as e:
                 logger.error(f"損切りチェックエラー: {sym} {e}")

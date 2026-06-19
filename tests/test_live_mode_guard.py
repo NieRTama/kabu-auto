@@ -44,3 +44,25 @@ class TestLiveModeGuardSource:
         assert "sync_on_startup" in src, (
             "main.py に order_mgr.sync_on_startup() 呼び出しがない"
         )
+
+    def test_live_mode_aborts_on_token_refresh_failure(self):
+        """再レビュー P1-5: ライブモードで初回トークン取得に失敗したら起動を中断する
+        （fail-closed。ペーパーモードでの継続ログのみでは口座状態不明のまま発注ロジックが
+        動く危険があるため）"""
+        with open("main.py", encoding="utf-8") as f:
+            src = f.read()
+        import re
+        # refresh_token() の except ブロック内で mode=="live" 判定とsys.exit(1)が
+        # 行われていることを検証する
+        match = re.search(
+            r"client\.refresh_token\(\).*?except Exception as e:(.*?)(?=\n    #|\Z)",
+            src, re.DOTALL,
+        )
+        assert match, "client.refresh_token() の except ブロックが見つからない"
+        except_block = match.group(1)
+        assert 'mode' in except_block and 'live' in except_block, (
+            "トークン取得失敗時にliveモードかどうかの分岐が無い"
+        )
+        assert "sys.exit(1)" in except_block, (
+            "ライブモードでのトークン取得失敗時に sys.exit(1) していない（fail-closedでない）"
+        )

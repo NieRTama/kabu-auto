@@ -21,6 +21,7 @@ from src.core import (
     risk_profile as risk_profile_store,
 )
 from src.core.alerts import alert
+from src.core.netutil import is_port_available
 from src.core.scheduler import TradingScheduler
 from src.api.kabu_client import KabuClient
 from src.data import database as db
@@ -67,6 +68,11 @@ def main() -> None:
     try:
         client.refresh_token()
     except Exception as e:
+        if trading_conf.get("mode", "paper") == "live":
+            # ライブモードでAPI接続できないまま起動を続けると、口座状態を把握できない
+            # まま発注ロジックだけが動く危険な状態になる（fail-closed）
+            logger.critical(f"ライブモードでkabuステーション接続に失敗。起動を中断します: {e}")
+            sys.exit(1)
         logger.warning(f"kabuステーション接続失敗（ペーパーモードで継続）: {e}")
 
     # ─── 起動時注文同期（ライブモードのみ）────────────────
@@ -107,6 +113,7 @@ def main() -> None:
     scheduler.register("stop_loss_check", services.stop_loss_check)
     scheduler.register("signal_scan", services.signal_scan)
     scheduler.register("morning_execution", services.morning_execution)
+    scheduler.register("reconcile_orders", services.reconcile_orders)
 
     # ─── WebSocket 開始 ────────────────────────────────────
     client.start_websocket(on_order_event=order_mgr.on_order_event)
@@ -116,20 +123,30 @@ def main() -> None:
     update_status(running=True, ws_connected=True, mode=trading_conf.get("mode", "paper"))
 
     # ─── ダッシュボード起動（別スレッド）────────────────────
+    dash_host = dash_conf.get("host", "127.0.0.1")
+    dash_port = dash_conf.get("port", 8080)
+    if not is_port_available(dash_host, dash_port):
+        msg = f"ダッシュボードのポート {dash_host}:{dash_port} は既に使用中です"
+        if trading_conf.get("mode", "paper") == "live":
+            # ライブモードでダッシュボードが起動できないと、発注ロジックは動くのに
+            # 状態の監視・緊急決済操作ができない危険な状態になるため起動を中断する
+            logger.critical(f"{msg}。ライブモードのため起動を中断します。")
+            sys.exit(1)
+        logger.warning(f"{msg}。ダッシュボードが起動できない可能性があります。")
+
     dash_thread = threading.Thread(
         target=uvicorn.run,
         kwargs={
             "app": dashboard_app,
-            "host": dash_conf.get("host", "127.0.0.1"),
-            "port": dash_conf.get("port", 8080),
+            "host": dash_host,
+            "port": dash_port,
             "log_level": "warning",
         },
         daemon=True,
     )
     dash_thread.start()
-    dash_port = dash_conf.get("port", 8080)
     logger.info(f"ダッシュボード起動: http://localhost:{dash_port}")
-    if dash_conf.get("host", "127.0.0.1") == "0.0.0.0":
+    if dash_host == "0.0.0.0":
         logger.info(f"LANからのアクセス: http://{_get_lan_ip()}:{dash_port}")
 
     # ─── メインループ ────────────────────────────────────────

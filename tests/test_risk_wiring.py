@@ -26,6 +26,7 @@ class TestSchedulerJobOrdering:
         for name in (
             "risk_reset", "token_refresh", "data_update", "db_backup",
             "ml_retrain", "stop_loss_check", "signal_scan", "morning_execution",
+            "reconcile_orders",
         ):
             sched.register(name, MagicMock())
 

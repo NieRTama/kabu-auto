@@ -5,6 +5,7 @@ APSchedulerによるジョブスケジューラ
 - 毎日16:00: データ更新
 - 毎日16:20: シグナルスキャン（data_updateの完了を待つため16:00より後ろに設定）
 - 毎日17:00: バックアップ・ML再学習（週次）
+- 15秒ごと: 注文状態の照合（reconcile_orders。市場時間中のみコールバック側で実働）
 - 土曜: メンテナンス時間帯の回避
 """
 from datetime import datetime
@@ -77,6 +78,13 @@ class TradingScheduler:
                 cb["morning_execution"], "cron",
                 day_of_week="mon-fri",
                 hour=9, minute=5, id="morning_execution",
+            )
+        if "reconcile_orders" in cb:
+            # WebSocketイベントの取り逃し・切断・再起動を跨いでDB↔ブローカーの
+            # 注文状態ズレを定期的に検知・補正する（市場時間外はコールバック側でスキップ）
+            self._scheduler.add_job(
+                cb["reconcile_orders"], "interval",
+                seconds=15, id="reconcile_orders",
             )
 
         self._scheduler.start()

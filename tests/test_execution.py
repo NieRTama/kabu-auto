@@ -173,14 +173,14 @@ class TestCloseAllPositionsMarket:
         return p
 
     def test_calls_sell_market_for_each_position(self):
-        """緊急全決済は各保有銘柄について成行 sell_market を呼ぶ"""
+        """緊急全決済は各保有銘柄について成行 sell_market を reason='emergency' で呼ぶ"""
         with _make_om(mode="paper") as (om, client, _, session):
             scal = MagicMock()
             scal.all.return_value = [self._pos(qty=200)]
             session.scalars.return_value = scal
             om.sell_market = MagicMock()
             om.close_all_positions()
-        om.sell_market.assert_called_once_with("7203", 200)
+        om.sell_market.assert_called_once_with("7203", 200, reason="emergency")
 
     def test_does_not_use_limit_sell(self):
         """指値 sell() ではなく成行で決済する（急変時の約定漏れ防止）"""
@@ -195,59 +195,51 @@ class TestCloseAllPositionsMarket:
         om.sell_market.assert_called_once()
 
 
-# ─── Critical #3: ライブモード約定後のポジション更新 ─────────────────────
+# ─── on_order_event は補助トリガとしてAPI照合を起動するのみ（再レビュー P0-1/P0-2）──
 
 
-class TestOnOrderEventPositionUpdate:
-    def test_live_fill_triggers_position_update(self):
-        """ライブモード OrderState=5 受信時に実約定価格でポジション更新が呼ばれる"""
-        trade_mock = MagicMock()
-        trade_mock.status = "PENDING"
-        trade_mock.symbol = "7203"
-        trade_mock.side = "BUY"
-        trade_mock.quantity = 100
-        trade_mock.filled_quantity = None
-        trade_mock.price = 1000.0
-
+class TestOnOrderEventTriggersReconcile:
+    def test_open_trade_triggers_reconcile(self):
+        """未約定(OPEN_STATUSES)のTradeなら _reconcile_trade に処理を委譲する"""
+        trade_mock = MagicMock(status="PENDING")
         with _make_om(mode="live") as (om, _, _, session):
             session.scalar.return_value = trade_mock
-            om._resolve_fill = MagicMock(return_value=(1010.0, 100))
-            om._record_fill = MagicMock()
-            om._update_position = MagicMock()
+            om._reconcile_trade = MagicMock()
             om.on_order_event({"OrderID": "LIVE-ORD-001", "OrderState": 5})
+        om._reconcile_trade.assert_called_once_with(trade_mock)
 
-        # 約定単価(1010)・全量(100)でポジション更新されること
-        om._update_position.assert_called_once_with(
-            "7203", "BUY", 100, 1010.0, order_id=None,
-        )
+    def test_already_terminal_trade_does_not_reconcile(self):
+        """既にFILLED等の確定状態なら再照会しない（不要なAPI呼び出しを避ける）"""
+        trade_mock = MagicMock(status="FILLED")
+        with _make_om(mode="live") as (om, _, _, session):
+            session.scalar.return_value = trade_mock
+            om._reconcile_trade = MagicMock()
+            om.on_order_event({"OrderID": "LIVE-ORD-001", "OrderState": 5})
+        om._reconcile_trade.assert_not_called()
 
-    def test_paper_fill_event_skips_position_update(self):
-        """ペーパーモードでは WebSocket 約定イベントでポジション更新しない"""
-        trade_mock = MagicMock()
-        trade_mock.status = "PENDING"
-        trade_mock.symbol = "7203"
-        trade_mock.side = "BUY"
-        trade_mock.quantity = 100
-        trade_mock.filled_quantity = None
-        trade_mock.price = 1000.0
-
+    def test_paper_trade_already_filled_does_not_reconcile(self):
+        """ペーパー注文は発注時点でFILLED済みのため、イベント受信時に何もしない"""
+        trade_mock = MagicMock(status="FILLED")
         with _make_om(mode="paper") as (om, _, _, session):
             session.scalar.return_value = trade_mock
-            om._resolve_fill = MagicMock(return_value=(1010.0, 100))
-            om._record_fill = MagicMock()
-            om._update_position = MagicMock()
+            om._reconcile_trade = MagicMock()
             om.on_order_event({"OrderID": "PAPER-BUY-xxx", "OrderState": 5})
+        om._reconcile_trade.assert_not_called()
 
-        om._update_position.assert_not_called()
+    def test_unknown_order_id_ignored(self):
+        """DBに無い注文IDの通知は無視する（API照会もしない）"""
+        with _make_om(mode="live") as (om, client, _, session):
+            session.scalar.return_value = None
+            om._reconcile_trade = MagicMock()
+            om.on_order_event({"OrderID": "ORD", "OrderState": 5})
+        om._reconcile_trade.assert_not_called()
+        client.get_orders.assert_not_called()
 
-    def test_non_fill_state_ignored(self):
-        """OrderState が 5 以外はポジション更新しない"""
+    def test_missing_order_id_ignored(self):
         with _make_om(mode="live") as (om, _, _, _):
-            om._update_position = MagicMock()
-            for state in [1, 2, 3, 4]:
-                om.on_order_event({"OrderID": "ORD", "OrderState": state})
-
-        om._update_position.assert_not_called()
+            om._reconcile_trade = MagicMock()
+            om.on_order_event({"OrderState": 5})
+        om._reconcile_trade.assert_not_called()
 
 
 # ─── Medium #8: ペーパートレードが FILLED で保存される ──────────────────
@@ -299,3 +291,30 @@ class TestPaperTradeFilledStatus:
 
         trade = self._first_trade_added(session)
         assert trade.status == "PENDING"
+
+
+class TestTradeSectorRecorded:
+    """再レビュー P1-3: buy() がセクターをTradeに記録すること
+    （新規銘柄はPosition未作成のため、未約定BUYのセクター引当をTrade.sectorから
+    解決できるようにする）"""
+
+    def _first_trade_added(self, session) -> object:
+        return session.add.call_args_list[0][0][0]
+
+    def test_paper_buy_records_sector(self):
+        with _make_om(mode="paper") as (om, _, _, session):
+            om.buy("7203", 1000.0, 100, sector="Technology")
+        trade = self._first_trade_added(session)
+        assert trade.sector == "Technology"
+
+    def test_live_buy_records_sector(self):
+        with _make_om(mode="live") as (om, _, _, session):
+            om.buy("7203", 1000.0, 100, sector="Technology")
+        trade = self._first_trade_added(session)
+        assert trade.sector == "Technology"
+
+    def test_buy_without_sector_records_none(self):
+        with _make_om(mode="paper") as (om, _, _, session):
+            om.buy("7203", 1000.0, 100)
+        trade = self._first_trade_added(session)
+        assert trade.sector is None
