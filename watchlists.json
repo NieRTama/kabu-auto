@@ -44,7 +44,7 @@
       },
       {
         "code": "6758",
-        "name": "ソニーグループ",
+        "name": "Sony Group Corporation",
         "sector": "Technology"
       },
       {
@@ -61,6 +61,76 @@
         "code": "4755",
         "name": "Rakuten Group, Inc.",
         "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9602",
+        "name": "Toho Co., Ltd.",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "3166",
+        "name": "Ochi Holdings Co., Ltd.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9418",
+        "name": "U-NEXT HOLDINGS Co.,Ltd.",
+        "sector": "Industrials"
+      },
+      {
+        "code": "7453",
+        "name": "Ryohin Keikaku Co., Ltd.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "2702",
+        "name": "McDonald's Holdings Company (Japan), Ltd.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7867",
+        "name": "TOMY Company, Ltd.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "4503",
+        "name": "Astellas Pharma Inc.",
+        "sector": "Healthcare"
+      },
+      {
+        "code": "7872",
+        "name": "Estelle Holdings Co.,Ltd.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7033",
+        "name": "Management Solutions co.,Ltd.",
+        "sector": "Industrials"
+      },
+      {
+        "code": "7839",
+        "name": "Shoei Co., Ltd.",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "5401",
+        "name": "Nippon Steel Corporation",
+        "sector": "Basic Materials"
+      },
+      {
+        "code": "5527",
+        "name": "Property Technologies Inc.",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "2502",
+        "name": "Asahi Group Holdings, Ltd.",
+        "sector": "Consumer Defensive"
+      },
+      {
+        "code": "3635",
+        "name": "Koei Tecmo Holdings Co., Ltd.",
+        "sector": "Communication Services"
       }
     ],
     "小額リスト": [

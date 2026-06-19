@@ -21,6 +21,10 @@ log/
 # 認証情報（ログインのユーザーID・パスワードハッシュ）
 data/auth.json
 
+# セッション引き継ぎメモ・個人用リスク設定（非公開・個人用のため追跡しない）
+Chatlog.md
+risk_profile.json
+
 # 旧形式ウォッチリスト（watchlists.json に移行済み。後方互換のため残置するが追跡しない）
 watchlist.json
 
