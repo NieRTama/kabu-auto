@@ -1,6 +1,7 @@
 kabu_station:
   base_url: "http://localhost:18080/kabusapi"
-  password: ""  # 非推奨: .env の KABU_API_PASSWORD を使用すること（漏洩防止のためgit管理しない）
+  # APIパスワードは config.yaml に書かず、必ず .env の KABU_API_PASSWORD で設定する
+  # （平文での誤コミット・漏洩防止）。.env.example を参照。
   token_refresh_time: "08:30"  # 毎朝トークン再取得
 
 trading:

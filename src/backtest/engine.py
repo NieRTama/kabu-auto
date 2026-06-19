@@ -10,13 +10,14 @@
 """
 import json
 import math
-from datetime import date, datetime
+from datetime import date
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 
+from src.core import clock
 from src.core import config as cfg
 from src.data.database import BacktestRun, BacktestTradeRecord, get_session
 from src.data.market_data import load_ohlcv
@@ -216,7 +217,7 @@ def run_backtest(
             win_rate=win_rate,
             trade_count=len(sim_trades),
             use_ml=1 if model is not None else 0,
-            created_at=datetime.now(),
+            created_at=clock.now(),
             equity_curve_json=json.dumps(equity_curve),
             buy_threshold=buy_thr,
             sell_threshold=sell_thr,

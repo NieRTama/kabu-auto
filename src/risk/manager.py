@@ -6,15 +6,16 @@
 - セクター集中制限
 - ギャップリスク考慮
 """
-from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import clock
 from src.core import config as cfg
 from src.data.database import Position, Trade, get_session
 from src.data.market_data import latest_closes
+from src.execution import order_status as st
 
 
 class RiskManager:
@@ -34,7 +35,7 @@ class RiskManager:
         プロセスを再起動するとセーフティが消えてしまう。これを防ぐため、
         当日（JST）約定済みTradeから注文数と損失額を再構築する。
         """
-        today = datetime.now().date()
+        today = clock.today()
         with get_session() as session:
             trades = session.scalars(
                 select(Trade).where(Trade.filled_at.isnot(None))
@@ -75,7 +76,51 @@ class RiskManager:
         over, reason = self.is_daily_loss_limit_reached()
         if over:
             return False, reason
+        # 状態不明・キャンセル失敗の注文が残っている間は新規発注を抑止する
+        # （実口座と乖離したまま発注すると二重発注・想定外建玉になるため、要人手確認）
+        unresolved = self._count_unresolved_orders()
+        if unresolved:
+            return False, f"未解決の注文が{unresolved}件あります（要確認）"
         return True, ""
+
+    def _count_unresolved_orders(self) -> int:
+        """要人手確認の異常注文（UNKNOWN / CANCEL_FAILED）の件数を返す"""
+        with get_session() as session:
+            return session.scalar(
+                select(func.count(Trade.id)).where(
+                    Trade.status.in_(tuple(st.UNRESOLVED_STATUSES))
+                )
+            ) or 0
+
+    def _reserved_buy_by_sector(self) -> tuple[float, dict[str, float]]:
+        """未約定BUY注文の引当金額 (総額, セクター別内訳) を返す。
+
+        price × 残数（発注数量 - 約定済数量）で算定する。セクターは保有Positionから
+        解決し、解決できない（新規銘柄等）分は総額のみに計上する。
+        """
+        with get_session() as session:
+            trades = session.scalars(
+                select(Trade).where(
+                    Trade.side == "BUY",
+                    Trade.status.in_(tuple(st.OPEN_STATUSES)),
+                )
+            ).all()
+            pos_sector = {
+                p.symbol: p.sector
+                for p in session.scalars(select(Position)).all()
+            }
+        total = 0.0
+        by_sector: dict[str, float] = {}
+        for t in trades:
+            remaining = (t.quantity or 0) - (t.filled_quantity or 0)
+            if remaining <= 0 or not t.price:
+                continue
+            notional = t.price * remaining
+            total += notional
+            sec = pos_sector.get(t.symbol)
+            if sec:
+                by_sector[sec] = by_sector.get(sec, 0.0) + notional
+        return total, by_sector
 
     def increment_order_count(self) -> None:
         self._daily_order_count += 1
@@ -84,7 +129,11 @@ class RiskManager:
                            cash_balance: float) -> int:
         """購入株数を計算する（最大投資額を超えない範囲）"""
         max_ratio = self._conf.get("max_position_ratio", 0.20)
-        max_amount = cash_balance * max_ratio
+        # 未約定BUYの引当を差し引いた実効余力で上限を計算する
+        # （未約定中の多重発注で余力を二重に使う事故を防ぐ。main側の逐次減算と二重で守る）
+        reserved, _ = self._reserved_buy_by_sector()
+        available = max(0.0, cash_balance - reserved)
+        max_amount = available * max_ratio
         if price <= 0:
             return 0
         lot = 100  # 東証は通常100株単位
@@ -114,11 +163,13 @@ class RiskManager:
         max_ratio = self._conf.get("max_sector_ratio", 0.40)
         with get_session() as session:
             all_pos = session.scalars(select(Position).where(Position.quantity > 0)).all()
-        if not all_pos:
+        # 未約定BUYの引当も「買った後の集中度」として加味する（発注前に上限超過を防ぐ）
+        reserved_total, reserved_by_sector = self._reserved_buy_by_sector()
+        if not all_pos and reserved_total <= 0:
             return True, ""
         closes = latest_closes([p.symbol for p in all_pos])
-        total_value = 0.0
-        same_sector_value = 0.0
+        total_value = reserved_total
+        same_sector_value = reserved_by_sector.get(sector, 0.0)
         for p in all_pos:
             price = closes.get(p.symbol) or p.avg_cost
             value = p.quantity * price

@@ -8,7 +8,6 @@
 """
 import json
 import pickle
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +18,7 @@ from loguru import logger
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 
+from src.core import clock
 from src.strategy.indicators import FEATURE_COLS, build_features
 from src.strategy.labeling import build_training_set
 
@@ -138,7 +138,7 @@ def _save_metrics(
     from src.data.database import ModelMetrics, get_session
     with get_session() as session:
         session.add(ModelMetrics(
-            trained_at=datetime.now(),
+            trained_at=clock.now(),
             cv_mean_accuracy=round(cv_mean, 4),
             cv_std_accuracy=round(cv_std, 4),
             n_samples=n_samples,

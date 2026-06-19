@@ -13,6 +13,12 @@ def load(path: str = "config.yaml") -> dict:
     _config_path = Path(path)
     with open(_config_path, encoding="utf-8") as f:
         _config = yaml.safe_load(f)
+    # config.yaml に平文パスワードが書かれていたら警告（.env での管理を強制したい）
+    if (_config.get("kabu_station") or {}).get("password"):
+        logger.warning(
+            "config.yaml に kabu_station.password が記載されています。"
+            "漏洩防止のため削除し、.env の KABU_API_PASSWORD を使用してください。"
+        )
     _apply_env_overrides(_config)
     logger.info(f"Config loaded from {_config_path}")
     return _config

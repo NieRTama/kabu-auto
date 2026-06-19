@@ -1,7 +1,7 @@
 """SQLiteデータベース管理（WALモード有効）"""
 import shutil
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -12,6 +12,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from src.core import clock
 from src.core import config as cfg
 
 
@@ -40,8 +41,10 @@ class Trade(Base):
     order_id = Column(String(50), unique=True)
     symbol = Column(String(10), nullable=False)
     side = Column(String(4), nullable=False)  # "BUY" or "SELL"
-    quantity = Column(Integer, nullable=False)
-    price = Column(Float)
+    quantity = Column(Integer, nullable=False)  # 発注数量
+    price = Column(Float)  # 発注時の指値（成行は0）。実約定価格は filled_price を使う
+    filled_price = Column(Float)  # 実約定単価（約定イベント/注文照会から取得）
+    filled_quantity = Column(Integer)  # 実約定数量（部分約定時は quantity 未満）
     filled_at = Column(DateTime)
     status = Column(String(20), default="PENDING")
     pnl = Column(Float)
@@ -58,15 +61,15 @@ class Position(Base):
     # 日時はプロジェクト全体で JST naive に統一する（scheduler・order・ml も datetime.now()=JST）。
     # 旧 datetime.utcnow と混在すると morning_execution の cutoff 比較が9時間ずれて
     # 前日シグナルを取りこぼすため、必ず datetime.now を使うこと。
-    opened_at = Column(DateTime, default=datetime.now)
-    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    opened_at = Column(DateTime, default=clock.now)
+    updated_at = Column(DateTime, default=clock.now, onupdate=clock.now)
 
 
 class Signal(Base):
     __tablename__ = "signals"
     id = Column(Integer, primary_key=True)
     symbol = Column(String(10), nullable=False)
-    generated_at = Column(DateTime, default=datetime.now)  # JST naive（morning_executionのcutoffと統一）
+    generated_at = Column(DateTime, default=clock.now)  # JST naive（morning_executionのcutoffと統一）
     rule_score = Column(Float)
     ml_score = Column(Float)
     combined_score = Column(Float)

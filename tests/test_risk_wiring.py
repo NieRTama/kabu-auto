@@ -61,30 +61,33 @@ class TestSchedulerJobOrdering:
         )
 
 
-# ─── main.py のリスク結線（ソース検証） ──────────────────────────────────
-# main.py は uvicorn 等の重い依存をトップレベルでimportするため、
+# ─── リスク結線（ソース検証） ────────────────────────────────────────────
+# main.py / services は uvicorn 等の重い依存をトップレベルでimportするため、
 # 他のテスト（test_live_mode_guard.py）と同様にソーステキスト検証で行う。
+# 取引ロジックは src/services/trading.py に切り出したため、結線はそちらを検証する。
 
 
-class TestMainPyRiskWiring:
+class TestRiskWiring:
     @pytest.fixture(autouse=True)
     def _source(self):
         with open("main.py", encoding="utf-8") as f:
-            self.src = f.read()
+            self.main_src = f.read()
+        with open("src/services/trading.py", encoding="utf-8") as f:
+            self.svc_src = f.read()
 
     def test_reset_daily_counters_registered_with_scheduler(self):
-        assert 'scheduler.register("risk_reset", risk.reset_daily_counters)' in self.src, (
+        assert 'scheduler.register("risk_reset", risk.reset_daily_counters)' in self.main_src, (
             "reset_daily_counters() がスケジューラに登録されていない"
         )
 
     def test_validate_buy_used_in_signal_scan_and_morning_execution(self):
-        assert self.src.count("risk.validate_buy(") >= 2, (
+        assert self.svc_src.count("validate_buy(") >= 2, (
             "validate_buy() が signal_scan / morning_execution の両方から呼ばれていない"
         )
 
     def test_sector_passed_to_order_manager_buy(self):
-        assert "order_mgr.buy(" in self.src
-        assert "sector=sector" in self.src, (
+        assert "order_mgr.buy(" in self.svc_src
+        assert "sector=sector" in self.svc_src, (
             "buy() にセクター情報が渡されていない（セクター集中チェックが機能しない）"
         )
 

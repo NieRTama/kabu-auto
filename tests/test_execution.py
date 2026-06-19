@@ -162,37 +162,37 @@ class TestIncrementOrderCountTiming:
         risk.increment_order_count.assert_called_once()
 
 
-# ─── close_all_positions の価格ガード（M-1）─────────────────────────────
+# ─── close_all_positions は成行で全決済する（A-1）───────────────────────
 
 
-class TestCloseAllPositionsPriceGuard:
+class TestCloseAllPositionsMarket:
     def _pos(self, symbol="7203", qty=100):
         p = MagicMock()
         p.symbol = symbol
         p.quantity = qty
         return p
 
-    def test_zero_price_skips_sell(self):
-        """現在値が取得できない（price=0）場合は sell を呼ばない（0円指値防止）"""
-        with _make_om(mode="paper") as (om, client, _, session):
-            scal = MagicMock()
-            scal.all.return_value = [self._pos()]
-            session.scalars.return_value = scal
-            client.get_board.return_value = {}  # CurrentPrice も Sell1 も無い
-            om.sell = MagicMock()
-            om.close_all_positions()
-        om.sell.assert_not_called()
-
-    def test_valid_price_calls_sell(self):
-        """現在値が取得できれば sell が呼ばれる"""
+    def test_calls_sell_market_for_each_position(self):
+        """緊急全決済は各保有銘柄について成行 sell_market を呼ぶ"""
         with _make_om(mode="paper") as (om, client, _, session):
             scal = MagicMock()
             scal.all.return_value = [self._pos(qty=200)]
             session.scalars.return_value = scal
-            client.get_board.return_value = {"CurrentPrice": 1500.0}
-            om.sell = MagicMock()
+            om.sell_market = MagicMock()
             om.close_all_positions()
-        om.sell.assert_called_once_with("7203", 1500.0, 200)
+        om.sell_market.assert_called_once_with("7203", 200)
+
+    def test_does_not_use_limit_sell(self):
+        """指値 sell() ではなく成行で決済する（急変時の約定漏れ防止）"""
+        with _make_om(mode="paper") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = [self._pos()]
+            session.scalars.return_value = scal
+            om.sell = MagicMock()
+            om.sell_market = MagicMock()
+            om.close_all_positions()
+        om.sell.assert_not_called()
+        om.sell_market.assert_called_once()
 
 
 # ─── Critical #3: ライブモード約定後のポジション更新 ─────────────────────
@@ -200,33 +200,54 @@ class TestCloseAllPositionsPriceGuard:
 
 class TestOnOrderEventPositionUpdate:
     def test_live_fill_triggers_position_update(self):
-        """ライブモード OrderState=5 受信時に _update_position_from_fill が呼ばれる"""
+        """ライブモード OrderState=5 受信時に実約定価格でポジション更新が呼ばれる"""
         trade_mock = MagicMock()
         trade_mock.status = "PENDING"
+        trade_mock.symbol = "7203"
+        trade_mock.side = "BUY"
+        trade_mock.quantity = 100
+        trade_mock.filled_quantity = None
+        trade_mock.price = 1000.0
 
         with _make_om(mode="live") as (om, _, _, session):
             session.scalar.return_value = trade_mock
-            om._update_position_from_fill = MagicMock()
+            om._resolve_fill = MagicMock(return_value=(1010.0, 100))
+            om._record_fill = MagicMock()
+            om._update_position = MagicMock()
             om.on_order_event({"OrderID": "LIVE-ORD-001", "OrderState": 5})
 
-        om._update_position_from_fill.assert_called_once_with("LIVE-ORD-001")
+        # 約定単価(1010)・全量(100)でポジション更新されること
+        om._update_position.assert_called_once_with(
+            "7203", "BUY", 100, 1010.0, order_id=None,
+        )
 
     def test_paper_fill_event_skips_position_update(self):
         """ペーパーモードでは WebSocket 約定イベントでポジション更新しない"""
-        with _make_om(mode="paper") as (om, _, _, _):
-            om._update_position_from_fill = MagicMock()
+        trade_mock = MagicMock()
+        trade_mock.status = "PENDING"
+        trade_mock.symbol = "7203"
+        trade_mock.side = "BUY"
+        trade_mock.quantity = 100
+        trade_mock.filled_quantity = None
+        trade_mock.price = 1000.0
+
+        with _make_om(mode="paper") as (om, _, _, session):
+            session.scalar.return_value = trade_mock
+            om._resolve_fill = MagicMock(return_value=(1010.0, 100))
+            om._record_fill = MagicMock()
+            om._update_position = MagicMock()
             om.on_order_event({"OrderID": "PAPER-BUY-xxx", "OrderState": 5})
 
-        om._update_position_from_fill.assert_not_called()
+        om._update_position.assert_not_called()
 
     def test_non_fill_state_ignored(self):
-        """OrderState が 5 以外は _update_position_from_fill を呼ばない"""
+        """OrderState が 5 以外はポジション更新しない"""
         with _make_om(mode="live") as (om, _, _, _):
-            om._update_position_from_fill = MagicMock()
+            om._update_position = MagicMock()
             for state in [1, 2, 3, 4]:
                 om.on_order_event({"OrderID": "ORD", "OrderState": state})
 
-        om._update_position_from_fill.assert_not_called()
+        om._update_position.assert_not_called()
 
 
 # ─── Medium #8: ペーパートレードが FILLED で保存される ──────────────────

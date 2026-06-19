@@ -11,7 +11,7 @@ import json
 import os
 import secrets
 import socket
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 
 from src.core import (
     config as cfg, watchlist as watchlist_store, risk_profile as risk_profile_store,
-    auth as auth_store,
+    auth as auth_store, clock,
 )
 from src.data.database import (
     BacktestRun, BacktestTradeRecord, ModelMetrics, Position, Signal, Trade, get_session,
@@ -212,7 +212,7 @@ def update_status(running: bool, ws_connected: bool, mode: str) -> None:
     _system_status.update({
         "running": running,
         "ws_connected": ws_connected,
-        "last_update": datetime.now().isoformat(),  # JST naive
+        "last_update": clock.now().isoformat(),  # JST naive
         "mode": mode,
     })
 
@@ -480,7 +480,7 @@ async def get_pnl_daily(days: int = 90):
 @app.get("/api/pnl/enhanced_summary")
 async def get_pnl_enhanced_summary():
     """今日/MTD/YTD/シャープレシオ/最大ドローダウン/含み損益合計を返す"""
-    today = datetime.now().date()  # filled_at（JST naive）と同じ基準で当日判定する
+    today = clock.today()  # filled_at（JST naive）と同じ基準で当日判定する
     month_start = today.replace(day=1)
     year_start = today.replace(month=1, day=1)
 

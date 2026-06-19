@@ -93,6 +93,7 @@ pip install -r requirements.txt
 
 kabuステーションのログインパスワードは `config.yaml` には書かず、`.env` ファイルで管理する
 （`.env` は `.gitignore` 済みのため誤ってgitにコミットされる心配がない）。
+`config.yaml` には `password` 項目を**置かない**こと。もし記載があると起動時に警告が出る。
 
 ```bash
 copy .env.example .env   # Windows。Mac/Linuxは cp .env.example .env
@@ -245,6 +246,8 @@ CONFIRM_LIVE_TRADING=true python main.py
 
 ダッシュボード右上の「緊急全決済」ボタンを押すと、全保有銘柄を成行で即時決済する。  
 本番モードでは `X-Emergency-Token` ヘッダーが必要（起動時のコンソール表示を参照）。
+
+損切り（`stop_loss_check`）も同様に**成行**で発注する（急変時に指値だと約定しないため、確実な約定を優先）。
 
 ---
 

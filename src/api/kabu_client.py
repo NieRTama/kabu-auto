@@ -25,6 +25,7 @@ class KabuClient:
         self._on_price: Optional[Callable] = None
         self._on_order_event: Optional[Callable] = None
         self._ws_reconnect = True
+        self._ws_reconnect_delay = 2
 
     # ─── 認証 ───────────────────────────────────────────
 
@@ -137,7 +138,6 @@ class KabuClient:
     def _ws_run_loop(self) -> None:
         ws_url = self._base_url.replace("http://", "ws://").replace("https://", "wss://")
         ws_url = ws_url.replace("/kabusapi", "") + "/kabusapi/websocket"
-        delay = 2
         while self._ws_reconnect:
             try:
                 logger.info("WebSocket接続中...")
@@ -152,12 +152,13 @@ class KabuClient:
             except Exception as e:
                 logger.error(f"WebSocketエラー: {e}")
             if self._ws_reconnect:
-                logger.info(f"WebSocket再接続まで {delay}秒待機...")
-                time.sleep(delay)
-                delay = min(delay * 2, 60)
+                logger.info(f"WebSocket再接続まで {self._ws_reconnect_delay}秒待機...")
+                time.sleep(self._ws_reconnect_delay)
+                self._ws_reconnect_delay = min(self._ws_reconnect_delay * 2, 60)
 
     def _on_ws_open(self, ws) -> None:
         logger.info("WebSocket接続確立")
+        self._ws_reconnect_delay = 2
 
     def _on_ws_message(self, ws, message: str) -> None:
         try:

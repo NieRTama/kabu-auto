@@ -199,11 +199,12 @@ class TestMorningExecutionMixed:
 
     def test_sell_happens_before_buy_in_code_order(self):
         """コードの実行順: SELL ループが BUY ループより先に来ること"""
-        # main.py の morning_execution が SELL → BUY の順で実装されていることを検証
+        # 取引ロジックは services/trading.py に切り出したため、そちらの
+        # morning_execution が SELL → BUY の順で実装されていることを検証する
         import inspect
-        import main as main_module
+        from src.services.trading import TradingServices
 
-        src = inspect.getsource(main_module.main)
+        src = inspect.getsource(TradingServices.morning_execution)
         # ループの開始位置で比較（変数定義ではなく実行順を確認）
         sell_loop_idx = src.find("for sig in sell_signals")
         buy_check_idx = src.find("if not buy_signals")
