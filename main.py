@@ -7,6 +7,7 @@ kabu-auto メインエントリポイント
 データ更新・ML再学習・損切り監視・シグナルスキャン・朝の発注の各ロジックは
 src/services/trading.py の TradingServices に切り出している。
 """
+import atexit
 import os
 import sys
 import threading
@@ -61,17 +62,30 @@ def main() -> None:
     # ─── 多重起動防止（再レビュー P1-1）────────────────────────
     # 同一PCでの誤った二重起動はスケジューラジョブの重複実行・二重発注・WebSocket
     # 接続競合・DB破壊につながるため、実発注の可能性があるモードでは起動を中断する。
-    # paper は実資金リスクが無いため警告のみで継続する。
+    # paper はDB/ログ/バックテスト結果の汚染リスクはあるが実資金リスクは無いため、
+    # config の runtime.allow_multiple_paper_instances=true のときのみ警告のみで続行する
+    # （既定 false = paper でも多重起動は中断。テストデータ整合性を優先した安全側の既定）。
+    allow_multi_paper = cfg.get_section("runtime").get("allow_multiple_paper_instances", False)
     lock_ok, lock_detail = process_lock.acquire("data/kabu_auto.lock")
-    if not lock_ok:
-        if mode == "paper":
+    if lock_ok:
+        # 正常取得時のみ解放を atexit に登録する。sys.exit(1) や予期せぬ例外で
+        # 起動が中断されてもロックファイルが残らないようにする（KeyboardInterrupt
+        # だけでなくあらゆる正常終了経路をカバー）。release() は自分が書いたロックの
+        # ときのみ削除するため、多重呼び出し・他プロセスのロック残存に対して安全。
+        atexit.register(process_lock.release)
+    else:
+        if mode == "paper" and allow_multi_paper:
             logger.warning(
-                f"多重起動を検知しましたが paper モードのため続行します: {lock_detail}"
+                f"多重起動を検知しましたが paper モード（allow_multiple_paper_instances=true）"
+                f"のため続行します: {lock_detail}"
             )
         else:
             logger.critical(
                 f"多重起動を検知したため起動を中断します: {lock_detail}。"
                 "別の kabu-auto プロセスを終了してから再起動してください"
+                + ("（paper でも多重起動を許可するには config の "
+                   "runtime.allow_multiple_paper_instances を true にしてください）"
+                   if mode == "paper" else "")
             )
             sys.exit(1)
 
@@ -190,6 +204,15 @@ def main() -> None:
             f"【注意】{tm.description(mode)}でダッシュボードをLAN公開しています。"
             "アクセストークン・ログイン認証が有効であることを確認してください。"
         )
+    # dry_run が本番用エンドポイント（検証ポート18081以外）から実際の口座データを
+    # 読んでいることを WARNING で明示する（発注はしないが本番口座の実情報を扱っている。
+    # プリフライトでも検出するが、運用バナー直後にも目立つ形で出して誤認を防ぐ）。
+    base_url = cfg.get_section("kabu_station").get("base_url", "")
+    if mode == tm.DRY_RUN and "18081" not in base_url:
+        logger.warning(
+            f"【注意】dry_run が本番口座データを読み取っています（{base_url}）。"
+            "発注は行いませんが、接続先は本番環境です。"
+        )
 
     # ─── ダッシュボード起動（別スレッド）────────────────────
     dash_host = dash_conf.get("host", "127.0.0.1")
@@ -228,7 +251,8 @@ def main() -> None:
         scheduler.stop()
         client.stop_websocket()
         update_status(running=False, ws_connected=False, mode=trading_conf.get("mode", "paper"))
-        process_lock.release()
+        # ロックファイルの解放は atexit.register(process_lock.release) が担う
+        # （KeyboardInterrupt 以外の終了経路もカバーするため一元化している）
         logger.info("終了しました")
 
 

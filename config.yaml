@@ -71,6 +71,14 @@ strategy:
   tb_max_holding: 10   # 時間バリア（最大保有日数、スイング想定）
   tb_vol_span: 20      # ボラティリティ推定の指数加重期間
 
+runtime:
+  # 同一PCでの多重起動を検知した際の挙動（再レビュー対応）。
+  # paper 以外（dry_run/semi_live/live）は安全のため常に起動を中断する。
+  # paper は実資金リスクは無いが、DB・ログ・バックテスト結果・ダッシュボード状態の
+  # 汚染リスクがあるため既定では中断する。意図的に複数のpaperインスタンスを
+  # 同時起動したい場合のみ true にする。
+  allow_multiple_paper_instances: false
+
 data:
   db_path: "data/kabu_auto.db"
   backup_dir: "data/backups"
