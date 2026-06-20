@@ -151,6 +151,12 @@
     <div id="operational-status" style="font-size:0.82rem;color:#cbd5e1;overflow-x:auto;white-space:nowrap;">—</div>
   </div>
 
+  <!-- ─── 異常検知バナー（異常があるときのみ表示） ───────────────── -->
+  <div id="health-banner" style="display:none;margin-bottom:24px;border-radius:8px;padding:12px 16px;background:#3f1d1d;border:1px solid #b91c1c;">
+    <div style="font-weight:700;color:#fecaca;margin-bottom:6px;">⚠️ 異常検知</div>
+    <ul id="health-list" style="margin:0;padding-left:20px;font-size:0.85rem;color:#fecaca;"></ul>
+  </div>
+
   <!-- ─── リスクプロファイル切替 ──────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px;">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
@@ -225,6 +231,14 @@
       <button id="kill-switch-btn" onclick="toggleKillSwitch()"
         style="background:#b45309;color:#fff7ed;border:none;border-radius:8px;padding:10px 18px;font-weight:700;cursor:pointer;">取引を緊急停止</button>
       <span id="kill-switch-msg" style="font-size:0.8rem;color:#f87171;margin-left:8px;"></span>
+      <hr style="border-color:#334155;margin:16px 0;">
+      <p style="color:#94a3b8; font-size:0.85rem; margin-bottom:8px;">
+        保有銘柄にブローカー側の逆指値ストップ（保険）を置きます。PC/アプリ停止時でも
+        証券会社側で損切りが効きます（ライブ/セミライブのみ）。
+      </p>
+      <button onclick="placeBrokerStop()"
+        style="background:#1e3a5f;color:#bfdbfe;border:1px solid #2563eb;border-radius:8px;padding:8px 16px;cursor:pointer;">保護ストップを発注</button>
+      <span id="broker-stop-msg" style="font-size:0.8rem;color:#f87171;margin-left:8px;"></span>
     </div>
   </div>
 
@@ -261,6 +275,32 @@
           <thead><tr><th>日付</th><th>確定損益</th><th>取引</th><th>買/売</th><th>勝/負</th><th>勝率</th></tr></thead>
           <tbody id="daily-report-tbody"><tr><td colspan="6" style="color:#64748b">なし</td></tr></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── パフォーマンス分析 ─────────────────────────────────────── -->
+  <div class="card" style="margin-bottom:24px;">
+    <h2>📈 パフォーマンス分析</h2>
+    <div class="grid" id="perf-summary" style="margin-bottom:12px;"></div>
+    <div class="row">
+      <div>
+        <div class="label" style="margin-bottom:6px;">銘柄別</div>
+        <div style="overflow-x:auto;">
+          <table style="font-size:0.8rem;">
+            <thead><tr><th>銘柄</th><th>取引</th><th>損益</th><th>勝率</th></tr></thead>
+            <tbody id="perf-symbol-tbody"><tr><td colspan="4" style="color:#64748b">なし</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="label" style="margin-bottom:6px;">セクター別</div>
+        <div style="overflow-x:auto;">
+          <table style="font-size:0.8rem;">
+            <thead><tr><th>セクター</th><th>取引</th><th>損益</th><th>勝率</th></tr></thead>
+            <tbody id="perf-sector-tbody"><tr><td colspan="4" style="color:#64748b">なし</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -432,6 +472,11 @@
     </div>
     <div id="bt-detail" style="display:none;">
       <hr style="border-color:#334155;margin:16px 0;">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+        <button id="bt-divergence-btn" onclick="showDivergence()"
+          style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:5px 12px;font-size:0.8rem;cursor:pointer;">実績との乖離を見る</button>
+      </div>
+      <div id="bt-divergence" style="display:none;margin-bottom:16px;padding:10px 12px;background:#0f172a;border-radius:8px;border:1px dashed #334155;font-size:0.82rem;"></div>
       <div id="bt-metrics" class="grid" style="margin-bottom:16px;"></div>
       <canvas id="bt-chart" style="max-height:280px;margin-bottom:16px;"></canvas>
       <div class="label" style="margin-bottom:8px;">取引一覧</div>
@@ -482,8 +527,52 @@
     await Promise.all([
       loadStatus(), loadPnlEnhancedSummary(), loadPositions(),
       loadSignals(), loadTrades(), loadPnlChart(),
-      loadJournal(), loadDailyReport(),
+      loadJournal(), loadDailyReport(), loadHealth(), loadPerformance(),
     ]);
+  }
+
+  // ── 異常検知バナー ─────────────────────────────────────────────
+  async function loadHealth() {
+    let anomalies = [];
+    try { anomalies = (await fetchJson('/api/health')).anomalies || []; } catch (e) { return; }
+    const banner = document.getElementById('health-banner');
+    const list = document.getElementById('health-list');
+    if (!anomalies.length) { banner.style.display = 'none'; return; }
+    list.innerHTML = anomalies.map(a =>
+      `<li>${a.level === 'critical' ? '🔴' : '🟡'} ${escapeHtml(a.message)}</li>`).join('');
+    banner.style.display = 'block';
+  }
+
+  // ── パフォーマンス分析 ─────────────────────────────────────────
+  async function loadPerformance() {
+    const d = await fetchJson('/api/performance');
+    const yen = v => (v == null ? '—' : '¥' + Number(v).toLocaleString());
+    const pct = v => (v == null ? '—' : (v * 100).toFixed(1) + '%');
+    const card = (label, val, color) =>
+      `<div class="card" style="padding:10px;"><div class="label">${label}</div>`
+      + `<div class="value ${color || 'neutral'}" style="font-size:1.1rem;">${val}</div></div>`;
+    document.getElementById('perf-summary').innerHTML =
+      card('取引数', d.total_trades ?? 0)
+      + card('勝率', pct(d.win_rate))
+      + card('純損益', yen(d.net_pnl), (d.net_pnl || 0) >= 0 ? 'green' : 'red')
+      + card('プロフィットファクター', d.profit_factor ?? '—')
+      + card('期待値/取引', yen(d.expectancy), (d.expectancy || 0) >= 0 ? 'green' : 'red')
+      + card('平均利益', yen(d.avg_win), 'green')
+      + card('平均損失', yen(d.avg_loss ? -d.avg_loss : null), 'red')
+      + card('最大連勝/連敗', `${d.max_consecutive_wins}/${d.max_consecutive_losses}`);
+
+    const rows = (obj) => {
+      const entries = Object.entries(obj || {}).sort((a, b) => b[1].pnl - a[1].pnl);
+      if (!entries.length) return '<tr><td colspan="4" style="color:#64748b">なし</td></tr>';
+      return entries.map(([k, v]) => {
+        const c = v.pnl > 0 ? '#4ade80' : v.pnl < 0 ? '#f87171' : '#e2e8f0';
+        return `<tr><td>${escapeHtml(k)}</td><td>${v.trades}</td>`
+          + `<td style="color:${c};">¥${Number(v.pnl).toLocaleString()}</td>`
+          + `<td>${v.win_rate == null ? '—' : (v.win_rate * 100).toFixed(0) + '%'}</td></tr>`;
+      }).join('');
+    };
+    document.getElementById('perf-symbol-tbody').innerHTML = rows(d.by_symbol);
+    document.getElementById('perf-sector-tbody').innerHTML = rows(d.by_sector);
   }
 
   // ── 取引ジャーナル・日次レポート ───────────────────────────────
@@ -496,9 +585,10 @@
       const pnlColor = r.pnl > 0 ? '#4ade80' : r.pnl < 0 ? '#f87171' : '#e2e8f0';
       const pct = r.return_pct != null ? (r.return_pct * 100).toFixed(1) + '%' : '-';
       const note = escapeHtml(r.note || '');
-      return `<tr>
+      const basis = r.rationale ? ` title="根拠: ${escapeHtml(r.rationale)}"` : '';
+      return `<tr${basis}>
         <td style="font-size:0.72rem;color:#94a3b8;">${dt}</td>
-        <td><strong>${symLabel(r.symbol)}</strong></td>
+        <td><strong>${symLabel(r.symbol)}</strong>${r.rationale ? ' <span style="color:#64748b;font-size:0.7rem;">ⓘ</span>' : ''}</td>
         <td>${r.side === 'BUY' ? '買' : '売'}</td>
         <td>${r.quantity}</td>
         <td style="color:${pnlColor};font-weight:700;">¥${(r.pnl || 0).toLocaleString()}</td>
@@ -1102,7 +1192,27 @@
     await loadBtRuns();
   }
 
+  let currentBtRunId = null;
+
+  async function showDivergence() {
+    if (!currentBtRunId) return;
+    const box = document.getElementById('bt-divergence');
+    const d = await fetchJson(`/api/backtest/${currentBtRunId}/divergence`);
+    const pct = v => (v == null ? '—' : (v * 100).toFixed(1) + '%');
+    const yen = v => (v == null ? '—' : '¥' + Number(v).toLocaleString());
+    box.innerHTML =
+      `<div style="font-weight:700;margin-bottom:6px;">${escapeHtml(d.symbol)} バックテスト vs 実取引</div>`
+      + `<div>勝率: BT ${pct(d.backtest.win_rate)} → 実 ${pct(d.actual.win_rate)} `
+      + `(差 ${d.divergence.win_rate_diff == null ? '—' : pct(d.divergence.win_rate_diff)})</div>`
+      + `<div>平均リターン: BT ${pct(d.backtest.avg_return_pct)} → 実 ${pct(d.actual.avg_return_pct)}</div>`
+      + `<div>実取引: ${d.actual.trade_count}件 / 純損益 ${yen(d.actual.net_pnl)}</div>`
+      + (d.note ? `<div style="color:#fbbf24;margin-top:4px;">${escapeHtml(d.note)}</div>` : '');
+    box.style.display = 'block';
+  }
+
   async function loadBtDetail(runId) {
+    currentBtRunId = runId;
+    document.getElementById('bt-divergence').style.display = 'none';
     const d = await fetchJson(`/api/backtest/${runId}`);
     const run = d.run;
 
@@ -1496,6 +1606,32 @@
       if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
       alert(d.message || '実行しました');
       await loadStatus();
+    } catch (e) {
+      msg.textContent = 'エラー: ' + e.message;
+    }
+  }
+
+  // ── ブローカー側保護ストップ ───────────────────────────────────
+  async function placeBrokerStop() {
+    const msg = document.getElementById('broker-stop-msg');
+    msg.textContent = '';
+    const symbol = prompt('保護ストップを置く銘柄コード:');
+    if (!symbol) return;
+    const token = prompt('緊急決済トークンを入力してください（起動時のコンソール表示で確認）:');
+    if (!token) return;
+    const trigStr = prompt('トリガー価格（空欄なら 取得平均×(1+損切り率) で自動算出）:', '');
+    const body = { symbol: symbol.trim() };
+    if (trigStr && trigStr.trim()) body.trigger_price = parseFloat(trigStr);
+    try {
+      const r = await fetch(API + '/api/stop_loss', {
+        method: 'POST',
+        headers: { 'X-Emergency-Token': token, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+      alert(`保護ストップを発注しました\n${d.symbol} ${d.quantity}株 トリガー@${d.trigger_price}`);
+      await loadAll();
     } catch (e) {
       msg.textContent = 'エラー: ' + e.message;
     }

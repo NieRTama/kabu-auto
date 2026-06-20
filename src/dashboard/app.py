@@ -530,6 +530,7 @@ async def get_trades(limit: int = 50):
             "filled_at": t.filled_at.isoformat() if t.filled_at else None,
             "status": t.status,
             "pnl": t.pnl,
+            "rationale": t.rationale,
         }
         for t in trades
     ]
@@ -621,6 +622,7 @@ async def get_trade_journal(limit: int = 100):
             "return_pct": return_pct,
             "filled_at": t.filled_at.isoformat() if t.filled_at else None,
             "note": t.note,
+            "rationale": t.rationale,
         })
     return out
 
@@ -639,6 +641,31 @@ async def set_trade_note(order_id: str, req: TradeNoteRequest):
         trade.note = req.note[:1000]
         session.commit()
     return {"status": "ok", "order_id": order_id}
+
+
+@app.get("/api/health")
+async def get_health():
+    """運用上の異常（未解決注文・損失上限接近・kill switch等）の現在一覧を返す（7.5）。"""
+    if _order_manager is None:
+        return {"anomalies": []}
+    from src.core import health
+    try:
+        anomalies = health.check_anomalies(_order_manager._risk)
+    except Exception as e:
+        logger.warning(f"異常検知の取得失敗: {e}")
+        anomalies = []
+    return {"anomalies": anomalies}
+
+
+@app.get("/api/performance")
+async def get_performance():
+    """パフォーマンス分析（7.8）: 期待値・プロフィットファクター・連勝連敗・銘柄/セクター別。"""
+    from src.analytics.performance import compute_performance
+    with get_session() as session:
+        trades = session.scalars(
+            select(Trade).where(Trade.pnl.isnot(None)).order_by(Trade.filled_at)
+        ).all()
+    return compute_performance(trades)
 
 
 @app.get("/api/pnl_summary")
@@ -841,6 +868,42 @@ async def release_halt(_: None = Depends(_verify_emergency_token)):
     if not result.get("ok"):
         raise HTTPException(status_code=409, detail=result.get("reason"))
     return {"status": "ok", "message": "取引を再開しました", **result}
+
+
+# ─── ブローカー側逆指値ストップ（4.3）──────────────────────────────────────
+
+
+class StopLossRequest(BaseModel):
+    symbol: str
+    quantity: Optional[int] = None      # 省略時は保有数量
+    trigger_price: Optional[float] = None  # 省略時は avg_cost × (1 + stop_loss_pct)
+
+
+@app.post("/api/stop_loss")
+async def place_broker_stop(req: StopLossRequest, _: None = Depends(_verify_emergency_token)):
+    """保有ポジションにブローカー側の逆指値ストップを置く（X-Emergency-Token 必須）。
+
+    数量・トリガー価格を省略すると、保有数量と「取得平均 ×(1+損切り率)」から自動算出する。
+    PC/アプリ停止時でも証券会社側で損切りが効く保険（ライブ/セミライブのみ実発注）。
+    """
+    if _order_manager is None:
+        raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
+    with get_session() as session:
+        pos = session.scalar(select(Position).where(Position.symbol == req.symbol))
+    if pos is None or pos.quantity <= 0:
+        raise HTTPException(status_code=400, detail=f"保有ポジションがありません: {req.symbol}")
+    quantity = req.quantity or pos.quantity
+    if req.trigger_price is not None:
+        trigger = req.trigger_price
+    else:
+        stop_pct = cfg.get_section("trading").get("stop_loss_pct", -0.05)
+        trigger = round(pos.avg_cost * (1 + stop_pct), 1)
+    order_id = _order_manager.place_stop_loss(req.symbol, quantity, trigger)
+    if not order_id:
+        raise HTTPException(status_code=400,
+                            detail="逆指値ストップを発注できませんでした（ペーパー/dry_run、または発注拒否）")
+    return {"status": "ok", "order_id": order_id, "symbol": req.symbol,
+            "quantity": quantity, "trigger_price": trigger}
 
 
 # ─── semi_live 発注承認キュー ───────────────────────────────────────────────
@@ -1269,6 +1332,25 @@ async def unarchive_backtest_run(run_id: int):
     if not _set_archived(run_id, False):
         raise HTTPException(status_code=404, detail="バックテスト結果が見つかりません")
     return {"status": "ok", "archived": False}
+
+
+@app.get("/api/backtest/{run_id}/divergence")
+async def get_backtest_divergence(run_id: int):
+    """バックテストの取引と、同一銘柄の実取引の乖離（勝率・平均リターン・純損益）を返す（7.7）。"""
+    from src.analytics.performance import compute_divergence
+    with get_session() as session:
+        run = session.scalar(select(BacktestRun).where(BacktestRun.id == run_id))
+        if run is None:
+            raise HTTPException(status_code=404, detail="バックテスト結果が見つかりません")
+        bt_trades = session.scalars(
+            select(BacktestTradeRecord).where(BacktestTradeRecord.run_id == run_id)
+        ).all()
+        actual = session.scalars(
+            select(Trade).where(Trade.symbol == run.symbol, Trade.pnl.isnot(None))
+        ).all()
+        result = compute_divergence(bt_trades, actual)
+    result["symbol"] = run.symbol
+    return result
 
 
 @app.get("/api/backtest/{run_id}")

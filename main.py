@@ -145,6 +145,7 @@ def main() -> None:
     scheduler.register("signal_scan", services.signal_scan)
     scheduler.register("morning_execution", services.morning_execution)
     scheduler.register("reconcile_orders", services.reconcile_orders)
+    scheduler.register("health_check", services.health_check)
 
     # ─── WebSocket 開始 ────────────────────────────────────
     client.start_websocket(on_order_event=order_mgr.on_order_event)

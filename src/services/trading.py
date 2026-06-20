@@ -64,6 +64,17 @@ def _select_latest_signals(session, max_age_days: int = 5) -> list:
     return pending
 
 
+def _signal_rationale(sig) -> str:
+    """シグナル（TradeSignal / DB Signal）から発注根拠の説明文を作る（7.6）。
+
+    combined / rule / ml の各スコアを記録し、後から「なぜこの取引をしたか」を辿れるようにする。
+    """
+    def _f(v):
+        return f"{v:.3f}" if isinstance(v, (int, float)) else "—"
+    return (f"{sig.action} score={_f(sig.combined_score)} "
+            f"(rule={_f(sig.rule_score)}, ml={_f(sig.ml_score)})")
+
+
 def _get_position_qty(symbol: str) -> int:
     with get_session() as session:
         pos = session.scalar(select(Position).where(Position.symbol == symbol))
@@ -155,6 +166,18 @@ class TradingServices:
         except Exception as e:
             logger.error(f"注文照合エラー: {e}")
 
+    # ─── 異常検知・アラート ─────────────────────────────
+    def health_check(self) -> None:
+        """運用上の異常（未解決注文・損失上限接近・kill switch等）を検知して通知する（7.5）。
+
+        市場時間に限定せず動かす（場が引けた後でも未解決注文は要対応のため）。
+        """
+        try:
+            from src.core import health
+            health.run_and_alert(self.risk)
+        except Exception as e:
+            logger.error(f"異常検知ジョブエラー: {e}")
+
     # ─── 損切り監視 ─────────────────────────────────────
     def stop_loss_check(self) -> None:
         if not TradingScheduler.is_market_open():
@@ -215,11 +238,13 @@ class TradingServices:
                             continue
                         qty = self.risk.calc_position_size(sym, close_price, cash)
                         if qty > 0:
-                            self.order_mgr.buy(sym, close_price, qty, sector=sector)
+                            self.order_mgr.buy(sym, close_price, qty, sector=sector,
+                                               rationale=_signal_rationale(sig))
                     elif sig.action == "SELL":
                         qty = _get_position_qty(sym)
                         if qty > 0:
-                            self.order_mgr.sell(sym, close_price, qty)
+                            self.order_mgr.sell(sym, close_price, qty,
+                                                rationale=_signal_rationale(sig))
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
 
@@ -255,7 +280,8 @@ class TradingServices:
                 price = board.get("CurrentPrice") or board.get("Buy1", {}).get("Price", 0)
                 if not price:
                     continue
-                self.order_mgr.sell(sig.symbol, float(price), qty)
+                self.order_mgr.sell(sig.symbol, float(price), qty,
+                                    rationale=_signal_rationale(sig))
                 logger.info(f"朝売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
             except Exception as e:
                 logger.error(f"朝売り発注失敗: {sig.symbol} {e}")
@@ -284,7 +310,8 @@ class TradingServices:
                 qty = self.risk.calc_position_size(sig.symbol, float(price), cash)
                 if qty <= 0:
                     continue
-                order_id = self.order_mgr.buy(sig.symbol, float(price), qty, sector=sector)
+                order_id = self.order_mgr.buy(sig.symbol, float(price), qty, sector=sector,
+                                              rationale=_signal_rationale(sig))
                 if order_id:
                     # 同一スキャン内の以降の銘柄が同じ余力を前提に判定しないよう、
                     # 発注成功分をその場で減算する（複数銘柄の資金二重計上を防ぐ。

@@ -215,8 +215,8 @@ class OrderManager:
             self._cancel_timeout_timer(trade.order_id)
 
     def buy(self, symbol: str, price: float, quantity: int,
-            sector: Optional[str] = None) -> Optional[str]:
-        """指値買い注文を発注する"""
+            sector: Optional[str] = None, rationale: Optional[str] = None) -> Optional[str]:
+        """指値買い注文を発注する（rationale=発注根拠。シグナルスコア等を記録する。7.6）"""
         if quantity <= 0:
             return None
         ok, reason = self._risk.can_place_order()
@@ -236,19 +236,20 @@ class OrderManager:
             now = clock.now()
             logger.info(f"[ペーパー] 買い: {symbol} {quantity}株 @{price:.0f}円")
             self._record_trade(order_id, symbol, "BUY", quantity, price,
-                               status=st.FILLED, filled_at=now, sector=sector)
+                               status=st.FILLED, filled_at=now, sector=sector,
+                               rationale=rationale)
             self._update_position(symbol, "BUY", quantity, price, sector)
             return order_id
 
         if self._mode == tm.DRY_RUN:
-            return self._record_dry_run("BUY", symbol, quantity, price, sector)
+            return self._record_dry_run("BUY", symbol, quantity, price, sector, rationale)
         if self._mode == tm.SEMI_LIVE:
-            return self._enqueue_approval("BUY", "LIMIT", symbol, price, quantity, sector)
+            return self._enqueue_approval("BUY", "LIMIT", symbol, price, quantity, sector, rationale)
 
-        return self._live_buy(symbol, price, quantity, sector)
+        return self._live_buy(symbol, price, quantity, sector, rationale)
 
     def _live_buy(self, symbol: str, price: float, quantity: int,
-                  sector: Optional[str] = None) -> Optional[str]:
+                  sector: Optional[str] = None, rationale: Optional[str] = None) -> Optional[str]:
         """実APIへ指値買いを送る（live / semi_live承認実行の共通実体）。"""
         order = {
             "Password": self._kabu_password,
@@ -282,15 +283,17 @@ class OrderManager:
                 logger.error(f"買い注文: OrderId 未取得: {symbol} {result}")
                 return None
             self._risk.increment_order_count()
-            self._record_trade(order_id, symbol, "BUY", quantity, price, sector=sector)
+            self._record_trade(order_id, symbol, "BUY", quantity, price, sector=sector,
+                               rationale=rationale)
             self._set_cancel_timer(order_id)
             return order_id
         except Exception as e:
             logger.error(f"買い注文失敗: {symbol} {e}")
             return None
 
-    def sell(self, symbol: str, price: float, quantity: int) -> Optional[str]:
-        """指値売り注文を発注する"""
+    def sell(self, symbol: str, price: float, quantity: int,
+             rationale: Optional[str] = None) -> Optional[str]:
+        """指値売り注文を発注する（rationale=発注根拠。7.6）"""
         if quantity <= 0:
             return None
         ok, reason = self._risk.can_place_order()
@@ -310,18 +313,20 @@ class OrderManager:
             now = clock.now()
             logger.info(f"[ペーパー] 売り: {symbol} {quantity}株 @{price:.0f}円")
             self._record_trade(order_id, symbol, "SELL", quantity, price,
-                               status=st.FILLED, filled_at=now)
+                               status=st.FILLED, filled_at=now, rationale=rationale)
             self._update_position(symbol, "SELL", quantity, price, order_id=order_id)
             return order_id
 
         if self._mode == tm.DRY_RUN:
-            return self._record_dry_run("SELL", symbol, quantity, price)
+            return self._record_dry_run("SELL", symbol, quantity, price, rationale=rationale)
         if self._mode == tm.SEMI_LIVE:
-            return self._enqueue_approval("SELL", "LIMIT", symbol, price, quantity)
+            return self._enqueue_approval("SELL", "LIMIT", symbol, price, quantity,
+                                          rationale=rationale)
 
-        return self._live_sell(symbol, price, quantity)
+        return self._live_sell(symbol, price, quantity, rationale)
 
-    def _live_sell(self, symbol: str, price: float, quantity: int) -> Optional[str]:
+    def _live_sell(self, symbol: str, price: float, quantity: int,
+                   rationale: Optional[str] = None) -> Optional[str]:
         """実APIへ指値売りを送る（live / semi_live承認実行の共通実体）。"""
         order = {
             "Password": self._kabu_password,
@@ -355,14 +360,15 @@ class OrderManager:
                 logger.error(f"売り注文: OrderId 未取得: {symbol} {result}")
                 return None
             self._risk.increment_order_count()
-            self._record_trade(order_id, symbol, "SELL", quantity, price)
+            self._record_trade(order_id, symbol, "SELL", quantity, price, rationale=rationale)
             self._set_cancel_timer(order_id)
             return order_id
         except Exception as e:
             logger.error(f"売り注文失敗: {symbol} {e}")
             return None
 
-    def sell_market(self, symbol: str, quantity: int, reason: str = "normal") -> Optional[str]:
+    def sell_market(self, symbol: str, quantity: int, reason: str = "normal",
+                    rationale: Optional[str] = None) -> Optional[str]:
         """成行売り注文を発注する（損切り・緊急決済など、確実な約定を優先する用途）。
 
         指値 sell() は急変時に約定しない恐れがあるため、損切り/全決済は本メソッドを使う。
@@ -379,6 +385,9 @@ class OrderManager:
         if quantity <= 0:
             return None
         is_exit = reason in ("stop_loss", "emergency")
+        # 退出系は理由が明確な根拠なので、明示指定が無ければ reason を根拠として記録する（7.6）
+        if rationale is None and is_exit:
+            rationale = {"stop_loss": "損切り（stop_loss）", "emergency": "緊急決済（emergency）"}[reason]
 
         if not is_exit:
             ok, block_reason = self._risk.can_place_order()
@@ -404,20 +413,22 @@ class OrderManager:
             now = clock.now()
             logger.info(f"[ペーパー] 成行売り: {symbol} {quantity}株 @{price:.0f}円")
             self._record_trade(order_id, symbol, "SELL", quantity, price,
-                               status=st.FILLED, filled_at=now)
+                               status=st.FILLED, filled_at=now, rationale=rationale)
             self._update_position(symbol, "SELL", quantity, price, order_id=order_id)
             return order_id
 
         if self._mode == tm.DRY_RUN:
             # ドライランは退出系でも実発注しない（検証専用）。価格未確定なので0で記録する
-            return self._record_dry_run("SELL", symbol, quantity, 0.0)
+            return self._record_dry_run("SELL", symbol, quantity, 0.0, rationale=rationale)
         if self._mode == tm.SEMI_LIVE and not is_exit:
             # 通常売りは承認キューへ。損切り・緊急決済（退出）は承認を介さず即時発注する
-            return self._enqueue_approval("SELL", "MARKET", symbol, 0.0, quantity)
+            return self._enqueue_approval("SELL", "MARKET", symbol, 0.0, quantity,
+                                          rationale=rationale)
 
-        return self._live_sell_market(symbol, quantity)
+        return self._live_sell_market(symbol, quantity, rationale)
 
-    def _live_sell_market(self, symbol: str, quantity: int) -> Optional[str]:
+    def _live_sell_market(self, symbol: str, quantity: int,
+                          rationale: Optional[str] = None) -> Optional[str]:
         """実APIへ成行売りを送る（live / semi_live退出・承認実行の共通実体）。"""
         order = {
             "Password": self._kabu_password,
@@ -452,11 +463,83 @@ class OrderManager:
                 return None
             self._risk.increment_order_count()
             # 成行は発注時に価格未確定。price=0 で記録し、約定時に filled_price で確定する
-            self._record_trade(order_id, symbol, "SELL", quantity, 0.0)
+            self._record_trade(order_id, symbol, "SELL", quantity, 0.0, rationale=rationale)
             self._set_cancel_timer(order_id)
             return order_id
         except Exception as e:
             logger.error(f"成行売り注文失敗: {symbol} {e}")
+            return None
+
+    def place_stop_loss(self, symbol: str, quantity: int,
+                        trigger_price: float) -> Optional[str]:
+        """ブローカー側の逆指値ストップ（成行）を発注する（4.3・ライブのみ実発注）。
+
+        PC/アプリが停止していても、株価がトリガー価格以下に下落したら証券会社側で
+        自動的に成行決済される「保険」。アプリ側の損切り監視(stop_loss_check)が止まる
+        ケースに備える。確実な約定を優先し、トリガー後は成行(AfterHitOrderType=1)とする。
+
+        モード別:
+          - live / semi_live: 実APIへ逆指値成行SELLを送る（保護目的なのでリスクゲートは
+            適用しない。退出系と同じ思想）。約定/タイムアウトキャンセルの対象にしない
+            （ストップは発動まで生かし続けるため、通常のタイムアウト解除はしない）。
+          - paper / dry_run: 実ブローカーが無いため何もしない（ペーパーの損切りは
+            stop_loss_check が日足終値で代替する）。
+        """
+        if quantity <= 0 or not trigger_price or trigger_price <= 0:
+            return None
+        if self._is_paper or self._mode == tm.DRY_RUN:
+            logger.info(
+                f"[{self._mode}] ブローカー側逆指値ストップはスキップ（実ブローカー無し）: "
+                f"{symbol} {quantity}株 @{trigger_price:.0f}"
+            )
+            return None
+
+        order = {
+            "Password": self._kabu_password,
+            "Symbol": symbol,
+            "Exchange": 1,
+            "SecurityType": 1,
+            "Side": "1",  # 売り
+            "CashMargin": 1,
+            "DelivType": 2,
+            "FundType": "  ",
+            "AccountType": 4,
+            "Qty": quantity,
+            "FrontOrderType": 30,  # 逆指値
+            "Price": 0,
+            "ExpireDay": 0,
+            "ReverseLimitOrder": {
+                "TriggerSec": 1,            # 発注銘柄でトリガー
+                "TriggerPrice": trigger_price,
+                "UnderOver": 1,             # 1=以下（下落してトリガー価格以下で発動）
+                "AfterHitOrderType": 1,     # 1=成行（発動後は確実な約定を優先）
+                "AfterHitPrice": 0,
+            },
+        }
+        try:
+            result = self._client.send_order(order)
+            if result.get("Result") != 0:
+                logger.error(
+                    f"逆指値ストップ注文拒否: {symbol} Result={result.get('Result')} "
+                    f"Message={result.get('Message', '')}"
+                )
+                return None
+            order_id = result.get("OrderId")
+            if not order_id:
+                logger.error(f"逆指値ストップ: OrderId 未取得: {symbol} {result}")
+                return None
+            self._risk.increment_order_count()
+            # ストップは発動まで生かすためタイムアウトキャンセルは設定しない
+            self._record_trade(
+                order_id, symbol, "SELL", quantity, 0.0,
+                rationale=f"ブローカー側逆指値ストップ トリガー@{trigger_price:.0f}（成行）",
+            )
+            logger.warning(
+                f"ブローカー側逆指値ストップ発注: {symbol} {quantity}株 トリガー@{trigger_price:.0f}"
+            )
+            return order_id
+        except Exception as e:
+            logger.error(f"逆指値ストップ注文失敗: {symbol} {e}")
             return None
 
     def close_all_positions(self) -> None:
@@ -567,7 +650,8 @@ class OrderManager:
     # ─── dry_run / semi_live ────────────────────────────────────────────
 
     def _record_dry_run(self, side: str, symbol: str, quantity: int,
-                        price: float, sector: Optional[str] = None) -> str:
+                        price: float, sector: Optional[str] = None,
+                        rationale: Optional[str] = None) -> str:
         """dry_run モードの「発注しようとした」記録を残す（実発注はしない）。
 
         DRY_RUN ステータスは OPEN/UNRESOLVED いずれにも属さないため、余力引当・建玉・
@@ -580,17 +664,20 @@ class OrderManager:
             f"[DRY-RUN] {side} {symbol} {quantity}株 @{price:.0f}円 — 実発注はスキップしました"
         )
         self._record_trade(order_id, symbol, side, quantity, price,
-                           status=st.DRY_RUN, filled_at=clock.now(), sector=sector)
+                           status=st.DRY_RUN, filled_at=clock.now(), sector=sector,
+                           rationale=rationale)
         return order_id
 
     def _enqueue_approval(self, side: str, order_type: str, symbol: str,
                           price: float, quantity: int,
-                          sector: Optional[str] = None) -> Optional[str]:
+                          sector: Optional[str] = None,
+                          rationale: Optional[str] = None) -> Optional[str]:
         """semi_live モードの計画注文を承認キューに積む（実発注はまだしない）。"""
         with get_session() as session:
             ap = OrderApproval(
                 symbol=symbol, side=side, order_type=order_type,
                 price=price, quantity=quantity, sector=sector, status="PENDING",
+                rationale=rationale,
             )
             session.add(ap)
             session.commit()
@@ -621,6 +708,7 @@ class OrderManager:
                     "price": r.price,
                     "quantity": r.quantity,
                     "sector": r.sector,
+                    "rationale": r.rationale,
                 }
                 for r in rows
             ]
@@ -640,13 +728,14 @@ class OrderManager:
             symbol, side = ap.symbol, ap.side
             order_type, price = ap.order_type, ap.price or 0.0
             quantity, sector = ap.quantity, ap.sector
+            rationale = ap.rationale
 
         if side == "BUY":
-            order_id = self._live_buy(symbol, price, quantity, sector)
+            order_id = self._live_buy(symbol, price, quantity, sector, rationale)
         elif order_type == "MARKET":
-            order_id = self._live_sell_market(symbol, quantity)
+            order_id = self._live_sell_market(symbol, quantity, rationale)
         else:
-            order_id = self._live_sell(symbol, price, quantity)
+            order_id = self._live_sell(symbol, price, quantity, rationale)
 
         if not order_id:
             return {"ok": False, "order_id": None,
@@ -745,7 +834,8 @@ class OrderManager:
                       quantity: int, price: float,
                       status: str = st.PENDING,
                       filled_at: Optional[datetime] = None,
-                      sector: Optional[str] = None) -> None:
+                      sector: Optional[str] = None,
+                      rationale: Optional[str] = None) -> None:
         with get_session() as session:
             session.add(Trade(
                 order_id=order_id,
@@ -756,6 +846,7 @@ class OrderManager:
                 price=price,
                 status=status,
                 filled_at=filled_at,
+                rationale=rationale,
             ))
             session.commit()
 

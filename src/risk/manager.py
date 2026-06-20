@@ -6,6 +6,7 @@
 - セクター集中制限
 - ギャップリスク考慮
 """
+from dataclasses import dataclass, field
 from typing import Optional
 
 from loguru import logger
@@ -17,6 +18,23 @@ from src.core import halt
 from src.data.database import Position, Trade, get_session
 from src.data.market_data import latest_closes
 from src.execution import order_status as st
+
+
+@dataclass
+class RiskSnapshot:
+    """リスク判定に必要なDB読取を1回にまとめたスナップショット（P2-6）。
+
+    validate_buy() は can_place_order / check_max_positions / calc_position_size /
+    check_sector_concentration を続けて呼び、それぞれが positions / 未約定BUY / 未解決数 /
+    最新終値を重複して問い合わせていた。発注判定の途中で口座状態がバラバラに変わる
+    （バッチ非整合）のも避けたいため、判定開始時に一括取得した本スナップショットを各チェックへ
+    渡す。snapshot を渡さない呼び出しは従来どおり個別にDBを引く（後方互換）。
+    """
+    positions: list = field(default_factory=list)       # quantity>0 の Position
+    open_buys: list = field(default_factory=list)        # 未約定BUYの Trade
+    pos_sector: dict = field(default_factory=dict)       # symbol→sector（全Position）
+    unresolved_count: int = 0
+    closes: dict = field(default_factory=dict)           # symbol→最新終値
 
 
 class RiskManager:
@@ -60,6 +78,38 @@ class RiskManager:
         if pnl < 0:
             self._daily_loss_yen += abs(pnl)
 
+    def build_snapshot(self) -> RiskSnapshot:
+        """リスク判定に必要なDB読取を1回のセッションでまとめて取得する（P2-6）。"""
+        with get_session() as session:
+            positions = list(session.scalars(
+                select(Position).where(Position.quantity > 0)
+            ).all())
+            open_buys = list(session.scalars(
+                select(Trade).where(
+                    Trade.side == "BUY",
+                    Trade.status.in_(tuple(st.OPEN_STATUSES)),
+                )
+            ).all())
+            pos_sector = {p.symbol: p.sector for p in session.scalars(select(Position)).all()}
+            unresolved = session.scalar(
+                select(func.count(Trade.id)).where(
+                    Trade.status.in_(tuple(st.UNRESOLVED_STATUSES))
+                )
+            ) or 0
+        closes = latest_closes([p.symbol for p in positions])
+        return RiskSnapshot(
+            positions=positions, open_buys=open_buys, pos_sector=pos_sector,
+            unresolved_count=unresolved, closes=closes,
+        )
+
+    def current_daily_loss(self) -> float:
+        """当日の累積実現損失（円・正の値）。異常監視・可視化用。"""
+        return self._daily_loss_yen
+
+    def daily_loss_limit(self) -> float:
+        """当日損失上限（円。0 で無効）。"""
+        return self._conf.get("max_daily_loss", 0)
+
     def is_daily_loss_limit_reached(self) -> tuple[bool, str]:
         """当日損失上限チェック。(over_limit, reason) を返す"""
         limit = self._conf.get("max_daily_loss", 0)
@@ -69,7 +119,7 @@ class RiskManager:
             return True, f"当日損失上限({limit:,.0f}円)に達しました"
         return False, ""
 
-    def can_place_order(self) -> tuple[bool, str]:
+    def can_place_order(self, snapshot: Optional[RiskSnapshot] = None) -> tuple[bool, str]:
         """注文可能かチェック。(ok, reason) を返す"""
         # 取引停止スイッチ（kill switch）が ON なら全ての新規発注を抑止する。
         # 損切り・緊急決済は sell_market(reason=...) でこのゲート自体をバイパスするため、
@@ -85,7 +135,8 @@ class RiskManager:
             return False, reason
         # 状態不明・キャンセル失敗の注文が残っている間は新規発注を抑止する
         # （実口座と乖離したまま発注すると二重発注・想定外建玉になるため、要人手確認）
-        unresolved = self._count_unresolved_orders()
+        unresolved = (snapshot.unresolved_count if snapshot is not None
+                      else self._count_unresolved_orders())
         if unresolved:
             return False, f"未解決の注文が{unresolved}件あります（要確認）"
         return True, ""
@@ -99,24 +150,30 @@ class RiskManager:
                 )
             ) or 0
 
-    def _reserved_buy_by_sector(self) -> tuple[float, dict[str, float]]:
+    def _reserved_buy_by_sector(
+        self, snapshot: Optional[RiskSnapshot] = None
+    ) -> tuple[float, dict[str, float]]:
         """未約定BUY注文の引当金額 (総額, セクター別内訳) を返す。
 
         price × 残数（発注数量 - 約定済数量）で算定する。セクターは発注時に記録した
         `Trade.sector` を優先する（新規銘柄はPositionが未作成のため、Position経由の
         解決では漏れる）。`Trade.sector` が無い古いレコードのみPositionへフォールバック。
         """
-        with get_session() as session:
-            trades = session.scalars(
-                select(Trade).where(
-                    Trade.side == "BUY",
-                    Trade.status.in_(tuple(st.OPEN_STATUSES)),
-                )
-            ).all()
-            pos_sector = {
-                p.symbol: p.sector
-                for p in session.scalars(select(Position)).all()
-            }
+        if snapshot is not None:
+            trades = snapshot.open_buys
+            pos_sector = snapshot.pos_sector
+        else:
+            with get_session() as session:
+                trades = session.scalars(
+                    select(Trade).where(
+                        Trade.side == "BUY",
+                        Trade.status.in_(tuple(st.OPEN_STATUSES)),
+                    )
+                ).all()
+                pos_sector = {
+                    p.symbol: p.sector
+                    for p in session.scalars(select(Position)).all()
+                }
         total = 0.0
         by_sector: dict[str, float] = {}
         for t in trades:
@@ -134,12 +191,13 @@ class RiskManager:
         self._daily_order_count += 1
 
     def calc_position_size(self, symbol: str, price: float,
-                           cash_balance: float) -> int:
+                           cash_balance: float,
+                           snapshot: Optional[RiskSnapshot] = None) -> int:
         """購入株数を計算する（最大投資額を超えない範囲）"""
         max_ratio = self._conf.get("max_position_ratio", 0.20)
         # 未約定BUYの引当を差し引いた実効余力で上限を計算する
         # （未約定中の多重発注で余力を二重に使う事故を防ぐ。main側の逐次減算と二重で守る）
-        reserved, _ = self._reserved_buy_by_sector()
+        reserved, _ = self._reserved_buy_by_sector(snapshot)
         available = max(0.0, cash_balance - reserved)
         max_amount = available * max_ratio
         if price <= 0:
@@ -150,7 +208,8 @@ class RiskManager:
         logger.debug(f"{symbol}: 購入可能数={quantity}株 (価格={price:.0f}, 上限={max_amount:.0f}円)")
         return quantity
 
-    def check_max_positions(self, candidate_symbol: Optional[str] = None) -> tuple[bool, str]:
+    def check_max_positions(self, candidate_symbol: Optional[str] = None,
+                            snapshot: Optional[RiskSnapshot] = None) -> tuple[bool, str]:
         """最大保有銘柄数チェック。
 
         保有Positionの数だけでなく、未約定BUYの銘柄（まだPosition化されていない
@@ -160,20 +219,24 @@ class RiskManager:
         含めて判定する（既に保有/未約定の銘柄であれば集合は増えないため通る）。
         """
         max_pos = self._conf.get("max_positions", 5)
-        with get_session() as session:
-            active_symbols = {
-                p.symbol for p in session.scalars(
-                    select(Position).where(Position.quantity > 0)
-                ).all()
-            }
-            reserved_symbols = {
-                t.symbol for t in session.scalars(
-                    select(Trade).where(
-                        Trade.side == "BUY",
-                        Trade.status.in_(tuple(st.OPEN_STATUSES)),
-                    )
-                ).all()
-            }
+        if snapshot is not None:
+            active_symbols = {p.symbol for p in snapshot.positions}
+            reserved_symbols = {t.symbol for t in snapshot.open_buys}
+        else:
+            with get_session() as session:
+                active_symbols = {
+                    p.symbol for p in session.scalars(
+                        select(Position).where(Position.quantity > 0)
+                    ).all()
+                }
+                reserved_symbols = {
+                    t.symbol for t in session.scalars(
+                        select(Trade).where(
+                            Trade.side == "BUY",
+                            Trade.status.in_(tuple(st.OPEN_STATUSES)),
+                        )
+                    ).all()
+                }
         after_symbols = active_symbols | reserved_symbols
         if candidate_symbol:
             after_symbols = after_symbols | {candidate_symbol}
@@ -182,7 +245,8 @@ class RiskManager:
         return True, ""
 
     def check_sector_concentration(self, sector: str,
-                                   candidate_notional: float = 0.0) -> tuple[bool, str]:
+                                   candidate_notional: float = 0.0,
+                                   snapshot: Optional[RiskSnapshot] = None) -> tuple[bool, str]:
         """同一セクターの集中投資チェック（建玉の時価評価額ベース）。
 
         銘柄数の比率ではなく、quantity × 最新終値 のエクスポージャー金額で判定する
@@ -193,13 +257,16 @@ class RiskManager:
         発注前に弾けないため、判定対象の候補金額も合算してから比較する。
         """
         max_ratio = self._conf.get("max_sector_ratio", 0.40)
-        with get_session() as session:
-            all_pos = session.scalars(select(Position).where(Position.quantity > 0)).all()
+        if snapshot is not None:
+            all_pos = snapshot.positions
+        else:
+            with get_session() as session:
+                all_pos = session.scalars(select(Position).where(Position.quantity > 0)).all()
         # 未約定BUYの引当も「買った後の集中度」として加味する（発注前に上限超過を防ぐ）
-        reserved_total, reserved_by_sector = self._reserved_buy_by_sector()
+        reserved_total, reserved_by_sector = self._reserved_buy_by_sector(snapshot)
         if not all_pos and reserved_total <= 0 and candidate_notional <= 0:
             return True, ""
-        closes = latest_closes([p.symbol for p in all_pos])
+        closes = snapshot.closes if snapshot is not None else latest_closes([p.symbol for p in all_pos])
         total_value = reserved_total + candidate_notional
         same_sector_value = reserved_by_sector.get(sector, 0.0) + candidate_notional
         for p in all_pos:
@@ -230,19 +297,25 @@ class RiskManager:
 
     def validate_buy(self, symbol: str, price: float,
                      cash_balance: float, sector: Optional[str] = None) -> tuple[bool, str]:
-        """買い注文の総合バリデーション"""
-        ok, reason = self.can_place_order()
+        """買い注文の総合バリデーション。
+
+        判定開始時に一括スナップショットを取り、各チェックへ渡す（DB往復削減・
+        判定中の口座状態の揺れを防ぐバッチ整合。P2-6）。
+        """
+        snap = self.build_snapshot()
+        ok, reason = self.can_place_order(snap)
         if not ok:
             return False, reason
-        ok, reason = self.check_max_positions(candidate_symbol=symbol)
+        ok, reason = self.check_max_positions(candidate_symbol=symbol, snapshot=snap)
         if not ok:
             return False, reason
-        quantity = self.calc_position_size(symbol, price, cash_balance)
+        quantity = self.calc_position_size(symbol, price, cash_balance, snapshot=snap)
         if quantity <= 0:
             return False, f"余力不足: {symbol}"
         if sector:
             # この注文自体の金額もセクター集中度に加味する（発注前に超過を弾く。再レビュー P1-2）
-            ok, reason = self.check_sector_concentration(sector, candidate_notional=price * quantity)
+            ok, reason = self.check_sector_concentration(
+                sector, candidate_notional=price * quantity, snapshot=snap)
             if not ok:
                 return False, reason
         return True, ""

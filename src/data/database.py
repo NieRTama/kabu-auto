@@ -50,7 +50,8 @@ class Trade(Base):
     filled_at = Column(DateTime)
     status = Column(String(20), default="PENDING")
     pnl = Column(Float)
-    note = Column(Text)
+    note = Column(Text)        # 利用者が後から書く自由記述メモ（取引ジャーナル）
+    rationale = Column(Text)   # 発注時に自動記録する売買根拠（シグナルスコア・損切り理由等。7.6）
 
 
 class OrderApproval(Base):
@@ -71,6 +72,7 @@ class OrderApproval(Base):
     status = Column(String(12), default="PENDING")   # PENDING / APPROVED / REJECTED
     decided_at = Column(DateTime)
     resulting_order_id = Column(String(50))          # 承認実行で発注した注文ID
+    rationale = Column(Text)                          # 発注根拠（承認後にTradeへ引き継ぐ。7.6）
     note = Column(Text)
 
 

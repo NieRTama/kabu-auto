@@ -301,6 +301,25 @@ CONFIRM_LIVE_TRADING=true python main.py
 - **日次レポート**: 日付ごとの確定損益・約定件数・買/売内訳・勝/負・勝率を集計表示する
   （`DRY_RUN` は実取引でないため除外）。
 
+### パフォーマンス分析・異常検知・発注根拠
+
+- **パフォーマンス分析**: プロフィットファクター・期待値・平均利益/損失・最大連勝/連敗・
+  銘柄別/セクター別の損益と勝率を表示（`/api/performance`）。
+- **異常検知（アラート）**: 未解決注文の残存・当日損失の上限接近(80%)/到達・kill switch ONを
+  定期検知し、新規発生時のみ通知（LINE等）する。ダッシュボード上部にも異常バナーを表示
+  （`/api/health`）。
+- **発注根拠の記録**: 発注時にシグナルスコア（combined/rule/ml）や損切り理由を `Trade.rationale` に
+  自動記録し、取引ジャーナルから「なぜこの取引をしたか」を辿れる。
+- **バックテスト実績乖離**: バックテストの想定（勝率・平均リターン）と、同一銘柄の実取引の
+  実績を比較し乖離を表示（バックテスト詳細の「実績との乖離を見る」）。
+
+### ブローカー側逆指値ストップ（保険）
+
+保有ポジションに証券会社側の逆指値（成行）ストップを置ける（ライブ/セミライブのみ）。
+PC・アプリが停止していても、株価がトリガー価格以下に下落すれば証券会社側で自動損切りが効く。
+「⚠️ 緊急操作」カードの「保護ストップを発注」（`X-Emergency-Token` 必須）から、数量・トリガー
+価格を省略すると「保有数量・取得平均×(1+損切り率)」で自動算出する。
+
 ---
 
 ## バックテスト
@@ -474,8 +493,11 @@ strategy:
 | GET | `/api/positions` | 現在ポジション（含み損益付き） |
 | GET | `/api/trades` | 取引履歴 |
 | GET | `/api/report/daily` | 日次レポート（確定損益・約定件数・売買内訳・勝敗・勝率。`days`） |
-| GET | `/api/journal` | 取引ジャーナル（確定取引・リターン率・メモ付き。`limit`） |
+| GET | `/api/journal` | 取引ジャーナル（確定取引・リターン率・発注根拠・メモ付き。`limit`） |
 | PUT | `/api/journal/{order_id}/note` | 取引にメモを付ける（`{note}`） |
+| GET | `/api/performance` | パフォーマンス分析（PF・期待値・連勝連敗・銘柄/セクター別） |
+| GET | `/api/health` | 運用異常の現在一覧（未解決注文・損失上限接近・kill switch） |
+| POST | `/api/stop_loss` | 保有ポジションにブローカー側逆指値ストップを発注（`X-Emergency-Token` 必須） |
 | GET | `/api/signals` | シグナル履歴 |
 | GET | `/api/pnl_summary` | 損益サマリ（基本） |
 | GET | `/api/pnl_chart` | 累積損益チャート用データ |
@@ -518,6 +540,7 @@ strategy:
 | POST | `/api/backtest/run` | バックテスト実行（閾値オーバーライド可） |
 | GET | `/api/backtest/runs` | バックテスト結果一覧（`page`/`page_size`/`include_archived`。ページング） |
 | GET | `/api/backtest/{run_id}` | バックテスト結果詳細 |
+| GET | `/api/backtest/{run_id}/divergence` | バックテストと同一銘柄の実取引の乖離（勝率・平均リターン・純損益） |
 | DELETE | `/api/backtest/{run_id}` | バックテスト結果を削除（取引明細も） |
 | POST | `/api/backtest/delete` | バックテスト結果を複数削除（`{ids}`） |
 | POST | `/api/backtest/{run_id}/archive` | バックテスト結果をアーカイブ |

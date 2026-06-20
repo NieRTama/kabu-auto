@@ -80,6 +80,14 @@ class TradingScheduler:
                 day_of_week="mon-fri",
                 hour=9, minute=5, id="morning_execution",
             )
+        if "health_check" in cb:
+            # 運用異常（未解決注文・損失上限接近・kill switch）の定期検知（平日 8:00-23:00 / 15分毎）。
+            # 市場時間に限定しないのは、場が引けた後でも未解決注文は要対応のため。
+            self._scheduler.add_job(
+                cb["health_check"], "cron",
+                day_of_week="mon-fri", hour="8-23", minute="*/15",
+                id="health_check",
+            )
         if "reconcile_orders" in cb:
             # WebSocketイベントの取り逃し・切断・再起動を跨いでDB↔ブローカーの
             # 注文状態ズレを定期的に検知・補正する（市場時間外はコールバック側でスキップ）
