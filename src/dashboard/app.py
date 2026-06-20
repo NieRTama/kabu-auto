@@ -312,31 +312,174 @@ async def logout(request: Request):
 
 @app.get("/api/status")
 async def get_status():
-    return {**_system_status, "risk_profile": risk_profile_store.get_active()}
+    """システム稼働状態と運用上の重要情報（モード・発注可否・LAN公開等）を返す。
+
+    ダッシュボードはこの情報を元に LIVE 赤バッジ・LAN公開警告・発注停止表示を出す。
+    """
+    from src.core import trading_mode as tm
+    dash = cfg.get_section("dashboard")
+    kabu = cfg.get_section("kabu_station")
+    mode = _system_status.get("mode", "paper")
+    host = dash.get("host", "127.0.0.1")
+    lan_exposed = host == "0.0.0.0"
+    status = {
+        **_system_status,
+        "risk_profile": risk_profile_store.get_active(),
+        "mode_description": tm.description(mode),
+        "places_real_orders": tm.places_real_orders(mode),
+        "endpoint": kabu.get("base_url", ""),
+        "lan_exposed": lan_exposed,
+        "funding_source": ("口座余力(/wallet)" if tm.reads_broker_api(mode)
+                           else "ペーパー初期資金"),
+    }
+    if _order_manager is not None:
+        try:
+            status.update(_order_manager.status_snapshot())
+        except Exception as e:
+            logger.warning(f"status_snapshot 取得失敗: {e}")
+    return status
 
 
 @app.get("/api/risk_profile")
 async def get_risk_profile():
-    """アクティブなリスクプロファイルと選択可能な全プロファイルを返す"""
+    """アクティブなリスクプロファイルと選択可能な全プロファイルを返す。
+
+    組み込み（low_risk/high_risk）とカスタムを区別できるよう builtin リストも返す。
+    """
+    profiles = risk_profile_store.get_profiles()
     return {
         "active": risk_profile_store.get_active(),
-        "profiles": risk_profile_store.get_profiles(),
+        "profiles": profiles,
+        "builtin": [n for n in profiles if risk_profile_store.is_builtin(n)],
     }
+
+
+def _requires_live_confirmation(confirm: bool) -> None:
+    """実発注モードでのプロファイル選択/cloneは二重確認を要求する（11: ライブ安全）。"""
+    from src.core import trading_mode as tm
+    mode = _system_status.get("mode", "paper")
+    if tm.places_real_orders(mode) and not confirm:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{tm.description(mode)}でのリスクプロファイル変更には確認が必要です"
+                   "（confirm=true を指定してください）",
+        )
 
 
 class RiskProfileRequest(BaseModel):
     name: str
+    confirm: bool = False  # 実発注モードでの切替に必要な二重確認
 
 
 @app.post("/api/risk_profile")
 async def set_risk_profile(req: RiskProfileRequest):
-    """リスクプロファイルを切り替える（ハイリスク⇔ローリスク）。
-    発注サイズ・損切り幅・売買閾値などに即座に反映される。"""
+    """リスクプロファイルを切り替える。発注サイズ・損切り幅・売買閾値などに即時反映。
+
+    実発注モード（live/semi_live）では confirm=true が必要（二重確認）。
+    """
+    _requires_live_confirmation(req.confirm)
     try:
         result = risk_profile_store.set_active(req.name)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return result
+
+
+class CustomProfileRequest(BaseModel):
+    name: str
+    params: dict
+
+
+@app.post("/api/risk_profiles")
+async def create_custom_profile(req: CustomProfileRequest):
+    """カスタムリスクプロファイルを新規作成する（値はサーバ側で検証する）。"""
+    try:
+        return risk_profile_store.create_custom(req.name, req.params)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class UpdateProfileRequest(BaseModel):
+    params: dict
+
+
+@app.put("/api/risk_profiles/{name}")
+async def update_custom_profile(name: str, req: UpdateProfileRequest):
+    """カスタムリスクプロファイルを更新する（組み込みは編集不可）。"""
+    try:
+        return risk_profile_store.update_custom(name, req.params)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/risk_profiles/{name}")
+async def delete_custom_profile(name: str):
+    """カスタムリスクプロファイルを削除する（組み込み・アクティブは削除不可）。"""
+    try:
+        remaining = risk_profile_store.delete_custom(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "ok", "remaining": remaining}
+
+
+class CloneProfileRequest(BaseModel):
+    new_name: str
+
+
+@app.post("/api/risk_profiles/{name}/clone")
+async def clone_profile(name: str, req: CloneProfileRequest):
+    """既存プロファイルを複製して新しいカスタムを作る。"""
+    try:
+        return risk_profile_store.clone(name, req.new_name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/risk_profiles/export")
+async def export_risk_profile(name: str):
+    """プロファイルをJSONファイルとしてダウンロードする。"""
+    try:
+        data = risk_profile_store.export_profile(name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    filename = f"risk_profile_{name}.json".replace("/", "_")
+    encoded = quote(filename)
+    return JSONResponse(
+        content=data,
+        headers={
+            "Content-Disposition": f"attachment; filename=\"risk_profile_export.json\"; filename*=UTF-8''{encoded}"
+        },
+    )
+
+
+class ProfileImportRequest(BaseModel):
+    name: str
+    params: dict
+    overwrite: bool = False
+
+
+@app.post("/api/risk_profiles/import")
+async def import_risk_profile(req: ProfileImportRequest):
+    """外部のプロファイル定義を取り込んでカスタムとして保存する。"""
+    try:
+        return risk_profile_store.import_profile(req.name, req.params, overwrite=req.overwrite)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/risk_profiles/compare")
+async def compare_risk_profiles(a: str, b: str):
+    """2つのプロファイルを比較して差分を返す。"""
+    try:
+        return risk_profile_store.compare(a, b)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/risk_profiles/history")
+async def get_risk_profile_history(limit: int = 50):
+    """リスクプロファイルの変更履歴を新しい順に返す。"""
+    return risk_profile_store.get_history(limit)
 
 
 @app.get("/api/positions")
@@ -549,6 +692,84 @@ async def emergency_close(_: None = Depends(_verify_emergency_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── 取引停止スイッチ（kill switch）────────────────────────────────────────
+
+
+class HaltRequest(BaseModel):
+    reason: str = ""
+    close_positions: bool = False  # True で停止と同時に全ポジションを成行決済する
+
+
+@app.get("/api/halt")
+async def get_halt_status():
+    """取引停止スイッチの現在状態を返す（停止中か・理由・停止時刻）。"""
+    from src.core import halt
+    return halt.get_state()
+
+
+@app.post("/api/halt")
+async def engage_halt(req: HaltRequest, _: None = Depends(_verify_emergency_token)):
+    """取引停止スイッチを作動させる（X-Emergency-Token 必須）。
+
+    新規発注を全停止し、未約定BUYをキャンセルする。close_positions=True なら
+    全ポジションを成行決済する。損切り・緊急決済は停止中も実行可能。
+    """
+    if _order_manager is None:
+        raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
+    try:
+        result = _order_manager.halt_trading(req.reason, close_positions=req.close_positions)
+        return {"status": "ok", "message": "取引を停止しました", **result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/halt")
+async def release_halt(_: None = Depends(_verify_emergency_token)):
+    """取引停止スイッチを解除する（X-Emergency-Token 必須）。
+
+    未解決注文（UNKNOWN/CANCEL_FAILED）が残っている間は解除できない（409）。
+    """
+    if _order_manager is None:
+        raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
+    result = _order_manager.resume_trading()
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("reason"))
+    return {"status": "ok", "message": "取引を再開しました", **result}
+
+
+# ─── semi_live 発注承認キュー ───────────────────────────────────────────────
+
+
+@app.get("/api/approvals")
+async def get_pending_approvals():
+    """semi_live モードの承認待ち計画注文を返す。"""
+    if _order_manager is None:
+        raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
+    return _order_manager.list_pending_approvals()
+
+
+@app.post("/api/approvals/{approval_id}/approve")
+async def approve_pending_order(approval_id: int):
+    """承認待ちの計画注文を承認し、実APIへ発注する（semi_live）。"""
+    if _order_manager is None:
+        raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
+    result = _order_manager.approve_order(approval_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("reason"))
+    return {"status": "ok", "message": "承認して発注しました", **result}
+
+
+@app.post("/api/approvals/{approval_id}/reject")
+async def reject_pending_order(approval_id: int):
+    """承認待ちの計画注文を却下する（発注しない）。"""
+    if _order_manager is None:
+        raise HTTPException(status_code=503, detail="OrderManagerが初期化されていません")
+    result = _order_manager.reject_order(approval_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("reason"))
+    return {"status": "ok", "message": "却下しました", **result}
+
+
 # ─── MLモデルメトリクス ───────────────────────────────────────────
 
 
@@ -637,9 +858,14 @@ async def get_watchlist():
 
 @app.post("/api/watchlist")
 async def add_watchlist_entry(entry: WatchlistEntry):
-    """ウォッチリストに銘柄を追加（既存コードなら会社名を更新）し、過去データを自動取得する"""
+    """ウォッチリストに銘柄を追加し、過去データを自動取得する。
+
+    同一リスト内に同じ銘柄が既にある場合は 409 Conflict を返す（6.9 重複防止）。
+    """
     try:
         result = watchlist_store.add(entry.code, entry.name)
+    except watchlist_store.DuplicateError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     from src.data.market_data import lookup_sector, update_symbol
@@ -816,33 +1042,127 @@ async def start_backtest(req: BacktestRequest):
     return {"run_id": run_id, "status": "completed"}
 
 
+def _serialize_run(r: BacktestRun) -> dict:
+    return {
+        "id": r.id,
+        "symbol": r.symbol,
+        "start_date": r.start_date.isoformat() if r.start_date else None,
+        "end_date": r.end_date.isoformat() if r.end_date else None,
+        "initial_capital": r.initial_capital,
+        "final_capital": r.final_capital,
+        "total_return": r.total_return,
+        "max_drawdown": r.max_drawdown,
+        "sharpe_ratio": r.sharpe_ratio,
+        "win_rate": r.win_rate,
+        "trade_count": r.trade_count,
+        "use_ml": bool(r.use_ml),
+        "buy_threshold": r.buy_threshold,
+        "sell_threshold": r.sell_threshold,
+        "archived": bool(r.archived),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
 @app.get("/api/backtest/runs")
-async def get_backtest_runs(limit: int = 20):
-    """直近のバックテスト実行一覧を返す"""
+async def get_backtest_runs(page: int = 1, page_size: int = 15,
+                            include_archived: bool = False):
+    """バックテスト実行一覧をページングして返す（新しい順）。
+
+    既定はアーカイブ済みを除外する（include_archived=true で含める）。1ページ15件。
+    戻り値: {"runs": [...], "total": int, "page": int, "page_size": int, "total_pages": int}
+    """
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    cond = [] if include_archived else [
+        (BacktestRun.archived.is_(None)) | (BacktestRun.archived == 0)
+    ]
+    with get_session() as session:
+        total = session.scalar(
+            select(func.count(BacktestRun.id)).where(*cond)
+        ) or 0
+        runs = session.scalars(
+            select(BacktestRun).where(*cond)
+            .order_by(BacktestRun.id.desc())
+            .offset((page - 1) * page_size).limit(page_size)
+        ).all()
+        items = [_serialize_run(r) for r in runs]
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return {
+        "runs": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
+class BacktestDeleteRequest(BaseModel):
+    ids: list[int]
+
+
+def _delete_runs(ids: list[int]) -> int:
+    """指定したバックテスト実行とその取引明細を1トランザクションで削除する。
+
+    実行(BacktestRun)と取引明細(BacktestTradeRecord)を一括で消し、孤児レコードを残さない。
+    戻り値: 実際に削除した実行件数。
+    """
+    if not ids:
+        return 0
     with get_session() as session:
         runs = session.scalars(
-            select(BacktestRun).order_by(BacktestRun.id.desc()).limit(limit)
+            select(BacktestRun).where(BacktestRun.id.in_(ids))
         ).all()
-    return [
-        {
-            "id": r.id,
-            "symbol": r.symbol,
-            "start_date": r.start_date.isoformat() if r.start_date else None,
-            "end_date": r.end_date.isoformat() if r.end_date else None,
-            "initial_capital": r.initial_capital,
-            "final_capital": r.final_capital,
-            "total_return": r.total_return,
-            "max_drawdown": r.max_drawdown,
-            "sharpe_ratio": r.sharpe_ratio,
-            "win_rate": r.win_rate,
-            "trade_count": r.trade_count,
-            "use_ml": bool(r.use_ml),
-            "buy_threshold": r.buy_threshold,
-            "sell_threshold": r.sell_threshold,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in runs
-    ]
+        found = [r.id for r in runs]
+        if found:
+            session.query(BacktestTradeRecord).filter(
+                BacktestTradeRecord.run_id.in_(found)
+            ).delete(synchronize_session=False)
+            for r in runs:
+                session.delete(r)
+        session.commit()
+    return len(found)
+
+
+@app.delete("/api/backtest/{run_id}")
+async def delete_backtest_run(run_id: int):
+    """バックテスト実行を1件削除する（取引明細も同時削除）。"""
+    deleted = _delete_runs([run_id])
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="バックテスト結果が見つかりません")
+    return {"status": "ok", "deleted": deleted}
+
+
+@app.post("/api/backtest/delete")
+async def delete_backtest_runs(req: BacktestDeleteRequest):
+    """バックテスト実行を複数まとめて削除する（取引明細も同時削除・1トランザクション）。"""
+    deleted = _delete_runs(req.ids)
+    return {"status": "ok", "deleted": deleted}
+
+
+def _set_archived(run_id: int, archived: bool) -> bool:
+    with get_session() as session:
+        run = session.scalar(select(BacktestRun).where(BacktestRun.id == run_id))
+        if run is None:
+            return False
+        run.archived = 1 if archived else 0
+        session.commit()
+    return True
+
+
+@app.post("/api/backtest/{run_id}/archive")
+async def archive_backtest_run(run_id: int):
+    """バックテスト実行をアーカイブする（一覧から除外。履歴は保持）。"""
+    if not _set_archived(run_id, True):
+        raise HTTPException(status_code=404, detail="バックテスト結果が見つかりません")
+    return {"status": "ok", "archived": True}
+
+
+@app.post("/api/backtest/{run_id}/unarchive")
+async def unarchive_backtest_run(run_id: int):
+    """バックテスト実行のアーカイブを解除する。"""
+    if not _set_archived(run_id, False):
+        raise HTTPException(status_code=404, detail="バックテスト結果が見つかりません")
+    return {"status": "ok", "archived": False}
 
 
 @app.get("/api/backtest/{run_id}")

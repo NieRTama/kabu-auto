@@ -192,20 +192,34 @@ PowerShell の場合は `Invoke-WebRequest -Uri <URL> -Method POST` を使用す
 
 ## 取引モード
 
-| モード | 説明 |
-|--------|------|
-| `paper` | ペーパートレード — 注文は実行されずシグナル・損益をシミュレート |
-| `live` | 本番 — kabuステーションAPI 経由で実際に発注 |
+| モード | 説明 | 実発注 | API読取 |
+|--------|------|:---:|:---:|
+| `paper` | ペーパートレード — 注文は実行されずシグナル・損益をシミュレート | × | × |
+| `dry_run` | ドライラン — 実APIから板/余力は読むが**発注はしない**。発注しようとした内容を `DRY_RUN` として記録するだけの検証モード（建玉・余力には影響しない） | × | ○ |
+| `semi_live` | セミライブ — 計画注文を**承認キュー**に積み、ダッシュボードで人が承認した分だけ実発注（損切り・緊急決済は承認不要で即時発注） | ○（承認後） | ○ |
+| `live` | 本番 — kabuステーションAPI 経由で実際に発注 | ○ | ○ |
 
 `config.yaml` の `trading.mode` で切り替える。**必ずペーパーモードで動作確認してから本番へ。**
+ペーパー→ドライラン→セミライブ→ライブ の順に段階的に移行するのが安全。
 
-ライブモードで起動するには、環境変数 `CONFIRM_LIVE_TRADING=true` の設定が必要です。
+実発注モード（`live` / `semi_live`）で起動するには、環境変数 `CONFIRM_LIVE_TRADING=true` の設定が必要です。
 
 ```bash
 CONFIRM_LIVE_TRADING=true python main.py
 ```
 
-未設定の場合は起動時にエラーメッセージを表示して終了します。
+未設定の場合は起動時にエラーメッセージを表示して終了します（`dry_run` は読み取りのみのため不要）。
+
+### プリフライトチェック（起動前の安全確認）
+
+`paper` 以外のモードでは起動時に自動でプリフライトチェックを実行します。
+実発注モードでは1つでも致命的な項目が失敗すると起動を中断します（fail-closed）。
+
+- API疎通（`/orders`・`/positions`・`/wallet`）
+- DBに未解決注文（`UNKNOWN`/`CANCEL_FAILED`）が残っていないこと
+- ダッシュボードのポートが空いていること
+- 実発注モードが検証用ポート（18081）を向いていないこと（本番は 18080）
+- 取引停止スイッチが ON のまま起動していないか（警告）
 
 ---
 
@@ -251,6 +265,31 @@ CONFIRM_LIVE_TRADING=true python main.py
 本番モードでは `X-Emergency-Token` ヘッダーが必要（起動時のコンソール表示を参照）。
 
 損切り（`stop_loss_check`）も同様に**成行**で発注する（急変時に指値だと約定しないため、確実な約定を優先）。
+
+### 取引停止スイッチ（kill switch）
+
+異常を察知したら、まず新規発注を全停止して状況を確認するための緊急ブレーキ。
+「緊急操作」カードの「取引を緊急停止」ボタン（`X-Emergency-Token` 必須）で作動する。
+
+- 作動すると新規発注を全停止し、未約定のBUY注文をキャンセルする（任意で全ポジション成行決済も可）
+- **損切り・緊急決済は停止中も実行される**（リスクを増やさない退出は止めない）
+- 停止状態は `data/trading_halt.json` に永続化され、プロセス再起動後も維持される
+- 解除（再開）は、未解決注文（`UNKNOWN`/`CANCEL_FAILED`）がゼロのときのみ可能
+
+### 発注承認（セミライブ）
+
+`semi_live` モードでは、計画された新規注文がダッシュボードの「発注承認待ち」に表示される。
+内容を確認して「承認」を押すと実際に発注され、「却下」を押すと発注されない。
+
+### インシデント回復手順
+
+口座状態とDBが食い違っている疑いがあるとき（`UNKNOWN`/`CANCEL_FAILED` が残る・約定したか不明など）:
+
+1. **まず止める** — ダッシュボードで「取引を緊急停止」（kill switch）を作動させる。
+2. **実態を確認** — kabuステーション本体／証券会社アプリで `/orders`・`/positions` の実際の状態を確認する。
+3. **DBを実態に合わせる** — 市場時間中は15秒間隔の照合ジョブ（`reconcile_orders`）が `/orders` と突合して自動収束する。手動で確認したい場合はダッシュボードの取引履歴を参照。
+4. **未解決をゼロにする** — `UNKNOWN`/`CANCEL_FAILED` の注文は、実態に合わせて手動で決済/キャンセルし解消する（残っている間は新規発注も再開もブロックされる）。
+5. **再開** — 未解決ゼロを確認したら kill switch を解除する。再起動が必要な場合、起動時のプリフライトチェックが未解決注文を再度検査する。
 
 ---
 
@@ -316,7 +355,22 @@ curl -X POST http://localhost:8080/api/backtest/run \
 | 売買閾値 | ±0.14 | ±0.08 |
 
 選択内容は `risk_profile.json` に永続化され、プロセス再起動後も維持される。
-プロファイルの定義自体は `config.yaml` の `risk_profiles` セクションで編集できる。
+組み込みプロファイル（`low_risk`/`high_risk`）の定義は `config.yaml` の `risk_profiles` セクションで編集できる。
+
+#### カスタムリスクプロファイル
+
+組み込みの2種に加え、任意名のカスタムプロファイルを作成できる（ダッシュボードの「⚖️ リスクプロファイル」パネル）。
+
+- **作成（複製）**: 既存プロファイルを複製して新規カスタムを作る（clone）
+- **削除**: カスタムのみ削除可（組み込み・アクティブは不可）
+- **比較**: 2プロファイルの差分を表示
+- **エクスポート/取込**: `/api/risk_profiles/export` / `/api/risk_profiles/import`（JSON）
+- **値の検証**: 保存・適用前に共有バリデーションを通し、範囲外・型不一致・項目欠落・未知キーは
+  エラーで弾く（**丸めない**。誤設定のまま運用に入らないため）。無効な値ではアクティブにできない
+- **変更履歴**: 切替・作成・更新・削除・複製・取込は `risk_profile.json` に履歴として記録される
+- **二重確認**: 実発注モード（live/semi_live）でのプロファイル切替は確認を要求する
+
+カスタムプロファイルとその履歴は `risk_profile.json` に永続化される。
 
 > **売買閾値の数値について**: `combined_score`（ルールスコア×0.5 + MLスコア×0.5）の実際の
 > 値域は、ルールベース要素がMAクロス/RSI極値/BBブレイク/MACDクロスといった発生頻度の低い
@@ -406,7 +460,7 @@ strategy:
 | POST | `/api/setup` | 初回のユーザーID・パスワード作成（`{username, password}`） |
 | POST | `/api/login` | ログイン（`{username, password}`、成功時セッションCookie発行） |
 | POST | `/api/logout` | ログアウト（セッション破棄） |
-| GET | `/api/status` | システム稼働状態（アクティブなリスクプロファイル名を含む） |
+| GET | `/api/status` | システム稼働状態（モード・接続先・発注可否・停止状態・LAN公開・未解決/承認待ち件数を含む） |
 | GET | `/api/positions` | 現在ポジション（含み損益付き） |
 | GET | `/api/trades` | 取引履歴 |
 | GET | `/api/signals` | シグナル履歴 |
@@ -414,7 +468,13 @@ strategy:
 | GET | `/api/pnl_chart` | 累積損益チャート用データ |
 | GET | `/api/pnl/daily` | 日次損益リスト（棒グラフ用） |
 | GET | `/api/pnl/enhanced_summary` | 損益サマリ（MTD/YTD/Sharpe/DD） |
-| POST | `/api/emergency_close` | 緊急全ポジション決済 |
+| POST | `/api/emergency_close` | 緊急全ポジション決済（`X-Emergency-Token` 必須） |
+| GET | `/api/halt` | 取引停止スイッチの状態 |
+| POST | `/api/halt` | 取引を緊急停止（`X-Emergency-Token` 必須、`{reason, close_positions}`） |
+| DELETE | `/api/halt` | 取引停止を解除（`X-Emergency-Token` 必須、未解決ありなら409） |
+| GET | `/api/approvals` | semi_live の承認待ち計画注文一覧 |
+| POST | `/api/approvals/{id}/approve` | 計画注文を承認して実発注 |
+| POST | `/api/approvals/{id}/reject` | 計画注文を却下 |
 | GET | `/api/model/metrics` | モデル精度履歴 |
 | GET | `/api/model/latest` | 最新モデルの学習結果 |
 | POST | `/api/model/retrain` | MLモデル手動再学習トリガー |
@@ -431,12 +491,24 @@ strategy:
 | POST | `/api/watchlist/import` | JSONからウォッチリストを取込（`{name, entries, overwrite}`） |
 | GET | `/api/symbol_names` | 銘柄コード→会社名マッピング |
 | GET | `/api/symbol_lookup/{code}` | yfinanceから会社名を取得 |
-| GET | `/api/risk_profile` | アクティブなリスクプロファイルと全プロファイル定義 |
-| POST | `/api/risk_profile` | リスクプロファイルを切替（`{name}`） |
+| GET | `/api/risk_profile` | アクティブなリスクプロファイルと全プロファイル定義（組み込み一覧含む） |
+| POST | `/api/risk_profile` | リスクプロファイルを切替（`{name, confirm}`。実発注モードは confirm 必須） |
+| POST | `/api/risk_profiles` | カスタムプロファイル作成（`{name, params}`） |
+| PUT | `/api/risk_profiles/{name}` | カスタムプロファイル更新（`{params}`） |
+| DELETE | `/api/risk_profiles/{name}` | カスタムプロファイル削除 |
+| POST | `/api/risk_profiles/{name}/clone` | プロファイルを複製（`{new_name}`） |
+| GET | `/api/risk_profiles/export?name=` | プロファイルをJSONでダウンロード |
+| POST | `/api/risk_profiles/import` | プロファイルを取込（`{name, params, overwrite}`） |
+| GET | `/api/risk_profiles/compare?a=&b=` | 2プロファイルの差分 |
+| GET | `/api/risk_profiles/history` | プロファイル変更履歴 |
 | GET | `/api/backtest/default_thresholds` | 現在アクティブな買い/売り閾値 |
 | POST | `/api/backtest/run` | バックテスト実行（閾値オーバーライド可） |
-| GET | `/api/backtest/runs` | バックテスト結果一覧 |
+| GET | `/api/backtest/runs` | バックテスト結果一覧（`page`/`page_size`/`include_archived`。ページング） |
 | GET | `/api/backtest/{run_id}` | バックテスト結果詳細 |
+| DELETE | `/api/backtest/{run_id}` | バックテスト結果を削除（取引明細も） |
+| POST | `/api/backtest/delete` | バックテスト結果を複数削除（`{ids}`） |
+| POST | `/api/backtest/{run_id}/archive` | バックテスト結果をアーカイブ |
+| POST | `/api/backtest/{run_id}/unarchive` | アーカイブ解除 |
 
 ---
 

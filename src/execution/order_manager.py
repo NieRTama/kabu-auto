@@ -18,8 +18,9 @@ from sqlalchemy import func, select
 from src.api.kabu_client import KabuClient
 from src.core import clock
 from src.core import config as cfg
+from src.core import trading_mode as tm
 from src.core.alerts import alert
-from src.data.database import Position, Trade, get_session
+from src.data.database import OrderApproval, Position, Trade, get_session
 from src.data.market_data import latest_closes
 from src.execution import order_status as st
 from src.risk.manager import RiskManager
@@ -32,7 +33,8 @@ class OrderManager:
         self._conf = cfg.get_section("trading")
         # パスワードは kabu_station セクションから取得する
         self._kabu_password = cfg.get_section("kabu_station").get("password", "")
-        self._is_paper = self._conf.get("mode", "paper") == "paper"
+        self._mode = self._conf.get("mode", "paper")
+        self._is_paper = tm.is_paper(self._mode)
         self._pending_orders: dict[str, threading.Timer] = {}
         self._orders_lock = threading.Lock()
 
@@ -238,6 +240,16 @@ class OrderManager:
             self._update_position(symbol, "BUY", quantity, price, sector)
             return order_id
 
+        if self._mode == tm.DRY_RUN:
+            return self._record_dry_run("BUY", symbol, quantity, price, sector)
+        if self._mode == tm.SEMI_LIVE:
+            return self._enqueue_approval("BUY", "LIMIT", symbol, price, quantity, sector)
+
+        return self._live_buy(symbol, price, quantity, sector)
+
+    def _live_buy(self, symbol: str, price: float, quantity: int,
+                  sector: Optional[str] = None) -> Optional[str]:
+        """実APIへ指値買いを送る（live / semi_live承認実行の共通実体）。"""
         order = {
             "Password": self._kabu_password,
             "Symbol": symbol,
@@ -302,6 +314,15 @@ class OrderManager:
             self._update_position(symbol, "SELL", quantity, price, order_id=order_id)
             return order_id
 
+        if self._mode == tm.DRY_RUN:
+            return self._record_dry_run("SELL", symbol, quantity, price)
+        if self._mode == tm.SEMI_LIVE:
+            return self._enqueue_approval("SELL", "LIMIT", symbol, price, quantity)
+
+        return self._live_sell(symbol, price, quantity)
+
+    def _live_sell(self, symbol: str, price: float, quantity: int) -> Optional[str]:
+        """実APIへ指値売りを送る（live / semi_live承認実行の共通実体）。"""
         order = {
             "Password": self._kabu_password,
             "Symbol": symbol,
@@ -387,6 +408,17 @@ class OrderManager:
             self._update_position(symbol, "SELL", quantity, price, order_id=order_id)
             return order_id
 
+        if self._mode == tm.DRY_RUN:
+            # ドライランは退出系でも実発注しない（検証専用）。価格未確定なので0で記録する
+            return self._record_dry_run("SELL", symbol, quantity, 0.0)
+        if self._mode == tm.SEMI_LIVE and not is_exit:
+            # 通常売りは承認キューへ。損切り・緊急決済（退出）は承認を介さず即時発注する
+            return self._enqueue_approval("SELL", "MARKET", symbol, 0.0, quantity)
+
+        return self._live_sell_market(symbol, quantity)
+
+    def _live_sell_market(self, symbol: str, quantity: int) -> Optional[str]:
+        """実APIへ成行売りを送る（live / semi_live退出・承認実行の共通実体）。"""
         order = {
             "Password": self._kabu_password,
             "Symbol": symbol,
@@ -439,6 +471,208 @@ class OrderManager:
                 self.sell_market(pos.symbol, pos.quantity, reason="emergency")
             except Exception as e:
                 logger.error(f"緊急決済失敗: {pos.symbol} {e}")
+
+    def cancel_all_pending_buys(self) -> int:
+        """未約定のBUY注文をすべてキャンセルする（kill switch 作動時の新規建玉防止）。
+
+        SELL（決済・損切り）はリスクを減らす方向なので残す。BUYのみ取り消す。
+        戻り値: キャンセルを試みた注文件数（ペーパーは対象外で常に0）。
+        """
+        if self._is_paper:
+            return 0
+        with get_session() as session:
+            open_buy_ids = [
+                t.order_id for t in session.scalars(
+                    select(Trade).where(
+                        Trade.side == "BUY",
+                        Trade.status.in_(tuple(st.OPEN_STATUSES)),
+                    )
+                ).all()
+            ]
+        for oid in open_buy_ids:
+            self._cancel_order_now(oid)
+        return len(open_buy_ids)
+
+    def halt_trading(self, reason: str = "", close_positions: bool = False) -> dict:
+        """取引停止スイッチ（kill switch）を作動させる。
+
+        手順: 停止フラグON → 未約定BUYをキャンセル →（任意で）全ポジション成行決済。
+        以後 RiskManager.can_place_order() が新規発注を弾く。損切り・緊急決済は
+        reason バイパスで引き続き実行可能。解除は resume_trading() で手動のみ。
+        戻り値: {"state": <halt状態>, "cancelled_buys": int, "closed_positions": bool}
+        """
+        from src.core import halt
+        state = halt.engage(reason)
+        cancelled = self.cancel_all_pending_buys()
+        if close_positions:
+            self.close_all_positions()
+        alert("取引停止スイッチ作動",
+              f"理由: {state.get('reason')} / 未約定BUYキャンセル: {cancelled}件"
+              + ("（全ポジション成行決済を実行）" if close_positions else ""))
+        return {"state": state, "cancelled_buys": cancelled, "closed_positions": close_positions}
+
+    def resume_trading(self) -> dict:
+        """取引停止を解除する。未解決注文（UNKNOWN/CANCEL_FAILED）が残る間は解除しない。
+
+        実口座と乖離した状態（状態不明・キャンセル失敗）のまま再開すると
+        二重発注・想定外建玉を招くため、未解決ゼロを解除の条件とする。
+        戻り値: {"ok": bool, "reason": str, "state": <halt状態>}
+        """
+        from src.core import halt
+        unresolved = self._count_unresolved()
+        if unresolved:
+            return {
+                "ok": False,
+                "reason": f"未解決の注文が{unresolved}件あります。"
+                          "/orders・/positions を確認し解消してから再開してください",
+                "state": halt.get_state(),
+            }
+        state = halt.release()
+        return {"ok": True, "reason": "", "state": state}
+
+    def _count_unresolved(self) -> int:
+        with get_session() as session:
+            return session.scalar(
+                select(func.count(Trade.id)).where(
+                    Trade.status.in_(tuple(st.UNRESOLVED_STATUSES))
+                )
+            ) or 0
+
+    def _count_pending_approvals(self) -> int:
+        with get_session() as session:
+            return session.scalar(
+                select(func.count(OrderApproval.id)).where(
+                    OrderApproval.status == "PENDING"
+                )
+            ) or 0
+
+    def status_snapshot(self) -> dict:
+        """ダッシュボード・起動ログ用の運用状態スナップショット（Phase 3 / 11.1）。
+
+        モード・発注可否・停止スイッチ・未解決注文・承認待ち件数をまとめて返す。
+        発注可否(can_place_order)は kill switch・日次上限・損失上限・未解決ガードを
+        すべて織り込んだ実効的な判定。
+        """
+        from src.core import halt
+        can_order, reason = self._risk.can_place_order()
+        return {
+            "mode": self._mode,
+            "can_place_order": can_order,
+            "block_reason": reason,
+            "halt": halt.get_state(),
+            "unresolved_orders": self._count_unresolved(),
+            "pending_approvals": self._count_pending_approvals(),
+        }
+
+    # ─── dry_run / semi_live ────────────────────────────────────────────
+
+    def _record_dry_run(self, side: str, symbol: str, quantity: int,
+                        price: float, sector: Optional[str] = None) -> str:
+        """dry_run モードの「発注しようとした」記録を残す（実発注はしない）。
+
+        DRY_RUN ステータスは OPEN/UNRESOLVED いずれにも属さないため、余力引当・建玉・
+        未解決ガードに影響しない。日次注文数だけはセッション内のゲート挙動を
+        ライブと揃えるため計上する。
+        """
+        self._risk.increment_order_count()
+        order_id = f"DRYRUN-{side}-{symbol}-{uuid.uuid4().hex[:8]}"
+        logger.warning(
+            f"[DRY-RUN] {side} {symbol} {quantity}株 @{price:.0f}円 — 実発注はスキップしました"
+        )
+        self._record_trade(order_id, symbol, side, quantity, price,
+                           status=st.DRY_RUN, filled_at=clock.now(), sector=sector)
+        return order_id
+
+    def _enqueue_approval(self, side: str, order_type: str, symbol: str,
+                          price: float, quantity: int,
+                          sector: Optional[str] = None) -> Optional[str]:
+        """semi_live モードの計画注文を承認キューに積む（実発注はまだしない）。"""
+        with get_session() as session:
+            ap = OrderApproval(
+                symbol=symbol, side=side, order_type=order_type,
+                price=price, quantity=quantity, sector=sector, status="PENDING",
+            )
+            session.add(ap)
+            session.commit()
+            ap_id = ap.id
+        logger.warning(
+            f"[semi-live] 承認待ちに登録: {side} {symbol} {quantity}株 "
+            f"({order_type}, approval_id={ap_id})"
+        )
+        alert("発注承認待ち",
+              f"{side} {symbol} {quantity}株 をダッシュボードで承認してください（id={ap_id}）")
+        return None  # 承認されるまで実発注しない
+
+    def list_pending_approvals(self) -> list[dict]:
+        """承認待ち（PENDING）の計画注文を新しい順に返す。"""
+        with get_session() as session:
+            rows = session.scalars(
+                select(OrderApproval)
+                .where(OrderApproval.status == "PENDING")
+                .order_by(OrderApproval.id.desc())
+            ).all()
+            return [
+                {
+                    "id": r.id,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "symbol": r.symbol,
+                    "side": r.side,
+                    "order_type": r.order_type,
+                    "price": r.price,
+                    "quantity": r.quantity,
+                    "sector": r.sector,
+                }
+                for r in rows
+            ]
+
+    def approve_order(self, approval_id: int) -> dict:
+        """承認待ちの計画注文を承認し、実APIへ発注する（semi_live）。
+
+        戻り値: {"ok": bool, "order_id": str|None, "reason": str}
+        """
+        with get_session() as session:
+            ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
+            if ap is None:
+                return {"ok": False, "order_id": None, "reason": "承認対象が見つかりません"}
+            if ap.status != "PENDING":
+                return {"ok": False, "order_id": None,
+                        "reason": f"既に処理済みです（{ap.status}）"}
+            symbol, side = ap.symbol, ap.side
+            order_type, price = ap.order_type, ap.price or 0.0
+            quantity, sector = ap.quantity, ap.sector
+
+        if side == "BUY":
+            order_id = self._live_buy(symbol, price, quantity, sector)
+        elif order_type == "MARKET":
+            order_id = self._live_sell_market(symbol, quantity)
+        else:
+            order_id = self._live_sell(symbol, price, quantity)
+
+        if not order_id:
+            return {"ok": False, "order_id": None,
+                    "reason": "発注に失敗しました（拒否/接続エラー等）。承認は保留のままです"}
+        with get_session() as session:
+            ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
+            ap.status = "APPROVED"
+            ap.decided_at = clock.now()
+            ap.resulting_order_id = order_id
+            session.commit()
+        logger.warning(f"[semi-live] 承認・発注: id={approval_id} {side} {symbol} → {order_id}")
+        return {"ok": True, "order_id": order_id, "reason": ""}
+
+    def reject_order(self, approval_id: int) -> dict:
+        """承認待ちの計画注文を却下する（発注しない）。"""
+        with get_session() as session:
+            ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
+            if ap is None:
+                return {"ok": False, "reason": "承認対象が見つかりません"}
+            if ap.status != "PENDING":
+                return {"ok": False, "reason": f"既に処理済みです（{ap.status}）"}
+            ap.status = "REJECTED"
+            ap.decided_at = clock.now()
+            session.commit()
+        logger.info(f"[semi-live] 却下: id={approval_id}")
+        return {"ok": True, "reason": ""}
 
     def _has_pending_order(self, symbol: str) -> bool:
         """同銘柄に未約定注文があるか確認する（二重発注防止）"""

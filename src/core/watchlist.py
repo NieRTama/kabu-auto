@@ -38,6 +38,13 @@ MAX_CODE_LEN = 12            # 銘柄コードの最大長（東証は通常4桁
 _CODE_RE = re.compile(r"^[0-9A-Za-z.]{1,%d}$" % MAX_CODE_LEN)
 
 
+class DuplicateError(ValueError):
+    """同一リスト内に同じ銘柄コードが既に存在する場合のエラー（6.9 重複防止）。
+
+    呼び出し元のAPIはこれを 409 Conflict に変換する（通常のValueError=400と区別するため）。
+    """
+
+
 def _validate_code(code: str) -> str:
     """銘柄コードを正規化・検証する。不正なら ValueError。"""
     code = normalize_code(code)
@@ -53,8 +60,17 @@ _data: Optional[dict] = None
 
 
 def normalize_code(code: str) -> str:
-    """全角数字（IME入力時など）を半角に正規化する（例: '７２０３' → '7203'）"""
-    return unicodedata.normalize("NFKC", code.strip())
+    """銘柄コードを正規化する。
+
+    - 全角数字（IME入力時など）を半角に正規化する（例: '７２０３' → '7203'）
+    - yfinance形式の市場サフィックス '.T'（東証）を除去する（例: '7203.T' → '7203'）。
+      コードは内部的にサフィックス無しで保存し、yfinance呼び出し時にのみ '.T' を付ける
+      ため、入力揺れ（'7203' と '7203.T'）を同一銘柄として重複判定できるようにする。
+    """
+    normalized = unicodedata.normalize("NFKC", code.strip())
+    if normalized.upper().endswith(".T"):
+        normalized = normalized[:-2]
+    return normalized
 
 
 def _normalize_entries(entries: list[dict]) -> list[dict]:
@@ -136,14 +152,19 @@ def get_sectors() -> dict[str, str]:
 
 
 def add(code: str, name: str = "") -> list[dict]:
+    """アクティブリストに銘柄を追加する。
+
+    6.9 重複防止: 同一リスト内に同じ銘柄コードが既にある場合は DuplicateError を送出する
+    （'7203' と '7203.T' は normalize_code により同一銘柄として扱われる）。
+    """
     code = _validate_code(code)
     entries = _active_entries()
     for e in entries:
         if e["code"] == code:
-            e["name"] = name or e["name"]
-            break
-    else:
-        entries.append({"code": code, "name": name, "sector": ""})
+            raise DuplicateError(
+                f"銘柄 {code} は既にこのリスト「{get_active_list_name()}」に登録されています"
+            )
+    entries.append({"code": code, "name": name, "sector": ""})
     _save()
     return entries
 

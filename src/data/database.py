@@ -53,6 +53,27 @@ class Trade(Base):
     note = Column(Text)
 
 
+class OrderApproval(Base):
+    """semi_live モードの発注承認キュー（Phase 3 / 7.3）。
+
+    計画注文をいったんここに PENDING で積み、ダッシュボードで人が承認すると
+    実APIへ発注して APPROVED（resulting_order_id に発注ID）、却下すると REJECTED にする。
+    """
+    __tablename__ = "order_approvals"
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=clock.now)
+    symbol = Column(String(10), nullable=False)
+    side = Column(String(4), nullable=False)        # "BUY" / "SELL"
+    order_type = Column(String(10), nullable=False)  # "LIMIT" / "MARKET"
+    price = Column(Float)                             # 指値（成行は0/None）
+    quantity = Column(Integer, nullable=False)
+    sector = Column(String(50))
+    status = Column(String(12), default="PENDING")   # PENDING / APPROVED / REJECTED
+    decided_at = Column(DateTime)
+    resulting_order_id = Column(String(50))          # 承認実行で発注した注文ID
+    note = Column(Text)
+
+
 class Position(Base):
     __tablename__ = "positions"
     id = Column(Integer, primary_key=True)
@@ -108,6 +129,7 @@ class BacktestRun(Base):
     equity_curve_json = Column(Text)  # JSON: [{"date": "YYYY-MM-DD", "equity": float}]
     buy_threshold = Column(Float)   # この実行で実際に使われた買い閾値（探索的に上書きされた場合も記録）
     sell_threshold = Column(Float)  # この実行で実際に使われた売り閾値
+    archived = Column(Integer, default=0)  # 1=アーカイブ済み（一覧から除外。履歴は保持）
 
 
 class BacktestTradeRecord(Base):

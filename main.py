@@ -18,7 +18,7 @@ from loguru import logger
 
 from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
-    risk_profile as risk_profile_store,
+    risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -40,21 +40,33 @@ def main() -> None:
     cfg.load("config.yaml")
     watchlist_store.load("watchlists.json")  # 旧 watchlist.json があれば自動移行される
     risk_profile_store.load("risk_profile.json")  # アクティブなリスクプロファイルを config に適用
+    halt_store.load("data/trading_halt.json")  # 取引停止スイッチの状態を復元（停止中なら起動後も維持）
     log_setup.setup()
     db.init()
 
     trading_conf = cfg.get_section("trading")
     dash_conf = cfg.get_section("dashboard")
+    mode = trading_conf.get("mode", "paper")
 
-    # ─── ライブモード起動確認 ──────────────────────────────────
-    if trading_conf.get("mode", "paper") == "live":
+    # ─── モード妥当性チェック ──────────────────────────────────
+    if not tm.is_valid(mode):
+        logger.critical(
+            f"不正な trading.mode です: {mode!r}。"
+            f"次のいずれかを指定してください: {', '.join(tm.VALID_MODES)}"
+        )
+        sys.exit(1)
+    logger.info(f"取引モード: {tm.description(mode)}")
+
+    # ─── 実発注モード（live / semi_live）の起動確認 ─────────────
+    # 実際の資金で発注しうるモードは二重確認を要求する（dry_run は読み取りのみなので不要）。
+    if tm.places_real_orders(mode):
         if os.environ.get("CONFIRM_LIVE_TRADING", "").lower() != "true":
             logger.error(
-                "ライブモードを起動するには環境変数 CONFIRM_LIVE_TRADING=true が必要です。"
+                f"{tm.description(mode)}を起動するには環境変数 CONFIRM_LIVE_TRADING=true が必要です。"
                 "  例: CONFIRM_LIVE_TRADING=true python main.py"
             )
             sys.exit(1)
-        logger.warning("【ライブモード】実際の資金を使用して取引します。")
+        logger.warning(f"【{tm.description(mode)}】実際の資金を使用して取引します。")
 
     client = KabuClient()
     risk = RiskManager()
@@ -68,15 +80,34 @@ def main() -> None:
     try:
         client.refresh_token()
     except Exception as e:
-        if trading_conf.get("mode", "paper") == "live":
-            # ライブモードでAPI接続できないまま起動を続けると、口座状態を把握できない
-            # まま発注ロジックだけが動く危険な状態になる（fail-closed）
-            logger.critical(f"ライブモードでkabuステーション接続に失敗。起動を中断します: {e}")
+        # 実発注モード（live / semi_live）でAPI接続できないまま起動を続けると、口座状態を
+        # 把握できないまま発注ロジックだけが動く危険な状態になる（fail-closed）。
+        if tm.places_real_orders(mode):
+            logger.critical(
+                f"{tm.description(mode)}でkabuステーション接続に失敗。起動を中断します: {e}"
+            )
             sys.exit(1)
-        logger.warning(f"kabuステーション接続失敗（ペーパーモードで継続）: {e}")
+        logger.warning(f"kabuステーション接続失敗（{tm.description(mode)}で継続）: {e}")
 
     # ─── 起動時注文同期（ライブモードのみ）────────────────
     order_mgr.sync_on_startup()
+
+    # ─── プリフライトチェック（paper 以外）────────────────
+    # 実発注モードは致命的失敗があれば起動中断（fail-closed）。dry_run は記録のみ。
+    if mode != "paper":
+        from src.core import preflight
+        result = preflight.run_preflight(
+            client, mode,
+            base_url=cfg.get_section("kabu_station").get("base_url", ""),
+            dash_host=dash_conf.get("host", "127.0.0.1"),
+            dash_port=dash_conf.get("port", 8080),
+        )
+        preflight.log_results(result)
+        if not result["ok"] and tm.places_real_orders(mode):
+            logger.critical(
+                f"{tm.description(mode)}のプリフライトチェックに失敗しました。起動を中断します。"
+            )
+            sys.exit(1)
 
     # ─── MLモデルロード ────────────────────────────────────
     model = ml_model.load()
@@ -120,17 +151,36 @@ def main() -> None:
 
     # ─── スケジューラ起動 ───────────────────────────────────
     scheduler.start()
-    update_status(running=True, ws_connected=True, mode=trading_conf.get("mode", "paper"))
+    update_status(running=True, ws_connected=True, mode=mode)
+
+    # ─── 運用状態バナー（11.1: mode/endpoint/発注可否/LAN公開を起動時に明示）──
+    snap = order_mgr.status_snapshot()
+    can_order = "可" if snap["can_place_order"] else f"不可（{snap['block_reason']}）"
+    lan_exposed = dash_conf.get("host", "127.0.0.1") == "0.0.0.0"
+    logger.info(
+        "─── 運用状態 ───\n"
+        f"  モード      : {tm.description(mode)}\n"
+        f"  エンドポイント: {cfg.get_section('kabu_station').get('base_url', '')}\n"
+        f"  資金ソース  : {'口座余力(/wallet)' if tm.reads_broker_api(mode) else 'ペーパー初期資金'}\n"
+        f"  発注        : {can_order}\n"
+        f"  未解決注文  : {snap['unresolved_orders']}件 / 承認待ち: {snap['pending_approvals']}件\n"
+        f"  LAN公開     : {'はい(0.0.0.0)' if lan_exposed else 'いいえ(localhost)'}"
+    )
+    if lan_exposed and tm.places_real_orders(mode):
+        logger.warning(
+            f"【注意】{tm.description(mode)}でダッシュボードをLAN公開しています。"
+            "アクセストークン・ログイン認証が有効であることを確認してください。"
+        )
 
     # ─── ダッシュボード起動（別スレッド）────────────────────
     dash_host = dash_conf.get("host", "127.0.0.1")
     dash_port = dash_conf.get("port", 8080)
     if not is_port_available(dash_host, dash_port):
         msg = f"ダッシュボードのポート {dash_host}:{dash_port} は既に使用中です"
-        if trading_conf.get("mode", "paper") == "live":
-            # ライブモードでダッシュボードが起動できないと、発注ロジックは動くのに
-            # 状態の監視・緊急決済操作ができない危険な状態になるため起動を中断する
-            logger.critical(f"{msg}。ライブモードのため起動を中断します。")
+        # 実発注モード（live / semi_live）でダッシュボードが起動できないと、発注ロジックは
+        # 動くのに状態の監視・緊急決済操作ができない危険な状態になるため起動を中断する
+        if tm.places_real_orders(mode):
+            logger.critical(f"{msg}。{tm.description(mode)}のため起動を中断します。")
             sys.exit(1)
         logger.warning(f"{msg}。ダッシュボードが起動できない可能性があります。")
 

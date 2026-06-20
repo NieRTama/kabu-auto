@@ -26,6 +26,8 @@ CANCEL_FAILED = "CANCEL_FAILED"
 REJECTED = "REJECTED"
 # 状態不明（起動同期でAPIに見つからない等。誤って CANCELLED 扱いしない）
 UNKNOWN = "UNKNOWN"
+# ドライラン（dry_run モードで「発注しようとした」記録。実発注はしていない）
+DRY_RUN = "DRY_RUN"
 
 # 未約定（建玉・余力の引当対象として扱うべき）状態
 OPEN_STATUSES = frozenset({PENDING, PARTIALLY_FILLED, CANCEL_REQUESTED})

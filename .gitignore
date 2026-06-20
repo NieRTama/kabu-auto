@@ -21,6 +21,9 @@ log/
 # 認証情報（ログインのユーザーID・パスワードハッシュ）
 data/auth.json
 
+# 取引停止スイッチの状態（運用状態・端末ごとに異なるため追跡しない）
+data/trading_halt.json
+
 # セッション引き継ぎメモ・個人用リスク設定（非公開・個人用のため追跡しない）
 chatlog2.md
 risk_profile.json

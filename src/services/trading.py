@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 
 from src.core import clock
 from src.core import config as cfg
+from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
 from src.core.alerts import alert
 from src.core.scheduler import TradingScheduler
@@ -224,8 +225,14 @@ class TradingServices:
 
     # ─── 朝の発注（ライブモードのみ）────────────────────
     def morning_execution(self) -> None:
-        """9:05 に前営業日のBUY/SELLシグナルを元に発注（ライブモードのみ）"""
-        if self.trading_conf.get("mode", "paper") != "live":
+        """9:05 に前営業日のBUY/SELLシグナルを元に発注する。
+
+        実行対象は paper 以外（live / dry_run / semi_live）。発注の実体は OrderManager が
+        モードに応じて分岐する（live=実発注 / dry_run=実発注せず記録のみ / semi_live=承認キュー）。
+        paper は signal_scan 内で当日終値で即時シミュレートするため morning は不要。
+        """
+        mode = self.trading_conf.get("mode", "paper")
+        if not tm.uses_morning_execution(mode):
             return
         if not TradingScheduler.is_market_open():
             return

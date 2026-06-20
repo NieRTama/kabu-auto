@@ -13,6 +13,8 @@
     .badge { padding: 4px 12px; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
     .badge.paper { background: #854d0e; color: #fef3c7; }
     .badge.live { background: #b91c1c; color: #fee2e2; }
+    .badge.dry_run { background: #1e40af; color: #dbeafe; }
+    .badge.semi_live { background: #9a3412; color: #ffedd5; }
     /* ライブ（実弾）モード警告バナー */
     #live-banner { display: none; background: #7f1d1d; color: #fee2e2; border: 2px solid #ef4444;
       border-radius: 8px; padding: 14px 16px; margin: 0 0 16px; line-height: 1.6; }
@@ -144,6 +146,11 @@
     </div>
   </div>
 
+  <!-- ─── 運用状態ライン（mode/発注可否/停止/LAN公開等） ──────────── -->
+  <div class="card" style="margin-bottom:24px;padding:12px 16px;">
+    <div id="operational-status" style="font-size:0.82rem;color:#cbd5e1;overflow-x:auto;white-space:nowrap;">—</div>
+  </div>
+
   <!-- ─── リスクプロファイル切替 ──────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px;">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
@@ -152,6 +159,11 @@
     </div>
     <div id="risk-profile-buttons" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;"></div>
     <div id="risk-profile-detail" style="font-size:0.8rem;color:#94a3b8;overflow-x:auto;"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+      <button onclick="createCustomProfile()" style="background:#0c4a6e;color:#7dd3fc;border:1px solid #0369a1;padding:5px 10px;border-radius:6px;font-size:0.78rem;cursor:pointer;">＋カスタム作成(複製)</button>
+      <button onclick="deleteCustomProfile()" style="background:#3f1d1d;color:#fca5a5;border:1px solid #7f1d1d;padding:5px 10px;border-radius:6px;font-size:0.78rem;cursor:pointer;">カスタム削除</button>
+      <button onclick="compareProfiles()" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:5px 10px;border-radius:6px;font-size:0.78rem;cursor:pointer;">比較</button>
+    </div>
     <span id="rp-msg" style="font-size:0.8rem;color:#f87171;"></span>
   </div>
 
@@ -205,6 +217,26 @@
         この操作は取り消せません。
       </p>
       <button class="emergency-btn" onclick="emergencyClose()">全ポジション即時決済</button>
+      <hr style="border-color:#334155;margin:16px 0;">
+      <p style="color:#fbbf24; font-size:0.85rem; margin-bottom:8px;">
+        取引停止スイッチ（kill switch）: 新規発注を全停止し未約定BUYをキャンセルします。<br>
+        損切り・緊急決済は停止中も実行されます。
+      </p>
+      <button id="kill-switch-btn" onclick="toggleKillSwitch()"
+        style="background:#b45309;color:#fff7ed;border:none;border-radius:8px;padding:10px 18px;font-weight:700;cursor:pointer;">取引を緊急停止</button>
+      <span id="kill-switch-msg" style="font-size:0.8rem;color:#f87171;margin-left:8px;"></span>
+    </div>
+  </div>
+
+  <!-- ─── semi_live 発注承認キュー（semi_liveモード時のみ表示） ──────── -->
+  <div id="approvals-section" class="card" style="margin-bottom:24px;display:none;">
+    <h2>✋ 発注承認待ち（セミライブ）</h2>
+    <p style="color:#94a3b8;font-size:0.82rem;margin-bottom:12px;">承認すると実際に発注されます。却下すると発注されません。</p>
+    <div style="overflow-x:auto;">
+      <table style="font-size:0.82rem;">
+        <thead><tr><th>銘柄</th><th>売買</th><th>種別</th><th>価格</th><th>数量</th><th>操作</th></tr></thead>
+        <tbody id="approvals-tbody"><tr><td colspan="6" style="color:#64748b">なし</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -361,10 +393,16 @@
       <div style="overflow-x:auto;">
         <table style="font-size:0.8rem;">
           <thead>
-            <tr><th>銘柄</th><th>期間</th><th>リターン</th><th>MDD</th><th>シャープ</th><th>勝率</th><th>取引数</th><th>閾値</th><th>ML</th><th></th></tr>
+            <tr><th>銘柄</th><th>期間</th><th>リターン</th><th>MDD</th><th>シャープ</th><th>勝率</th><th>取引数</th><th>閾値</th><th>ML</th><th></th><th>操作</th></tr>
           </thead>
-          <tbody id="bt-runs-tbody"><tr><td colspan="10" style="color:#64748b">なし</td></tr></tbody>
+          <tbody id="bt-runs-tbody"><tr><td colspan="11" style="color:#64748b">なし</td></tr></tbody>
         </table>
+      </div>
+      <div id="bt-runs-pager" style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:0.8rem;color:#94a3b8;">
+        <button onclick="btRunsPrevPage()" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:4px 10px;cursor:pointer;">前へ</button>
+        <span id="bt-runs-pageinfo">-</span>
+        <button onclick="btRunsNextPage()" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:4px 10px;cursor:pointer;">次へ</button>
+        <label style="margin-left:12px;"><input id="bt-include-archived" type="checkbox" onchange="btRunsPage=1;loadBtRuns();"> アーカイブも表示</label>
       </div>
     </div>
     <div id="bt-detail" style="display:none;">
@@ -472,11 +510,21 @@
     const msg = document.getElementById('rp-msg');
     msg.textContent = '';
     try {
-      const r = await fetch(API + '/api/risk_profile', {
+      let r = await fetch(API + '/api/risk_profile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
       });
+      if (r.status === 409) {
+        // 実発注モードでは二重確認が必要
+        const err = await r.json();
+        if (!confirm((err.detail || '確認が必要です') + '\n本当に切り替えますか？')) return;
+        r = await fetch(API + '/api/risk_profile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, confirm: true }),
+        });
+      }
       if (!r.ok) {
         const err = await r.json();
         msg.textContent = 'エラー: ' + (err.detail || r.statusText);
@@ -487,6 +535,46 @@
       msg.textContent = 'エラー: ' + err.message;
     }
   });
+
+  // ── カスタムリスクプロファイル管理（作成/clone/削除/比較）──────────
+  async function createCustomProfile() {
+    const name = prompt('新しいカスタムプロファイル名:');
+    if (!name) return;
+    const src = prompt('複製元プロファイル名（既存をコピー。空ならlow_risk）:', 'low_risk') || 'low_risk';
+    const msg = document.getElementById('rp-msg');
+    msg.textContent = '';
+    const r = await fetch(API + `/api/risk_profiles/${encodeURIComponent(src)}/clone`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_name: name }),
+    });
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+    alert(`「${name}」を作成しました。値はエクスポート/取込または config で調整できます。`);
+    await loadRiskProfile();
+  }
+
+  async function deleteCustomProfile() {
+    const name = prompt('削除するカスタムプロファイル名（組み込み・アクティブは不可）:');
+    if (!name) return;
+    const msg = document.getElementById('rp-msg');
+    const r = await fetch(API + '/api/risk_profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+    await loadRiskProfile();
+  }
+
+  async function compareProfiles() {
+    const a = prompt('比較するプロファイルA:', 'low_risk');
+    if (!a) return;
+    const b = prompt('比較するプロファイルB:', 'high_risk');
+    if (!b) return;
+    const r = await fetch(API + `/api/risk_profiles/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+    const d = await r.json();
+    if (!r.ok) { alert('エラー: ' + (d.detail || r.statusText)); return; }
+    const lines = Object.entries(d.diff).map(([k, v]) => `${k}: ${a}=${v[0]} / ${b}=${v[1]}`);
+    alert(lines.length ? `差分:\n${lines.join('\n')}` : '差分はありません（同一の値）');
+  }
 
   // ── MLモデルメトリクス ────────────────────────────────────────────
 
@@ -877,17 +965,31 @@
       `現在の値: 買い${d.buy_threshold} / 売り${d.sell_threshold}`;
   }
 
+  let btRunsPage = 1;
+  let btRunsTotalPages = 1;
+
+  function btRunsPrevPage() { if (btRunsPage > 1) { btRunsPage--; loadBtRuns(); } }
+  function btRunsNextPage() { if (btRunsPage < btRunsTotalPages) { btRunsPage++; loadBtRuns(); } }
+
   async function loadBtRuns() {
-    const runs = await fetchJson('/api/backtest/runs');
+    const includeArchived = document.getElementById('bt-include-archived')?.checked ? 'true' : 'false';
+    const d = await fetchJson(`/api/backtest/runs?page=${btRunsPage}&page_size=15&include_archived=${includeArchived}`);
+    const runs = d.runs || [];
+    btRunsTotalPages = d.total_pages || 1;
+    const pageInfo = document.getElementById('bt-runs-pageinfo');
+    if (pageInfo) pageInfo.textContent = `${d.total}件中 ${d.page}/${Math.max(1, d.total_pages)}ページ`;
     const tbody = document.getElementById('bt-runs-tbody');
-    if (!runs.length) { tbody.innerHTML = '<tr><td colspan="10" style="color:#64748b">なし</td></tr>'; return; }
+    if (!runs.length) { tbody.innerHTML = '<tr><td colspan="11" style="color:#64748b">なし</td></tr>'; return; }
     tbody.innerHTML = runs.map(r => {
       const ret = r.total_return;
       const retColor = ret > 0 ? '#4ade80' : ret < 0 ? '#f87171' : '#e2e8f0';
       const period = `${r.start_date || ''} ~ ${r.end_date || ''}`;
       const thr = (r.buy_threshold != null && r.sell_threshold != null)
         ? `${r.buy_threshold} / ${r.sell_threshold}` : '-';
-      return `<tr style="cursor:pointer;" onclick="loadBtDetail(${r.id})">
+      const archiveBtn = r.archived
+        ? `<button onclick="event.stopPropagation();unarchiveBtRun(${r.id})" style="background:#334155;color:#e2e8f0;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:0.72rem;">復元</button>`
+        : `<button onclick="event.stopPropagation();archiveBtRun(${r.id})" style="background:#334155;color:#e2e8f0;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:0.72rem;">保管</button>`;
+      return `<tr style="cursor:pointer;${r.archived ? 'opacity:0.55;' : ''}" onclick="loadBtDetail(${r.id})">
         <td><strong>${symLabel(r.symbol)}</strong></td>
         <td style="font-size:0.75rem;color:#64748b;">${period}</td>
         <td style="color:${retColor};font-weight:700;">${(ret * 100).toFixed(1)}%</td>
@@ -898,8 +1000,25 @@
         <td style="font-size:0.72rem;color:#94a3b8;">${thr}</td>
         <td>${r.use_ml ? '✓' : '-'}</td>
         <td style="color:#38bdf8;font-size:0.75rem;">詳細</td>
+        <td style="white-space:nowrap;">${archiveBtn}
+          <button onclick="event.stopPropagation();deleteBtRun(${r.id})" style="background:#7f1d1d;color:#fecaca;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:0.72rem;">削除</button>
+        </td>
       </tr>`;
     }).join('');
+  }
+
+  async function archiveBtRun(id) {
+    await fetch(API + `/api/backtest/${id}/archive`, { method: 'POST' });
+    await loadBtRuns();
+  }
+  async function unarchiveBtRun(id) {
+    await fetch(API + `/api/backtest/${id}/unarchive`, { method: 'POST' });
+    await loadBtRuns();
+  }
+  async function deleteBtRun(id) {
+    if (!confirm('このバックテスト結果を削除します（取引明細も削除）。よろしいですか？')) return;
+    await fetch(API + `/api/backtest/${id}`, { method: 'DELETE' });
+    await loadBtRuns();
   }
 
   async function loadBtDetail(runId) {
@@ -1022,20 +1141,59 @@
 
   // ── ステータス・損益・ポジション ────────────────────────────────
 
+  const MODE_LABEL = { paper: 'PAPER', live: 'LIVE', dry_run: 'DRY-RUN', semi_live: 'SEMI-LIVE' };
+
   async function loadStatus() {
     const s = await fetchJson('/api/status');
     const dot = s.running ? '<span class="status-dot online"></span>稼働中' : '<span class="status-dot offline"></span>停止';
     document.getElementById('sys-status').innerHTML = dot;
     const badge = document.getElementById('mode-badge');
-    badge.textContent = s.mode === 'live' ? 'LIVE' : 'PAPER';
-    badge.className = 'badge ' + (s.mode === 'live' ? 'live' : 'paper');
-    // ライブモード時は実弾警告バナーを表示する（このセッションで未確認の場合のみ）
+    badge.textContent = MODE_LABEL[s.mode] || (s.mode || 'PAPER').toUpperCase();
+    badge.className = 'badge ' + (s.mode || 'paper');
+
+    // 運用状態ライン（発注可否・停止スイッチ・LAN公開・未解決/承認待ち）
+    renderOperational(s);
+
+    // 実弾モード（live/semi_live）は実弾警告バナーを表示する（このセッションで未確認の場合のみ）
     const banner = document.getElementById('live-banner');
-    if (s.mode === 'live' && sessionStorage.getItem('liveAck') !== '1') {
+    if (s.places_real_orders && sessionStorage.getItem('liveAck') !== '1') {
       banner.style.display = 'block';
     } else {
       banner.style.display = 'none';
     }
+
+    // semi_live なら承認待ちセクションを表示・更新する
+    if (s.mode === 'semi_live') { document.getElementById('approvals-section').style.display = 'block'; loadApprovals(); }
+    else { document.getElementById('approvals-section').style.display = 'none'; }
+
+    // kill switch ボタンのラベルを停止状態に合わせる
+    const halted = s.halt && s.halt.halted;
+    const ks = document.getElementById('kill-switch-btn');
+    if (ks) {
+      ks.textContent = halted ? '取引停止を解除' : '取引を緊急停止';
+      ks.style.background = halted ? '#15803d' : '#b45309';
+    }
+  }
+
+  function renderOperational(s) {
+    const el = document.getElementById('operational-status');
+    if (!el) return;
+    const parts = [];
+    parts.push(`モード: <strong>${MODE_LABEL[s.mode] || s.mode}</strong>`);
+    if (s.endpoint) parts.push(`接続先: ${escapeHtml(s.endpoint)}`);
+    if (s.funding_source) parts.push(`資金: ${escapeHtml(s.funding_source)}`);
+    if ('can_place_order' in s) {
+      parts.push(s.can_place_order
+        ? '発注: <span style="color:#4ade80;">可</span>'
+        : `発注: <span style="color:#f87171;">不可（${escapeHtml(s.block_reason || '')}）</span>`);
+    }
+    if (s.halt && s.halt.halted) {
+      parts.push(`<span style="color:#f87171;font-weight:700;">⏸ 取引停止中（${escapeHtml(s.halt.reason || '')}）</span>`);
+    }
+    if (s.unresolved_orders) parts.push(`<span style="color:#fbbf24;">未解決注文 ${s.unresolved_orders}件</span>`);
+    if (s.pending_approvals) parts.push(`<span style="color:#fbbf24;">承認待ち ${s.pending_approvals}件</span>`);
+    if (s.lan_exposed) parts.push(`<span style="color:${s.places_real_orders ? '#f87171' : '#94a3b8'};">LAN公開</span>`);
+    el.innerHTML = parts.join('　|　');
   }
 
   function ackLiveBanner() {
@@ -1229,6 +1387,68 @@
     } catch(e) {
       alert('エラー: ' + e.message);
     }
+  }
+
+  // ── 取引停止スイッチ（kill switch）─────────────────────────────
+  async function toggleKillSwitch() {
+    const msg = document.getElementById('kill-switch-msg');
+    msg.textContent = '';
+    const s = await fetchJson('/api/status');
+    const halted = s.halt && s.halt.halted;
+    const token = prompt('緊急決済トークンを入力してください（起動時のコンソール表示で確認）:');
+    if (!token) return;
+    try {
+      let r;
+      if (halted) {
+        if (!confirm('取引停止を解除して発注を再開します。よろしいですか？')) return;
+        r = await fetch(API + '/api/halt', { method: 'DELETE', headers: { 'X-Emergency-Token': token } });
+      } else {
+        const reason = prompt('停止理由（任意）:') || '手動停止';
+        const closePos = confirm('停止と同時に全ポジションを成行決済しますか？\n[OK]=決済する / [キャンセル]=ポジションは保持');
+        r = await fetch(API + '/api/halt', {
+          method: 'POST',
+          headers: { 'X-Emergency-Token': token, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reason, close_positions: closePos }),
+        });
+      }
+      const d = await r.json();
+      if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+      alert(d.message || '実行しました');
+      await loadStatus();
+    } catch (e) {
+      msg.textContent = 'エラー: ' + e.message;
+    }
+  }
+
+  // ── semi_live 発注承認キュー ───────────────────────────────────
+  async function loadApprovals() {
+    const list = await fetchJson('/api/approvals');
+    const tbody = document.getElementById('approvals-tbody');
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = list.map(a => `<tr>
+      <td><strong>${symLabel(a.symbol)}</strong></td>
+      <td>${a.side === 'BUY' ? '買' : '売'}</td>
+      <td>${a.order_type === 'MARKET' ? '成行' : '指値'}</td>
+      <td>${a.order_type === 'MARKET' ? '-' : '¥' + (a.price || 0).toLocaleString()}</td>
+      <td>${a.quantity}</td>
+      <td style="white-space:nowrap;">
+        <button onclick="approveOrder(${a.id})" style="background:#15803d;color:#dcfce7;border:none;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:0.75rem;">承認</button>
+        <button onclick="rejectOrder(${a.id})" style="background:#7f1d1d;color:#fecaca;border:none;border-radius:4px;padding:3px 8px;cursor:pointer;font-size:0.75rem;">却下</button>
+      </td>
+    </tr>`).join('');
+  }
+
+  async function approveOrder(id) {
+    if (!confirm('この注文を承認して実際に発注します。よろしいですか？')) return;
+    const r = await fetch(API + `/api/approvals/${id}/approve`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { alert('エラー: ' + (d.detail || r.statusText)); return; }
+    await loadApprovals(); await loadAll();
+  }
+
+  async function rejectOrder(id) {
+    const r = await fetch(API + `/api/approvals/${id}/reject`, { method: 'POST' });
+    if (r.ok) await loadApprovals();
   }
 
   loadSymbolNames().then(() => {

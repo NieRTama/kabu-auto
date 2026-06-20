@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 
 from src.core import clock
 from src.core import config as cfg
+from src.core import halt
 from src.data.database import Position, Trade, get_session
 from src.data.market_data import latest_closes
 from src.execution import order_status as st
@@ -70,6 +71,12 @@ class RiskManager:
 
     def can_place_order(self) -> tuple[bool, str]:
         """注文可能かチェック。(ok, reason) を返す"""
+        # 取引停止スイッチ（kill switch）が ON なら全ての新規発注を抑止する。
+        # 損切り・緊急決済は sell_market(reason=...) でこのゲート自体をバイパスするため、
+        # 停止中でも退出だけは止まらない（既存リスクを増やさない退出は妨げない方針）。
+        if halt.is_halted():
+            state = halt.get_state()
+            return False, f"取引停止中（kill switch ON）: {state.get('reason') or '手動停止'}"
         limit = self._conf.get("daily_order_limit", 100)
         if self._daily_order_count >= limit:
             return False, f"1日の注文上限({limit})に達しました"

@@ -5,7 +5,13 @@ kabu_station:
   token_refresh_time: "08:30"  # 毎朝トークン再取得
 
 trading:
-  mode: "paper"  # "paper" (仮想) or "live" (本番)
+  # 取引モード:
+  #   paper     = 仮想取引（実APIへ発注せず終値で即時シミュレート）
+  #   live      = 本番（実際の資金で実APIへ発注）
+  #   dry_run   = 実APIから板/余力は読むが発注はしない（DRY_RUNとして記録のみ・検証用）
+  #   semi_live = 計画注文を承認キューに積み、ダッシュボードで承認した分だけ実発注
+  # live / semi_live は起動に環境変数 CONFIRM_LIVE_TRADING=true が必要。
+  mode: "paper"
   max_positions: 5  # 最大同時保有銘柄数
   max_position_ratio: 0.25  # 1銘柄あたり最大資金比率 (25%)
   stop_loss_pct: -0.07  # 損切りライン (-7%)
