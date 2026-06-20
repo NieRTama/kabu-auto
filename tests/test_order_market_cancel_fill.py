@@ -353,6 +353,144 @@ class TestSyncTradeWithOrderZeroFillBug:
         om._cancel_timeout_timer.assert_called_once_with("ORD-1")
 
 
+class TestTerminalPartialFill:
+    """再レビュー P0-2: ブローカー側で確定終了(State=5)した部分約定は、未約定の
+    PARTIALLY_FILLED とは別の終端状態(PARTIALLY_FILLED_DONE)になり、いつまでも
+    未解決の未約定注文として扱われない（=同銘柄の新規発注を永久にブロックしない）ことの検証。
+    """
+
+    def _trade(self, quantity=100, filled_quantity=None, status="PENDING", price=1000.0):
+        return MagicMock(order_id="ORD-1", symbol="7203", side="BUY",
+                         quantity=quantity, filled_quantity=filled_quantity,
+                         status=status, price=price)
+
+    def test_state5_partial_fill_becomes_partially_filled_done(self):
+        trade = self._trade(quantity=100)
+        with _make_om(mode="live") as (om, _, _, session):
+            session.scalar.return_value = trade
+            om._record_fill = MagicMock()
+            om._apply_fill = MagicMock()
+            om._cancel_timeout_timer = MagicMock()
+            om._sync_trade_with_order(
+                trade, {"State": 5, "CumQty": 40, "Price": 1010},
+            )
+        assert om._record_fill.call_args[0][1] == st.PARTIALLY_FILLED_DONE
+        om._apply_fill.assert_called_once_with(
+            "ORD-1", "7203", "BUY", 40, 1010.0, ANY, source="reconcile",
+        )
+        # ブローカー側で確定終了済みなので、未約定のPARTIALLY_FILLEDと異なりタイマーは解除する
+        om._cancel_timeout_timer.assert_called_once_with("ORD-1")
+
+    def test_partially_filled_done_is_not_open_status(self):
+        """PARTIALLY_FILLED_DONE は OPEN_STATUSES に含まれない
+        （=同銘柄の新規発注ブロック・reconcile対象から外れ、永久にブロックされ続けない）"""
+        assert st.PARTIALLY_FILLED_DONE not in st.OPEN_STATUSES
+        assert st.PARTIALLY_FILLED in st.OPEN_STATUSES
+
+
+class TestSellMarketExitCancelFailureBlocks:
+    """再レビュー P0-4: 退出系(stop_loss/emergency)発注前の競合注文キャンセルが
+    1件でも失敗した場合、その状態のまま成行売りを送信してはならない。"""
+
+    def test_cancel_failure_blocks_emergency_sell(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            om._cancel_open_orders_for_symbol = MagicMock(return_value=False)
+            with patch.object(mod, "alert") as alert_mock:
+                oid = om.sell_market("7203", 100, reason="emergency")
+        assert oid is None
+        client.send_order.assert_not_called()
+        alert_mock.assert_called_once()
+
+    def test_cancel_failure_blocks_stop_loss_sell(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            om._cancel_open_orders_for_symbol = MagicMock(return_value=False)
+            with patch.object(mod, "alert"):
+                oid = om.sell_market("7203", 100, reason="stop_loss")
+        assert oid is None
+        client.send_order.assert_not_called()
+
+    def test_cancel_success_allows_emergency_sell(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            om._cancel_open_orders_for_symbol = MagicMock(return_value=True)
+            oid = om.sell_market("7203", 100, reason="emergency")
+        assert oid == "ORD-1"
+        client.send_order.assert_called_once()
+
+
+class TestCancelOpenOrdersForSymbolAggregateResult:
+    def test_returns_true_when_all_cancellations_succeed(self):
+        with _make_om(mode="live") as (om, client, _, session):
+            t1, t2 = MagicMock(order_id="O1"), MagicMock(order_id="O2")
+            scal = MagicMock()
+            scal.all.return_value = [t1, t2]
+            session.scalars.return_value = scal
+            om._cancel_order_now = MagicMock(return_value=True)
+            assert om._cancel_open_orders_for_symbol("7203") is True
+
+    def test_returns_false_when_any_cancellation_fails(self):
+        with _make_om(mode="live") as (om, client, _, session):
+            t1, t2 = MagicMock(order_id="O1"), MagicMock(order_id="O2")
+            scal = MagicMock()
+            scal.all.return_value = [t1, t2]
+            session.scalars.return_value = scal
+            om._cancel_order_now = MagicMock(side_effect=[True, False])
+            assert om._cancel_open_orders_for_symbol("7203") is False
+
+    def test_returns_true_when_no_open_orders(self):
+        with _make_om(mode="live") as (om, client, _, session):
+            scal = MagicMock()
+            scal.all.return_value = []
+            session.scalars.return_value = scal
+            om._cancel_order_now = MagicMock()
+            assert om._cancel_open_orders_for_symbol("7203") is True
+
+
+class TestCloseAllPositionsUsesBrokerSourceOfTruth:
+    """再レビュー P0-1: ライブ/semi_liveの緊急全決済はローカルDBのPositionではなく
+    ブローカー /positions を正本として使う。"""
+
+    def test_uses_broker_leaves_qty_not_db(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            client.get_positions.return_value = [
+                {"Symbol": "7203", "LeavesQty": 150, "HoldQty": 0},
+            ]
+            om.sell_market = MagicMock()
+            om.close_all_positions()
+        om.sell_market.assert_called_once_with("7203", 150, reason="emergency")
+
+    def test_skips_zero_quantity_broker_positions(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            client.get_positions.return_value = [
+                {"Symbol": "7203", "LeavesQty": 0, "HoldQty": 0},
+            ]
+            om.sell_market = MagicMock()
+            om.close_all_positions()
+        om.sell_market.assert_not_called()
+
+    def test_positions_fetch_failure_blocks_and_alerts_instead_of_using_db(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            client.get_positions.side_effect = RuntimeError("network")
+            om.sell_market = MagicMock()
+            with patch.object(mod, "alert") as alert_mock:
+                om.close_all_positions()
+        om.sell_market.assert_not_called()
+        alert_mock.assert_called_once()
+
+    def test_multiple_symbols_each_closed(self):
+        with _make_om(mode="live") as (om, client, _, _):
+            client.get_positions.return_value = [
+                {"Symbol": "7203", "LeavesQty": 100, "HoldQty": 0},
+                {"Symbol": "9984", "LeavesQty": 50, "HoldQty": 0},
+            ]
+            om.sell_market = MagicMock()
+            om.close_all_positions()
+        calls = om.sell_market.call_args_list
+        assert calls[0].args == ("7203", 100)
+        assert calls[0].kwargs == {"reason": "emergency"}
+        assert calls[1].args == ("9984", 50)
+        assert calls[1].kwargs == {"reason": "emergency"}
+
+
 class TestReconcileTrade:
     def test_fetches_orders_and_syncs(self):
         trade = MagicMock(order_id="ORD-1")

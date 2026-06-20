@@ -12,8 +12,14 @@ DBの `Trade.status` 列にそのまま格納する（SQLite運用のため Enum
 
 # 発注直後〜約定/キャンセル待ち
 PENDING = "PENDING"
-# 一部のみ約定（残数は引き続き未約定）
+# 一部のみ約定（残数は引き続き未約定・生きている注文）
 PARTIALLY_FILLED = "PARTIALLY_FILLED"
+# 一部のみ約定したまま、ブローカー側で確定終了（取消/失効）した最終状態。
+# 残数は二度と約定しないため PARTIALLY_FILLED（未約定）とは区別する（再レビュー P0-2）。
+# 経緯: 旧実装は終了済み(State=5)の部分約定も PARTIALLY_FILLED にしてしまい、
+# OPEN_STATUSES に含まれるためいつまでも未解決注文として扱われ、同銘柄の新規発注が
+# 永久にブロックされ続けるバグがあった。
+PARTIALLY_FILLED_DONE = "PARTIALLY_FILLED_DONE"
 # 全数約定
 FILLED = "FILLED"
 # キャンセル要求済み（証券会社側の確定待ち）

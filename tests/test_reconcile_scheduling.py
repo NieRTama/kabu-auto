@@ -61,3 +61,24 @@ class TestTradingServicesReconcileOrders:
         order_mgr.reconcile_open_orders.side_effect = RuntimeError("boom")
         with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True):
             svc.reconcile_orders()  # raiseしない
+
+    def test_also_calls_position_drift_reconcile_when_market_open(self):
+        """P0-3: 注文照合に加え建玉ドリフト照合も呼ぶ"""
+        svc, order_mgr = self._services(market_open=True)
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True):
+            svc.reconcile_orders()
+        order_mgr.reconcile_positions_with_broker.assert_called_once()
+
+    def test_position_drift_reconcile_skipped_when_market_closed(self):
+        svc, order_mgr = self._services(market_open=False)
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=False):
+            svc.reconcile_orders()
+        order_mgr.reconcile_positions_with_broker.assert_not_called()
+
+    def test_position_drift_reconcile_runs_even_if_order_reconcile_fails(self):
+        """注文照合が例外で落ちても建玉ドリフト照合は独立して実行される"""
+        svc, order_mgr = self._services(market_open=True)
+        order_mgr.reconcile_open_orders.side_effect = RuntimeError("boom")
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True):
+            svc.reconcile_orders()
+        order_mgr.reconcile_positions_with_broker.assert_called_once()

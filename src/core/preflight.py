@@ -95,6 +95,23 @@ def _check_endpoint_mode_consistency(mode: str, base_url: str) -> dict:
     return _check("モード↔エンドポイント整合", True, CRITICAL)
 
 
+def _check_dry_run_production_data(mode: str, base_url: str) -> dict:
+    """dry_run が本番用エンドポイントから実際の口座データを読んでいることを明示する（P1-3）。
+
+    dry_run は sendorder を一切呼ばないため致命的ではないが、検証目的で起動した
+    つもりが本番口座の実際の余力・建玉を読み取っていることに気づかないまま運用する
+    リスクがあるため、warning として大きく可視化する（起動は止めない）。
+    """
+    if mode == "dry_run" and "18081" not in (base_url or ""):
+        return _check(
+            "dry_run 本番口座データ読み取り警告", False, WARNING,
+            f"dry_run モードが本番用エンドポイント({base_url})から実際の余力・建玉などの"
+            "口座データを読み取っています。発注は一切行いませんが、本番口座の実情報を"
+            "扱っていることを認識してください",
+        )
+    return _check("dry_run 本番口座データ読み取り警告", True, WARNING)
+
+
 def _check_halt() -> dict:
     if halt.is_halted():
         state = halt.get_state()
@@ -117,6 +134,7 @@ def run_preflight(client, mode: str, *, base_url: str,
     checks.append(_check_unresolved_orders())
     checks.append(_check_port(dash_host, dash_port))
     checks.append(_check_endpoint_mode_consistency(mode, base_url))
+    checks.append(_check_dry_run_production_data(mode, base_url))
     checks.append(_check_halt())
 
     ok = all(c["ok"] for c in checks if c["level"] == CRITICAL)

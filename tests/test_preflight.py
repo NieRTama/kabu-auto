@@ -122,6 +122,42 @@ class TestPreflight:
         assert chk["ok"] is False and chk["level"] == pf.WARNING
 
 
+class TestDryRunProductionDataWarning:
+    """再レビュー P1-3: dry_run が本番用エンドポイント(18081以外)から口座データを
+    読んでいることを大きく警告する（致命的ではないので起動は止めない）。"""
+
+    def test_dry_run_against_production_endpoint_warns(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "dry_run",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+            )
+        assert result["ok"] is True  # warningなので起動は止めない
+        chk = next(c for c in result["checks"] if "dry_run" in c["name"])
+        assert chk["ok"] is False and chk["level"] == pf.WARNING
+
+    def test_dry_run_against_test_endpoint_does_not_warn(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "dry_run",
+                base_url="http://localhost:18081/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+            )
+        chk = next(c for c in result["checks"] if "dry_run" in c["name"])
+        assert chk["ok"] is True
+
+    def test_live_mode_does_not_trigger_dry_run_warning(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "live",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+            )
+        chk = next(c for c in result["checks"] if "dry_run" in c["name"])
+        assert chk["ok"] is True
+
+
 class TestMainPyPreflightWiring:
     def test_main_calls_preflight(self):
         with open("main.py", encoding="utf-8") as f:

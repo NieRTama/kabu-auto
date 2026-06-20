@@ -158,13 +158,21 @@ class TradingServices:
     # ─── 注文状態の定期照合 ─────────────────────────────
     def reconcile_orders(self) -> None:
         """WebSocketイベントの取り逃し・切断・再起動に備え、未約定注文をブローカーの
-        /orders 照会結果へ定期的に収束させる（市場時間外は何もしない）。"""
+        /orders 照会結果へ定期的に収束させる（市場時間外は何もしない）。
+
+        合わせて建玉(/positions)もブローカー実態と照合する（P0-3）。注文照合が
+        失敗してもポジション照合は独立して実行する（どちらかの失敗が他方を隠さないため）。
+        """
         if not TradingScheduler.is_market_open():
             return
         try:
             self.order_mgr.reconcile_open_orders()
         except Exception as e:
             logger.error(f"注文照合エラー: {e}")
+        try:
+            self.order_mgr.reconcile_positions_with_broker()
+        except Exception as e:
+            logger.error(f"建玉照合エラー: {e}")
 
     # ─── 異常検知・アラート ─────────────────────────────
     def health_check(self) -> None:

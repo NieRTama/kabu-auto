@@ -559,7 +559,7 @@ async def get_daily_report(days: int = 30):
         trades = session.scalars(
             select(Trade).where(
                 Trade.filled_at.isnot(None),
-                Trade.status.in_(("FILLED", "PARTIALLY_FILLED")),
+                Trade.status.in_(("FILLED", "PARTIALLY_FILLED", "PARTIALLY_FILLED_DONE")),
             ).order_by(Trade.filled_at)
         ).all()
 

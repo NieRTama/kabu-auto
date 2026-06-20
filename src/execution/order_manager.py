@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from src.api.kabu_client import KabuClient
 from src.core import clock
 from src.core import config as cfg
+from src.core import halt
 from src.core import trading_mode as tm
 from src.core.alerts import alert
 from src.data.database import Fill, OrderApproval, OrderIntent, Position, Trade, get_session
@@ -112,7 +113,9 @@ class OrderManager:
             if ordered_qty > 0 and cum >= ordered_qty:
                 return st.FILLED
             if cum > 0:
-                return st.PARTIALLY_FILLED
+                # 部分約定のままブローカー側で確定終了（残数は取消/失効で二度と
+                # 約定しない）。未約定の PARTIALLY_FILLED とは区別する（P0-2）
+                return st.PARTIALLY_FILLED_DONE
             return st.CANCELLED
         # まだ生きている注文
         if cum > 0:
@@ -164,6 +167,61 @@ class OrderManager:
         for trade in open_trades:
             order = self._find_order(orders, trade.order_id)
             self._sync_trade_with_order(trade, order)
+
+    def reconcile_positions_with_broker(self) -> dict:
+        """DBの Position とブローカー実際の保有(/positions)を照合し、ズレを検出する（P0-3）。
+
+        /orders 照会だけでは「Trade群からの積算が実口座の建玉と一致しているか」までは
+        検証できない（バグ・未知の手動操作・取り逃したイベント等でズレうる）。ズレを
+        検知したら、実口座の建玉を正しく把握できていない状態で発注ロジックを動かし続ける
+        のは危険なため、既存の kill switch（取引停止スイッチ）を作動させて新規発注を
+        止め、人手確認を要求する（fail-closed。損切り・緊急決済はhalt中でもバイパスされ
+        止まらないため、退出操作で建玉を減らす方向には影響しない）。
+
+        ウォレット（現金残高）照合は対象外（現金フロー台帳が無く「期待現金残高」を
+        算出できないため。将来の拡張課題）。
+        ペーパー/dry_runは実ブローカーが無いため何もしない。
+        """
+        if self._is_paper or self._mode == tm.DRY_RUN:
+            return {"ok": True, "drift": []}
+        try:
+            broker_positions = self._client.get_positions()
+        except Exception as e:
+            logger.warning(f"建玉照合失敗（次回再試行）: {e}")
+            return {"ok": False, "drift": [], "error": str(e)}
+
+        broker_qty: dict[str, int] = {}
+        for p in broker_positions:
+            symbol = p.get("Symbol")
+            if not symbol:
+                continue
+            broker_qty[symbol] = broker_qty.get(symbol, 0) + int(p.get("LeavesQty") or 0)
+
+        with get_session() as session:
+            db_qty = {
+                p.symbol: p.quantity
+                for p in session.scalars(select(Position).where(Position.quantity > 0)).all()
+            }
+
+        drift = [
+            {"symbol": sym, "db_qty": db_qty.get(sym, 0), "broker_qty": broker_qty.get(sym, 0)}
+            for sym in (set(db_qty) | set(broker_qty))
+            if db_qty.get(sym, 0) != broker_qty.get(sym, 0)
+        ]
+        if drift:
+            detail = "; ".join(
+                f"{d['symbol']}: DB={d['db_qty']}株 ブローカー={d['broker_qty']}株"
+                for d in drift
+            )
+            logger.critical(f"建玉ドリフト検知: {detail}")
+            alert(
+                "建玉ドリフト検知（要確認）",
+                f"DBとブローカー実建玉に差異があります。新規発注を停止しました: {detail}",
+            )
+            if not halt.is_halted():
+                halt.engage(f"建玉ドリフト検知: {detail}")
+            return {"ok": False, "drift": drift}
+        return {"ok": True, "drift": []}
 
     def _reconcile_trade(self, trade: Trade) -> None:
         """1件のTradeをAPI照会で取得し直して状態を収束させる（on_order_event用）。"""
@@ -241,21 +299,24 @@ class OrderManager:
             f"注文状態同期: OrderID={trade.order_id} {cur_status}→{new_status} "
             f"約定={eff_cum_qty}/{cur_quantity}"
         )
-        filled_at = clock.now() if new_status == st.FILLED else None
+        filled_at = (clock.now() if new_status in (st.FILLED, st.PARTIALLY_FILLED_DONE)
+                    else None)
         self._record_fill(
             trade.order_id, new_status,
             eff_price if delta_qty > 0 else None, eff_cum_qty,
             filled_at=filled_at,
         )
         # ライブモード: 増分のみポジションへ反映（ペーパーは発注時点で反映済み）
-        if (new_status in (st.FILLED, st.PARTIALLY_FILLED)
+        if (new_status in (st.FILLED, st.PARTIALLY_FILLED, st.PARTIALLY_FILLED_DONE)
                 and not self._is_paper and delta_qty > 0):
             self._apply_fill(
                 trade.order_id, cur_symbol, cur_side, delta_qty, eff_price,
                 clock.now(), source="reconcile",
             )
-        # 終了状態ではタイムアウトキャンセルタイマーを解除（部分約定は残数を待つので解除しない）
-        if new_status in (st.FILLED, st.CANCELLED, st.REJECTED):
+        # 終了状態ではタイムアウトキャンセルタイマーを解除
+        # （未約定のPARTIALLY_FILLEDは残数を待つので解除しないが、PARTIALLY_FILLED_DONEは
+        # ブローカー側で確定終了済みなので解除する。P0-2）
+        if new_status in (st.FILLED, st.CANCELLED, st.REJECTED, st.PARTIALLY_FILLED_DONE):
             self._cancel_timeout_timer(trade.order_id)
 
     def buy(self, symbol: str, price: float, quantity: int,
@@ -465,8 +526,20 @@ class OrderManager:
                 logger.warning(f"未約定注文あり、重複発注スキップ: {symbol}")
                 return None
         elif not self._is_paper:
-            # 退出系: ゲートでブロックせず、競合する未約定注文を先にキャンセルしてから進める
-            self._cancel_open_orders_for_symbol(symbol)
+            # 退出系: ゲートでブロックせず、競合する未約定注文を先にキャンセルしてから進める。
+            # キャンセルに1件でも失敗（CANCEL_FAILED、実口座に注文が残っている可能性）が
+            # あれば、その状態のまま成行売りを重ねて送るのは危険なため中断する（再レビュー P0-4）。
+            if not self._cancel_open_orders_for_symbol(symbol):
+                logger.critical(
+                    f"退出注文ブロック: {symbol} の競合注文キャンセルに失敗。"
+                    "実口座の状態が不確実なため成行売りを送信せず中断します"
+                )
+                alert(
+                    "退出注文ブロック（要確認）",
+                    f"{symbol}: 既存注文のキャンセル失敗のため緊急/損切り成行売りを"
+                    "送信せず中断しました。証券会社サイトで直接ご確認ください",
+                )
+                return None
 
         if self._is_paper:
             # ペーパーは即時成立。約定価格は最新終値で近似する（成行のため板は無い）
@@ -616,17 +689,52 @@ class OrderManager:
             return None
 
     def close_all_positions(self) -> None:
-        """全ポジションを成行で強制決済する（緊急用）"""
+        """全ポジションを成行で強制決済する（緊急用）。
+
+        ライブ/semi_liveでは、ローカルDBの Position ではなくブローカー /positions を
+        正本として使う（再レビュー P0-1）。DBはWS取り逃し・反映遅延・バグ等で実口座と
+        ズレる可能性があり、緊急時にズレたDBを正本にすると「実際は200株あるのに100株しか
+        売らず残存」「実際は0株なのに不要な売りを送る」といった事故になるため。
+        /positions 取得自体に失敗した場合は実口座の状態を把握できないため、当てずっぽうで
+        DBに基づいた自動決済はせず、critical alert を出して人手確認に委ねる（fail-closed）。
+        ペーパー/dry_runは実ブローカーが無いためDBを正本のまま使う。
+        """
         logger.warning("緊急全ポジション決済を実行します")
-        with get_session() as session:
-            positions = session.scalars(
-                select(Position).where(Position.quantity > 0)
-            ).all()
-        for pos in positions:
+        if self._is_paper or self._mode == tm.DRY_RUN:
+            with get_session() as session:
+                positions = session.scalars(
+                    select(Position).where(Position.quantity > 0)
+                ).all()
+            for pos in positions:
+                try:
+                    self.sell_market(pos.symbol, pos.quantity, reason="emergency")
+                except Exception as e:
+                    logger.error(f"緊急決済失敗: {pos.symbol} {e}")
+            return
+
+        try:
+            broker_positions = self._client.get_positions()
+        except Exception as e:
+            logger.critical(f"緊急決済ブロック: ブローカー /positions 取得失敗: {e}")
+            alert(
+                "緊急決済ブロック（要確認）",
+                f"/positions 取得失敗のため自動決済を中断しました: {e}。"
+                "証券会社サイトで建玉を直接確認し、必要であれば手動で決済してください",
+            )
+            return
+
+        for pos in broker_positions:
             try:
-                self.sell_market(pos.symbol, pos.quantity, reason="emergency")
+                symbol = pos.get("Symbol")
+                leaves_qty = int(pos.get("LeavesQty") or 0)
+                if not symbol or leaves_qty <= 0:
+                    continue
+                # sell_market(reason="emergency") は送信前に同銘柄の未約定注文を
+                # 先にキャンセルする（成立すれば HoldQty による引当は解放されるため、
+                # ここでは LeavesQty=実保有数量をそのまま渡せばよい）
+                self.sell_market(symbol, leaves_qty, reason="emergency")
             except Exception as e:
-                logger.error(f"緊急決済失敗: {pos.symbol} {e}")
+                logger.error(f"緊急決済失敗: {pos} {e}")
 
     def cancel_all_pending_buys(self) -> int:
         """未約定のBUY注文をすべてキャンセルする（kill switch 作動時の新規建玉防止）。
@@ -932,8 +1040,12 @@ class OrderManager:
               f"OrderID={order_id} Result={result.get('Result')}。要確認")
         return False
 
-    def _cancel_open_orders_for_symbol(self, symbol: str) -> None:
-        """同銘柄の未約定注文をすべてキャンセルする（退出系発注前の競合解消用）。"""
+    def _cancel_open_orders_for_symbol(self, symbol: str) -> bool:
+        """同銘柄の未約定注文をすべてキャンセルする（退出系発注前の競合解消用）。
+
+        戻り値: 全件キャンセル確定で True。1件でも失敗（CANCEL_FAILED）があれば False
+        （呼び出し元はこの場合、成行売りの送信を中断する。再レビュー P0-4）。
+        """
         with get_session() as session:
             open_ids = [
                 t.order_id for t in session.scalars(
@@ -943,8 +1055,11 @@ class OrderManager:
                     )
                 ).all()
             ]
+        all_ok = True
         for oid in open_ids:
-            self._cancel_order_now(oid)
+            if not self._cancel_order_now(oid):
+                all_ok = False
+        return all_ok
 
     def _record_trade(self, order_id: str, symbol: str, side: str,
                       quantity: int, price: float,

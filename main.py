@@ -19,6 +19,7 @@ from loguru import logger
 from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
+    process_lock,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -56,6 +57,23 @@ def main() -> None:
         )
         sys.exit(1)
     logger.info(f"取引モード: {tm.description(mode)}")
+
+    # ─── 多重起動防止（再レビュー P1-1）────────────────────────
+    # 同一PCでの誤った二重起動はスケジューラジョブの重複実行・二重発注・WebSocket
+    # 接続競合・DB破壊につながるため、実発注の可能性があるモードでは起動を中断する。
+    # paper は実資金リスクが無いため警告のみで継続する。
+    lock_ok, lock_detail = process_lock.acquire("data/kabu_auto.lock")
+    if not lock_ok:
+        if mode == "paper":
+            logger.warning(
+                f"多重起動を検知しましたが paper モードのため続行します: {lock_detail}"
+            )
+        else:
+            logger.critical(
+                f"多重起動を検知したため起動を中断します: {lock_detail}。"
+                "別の kabu-auto プロセスを終了してから再起動してください"
+            )
+            sys.exit(1)
 
     # ─── 実発注モード（live / semi_live）の起動確認 ─────────────
     # 実際の資金で発注しうるモードは二重確認を要求する（dry_run は読み取りのみなので不要）。
@@ -210,6 +228,7 @@ def main() -> None:
         scheduler.stop()
         client.stop_websocket()
         update_status(running=False, ws_connected=False, mode=trading_conf.get("mode", "paper"))
+        process_lock.release()
         logger.info("終了しました")
 
 
