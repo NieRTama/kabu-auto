@@ -72,9 +72,10 @@ class TestDryRun:
         assert order_id and order_id.startswith("DRYRUN-BUY")
 
     def test_buy_records_dry_run_status(self):
+        from src.data.database import Trade
         with _make_om("dry_run") as (om, client, risk, session):
             om.buy("7203", 1000.0, 100)
-        trade = session.add.call_args_list[0][0][0]
+        trade = next(c[0][0] for c in session.add.call_args_list if isinstance(c[0][0], Trade))
         assert trade.status == st.DRY_RUN
 
     def test_sell_market_does_not_send_even_on_exit(self):

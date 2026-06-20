@@ -245,11 +245,25 @@ class TestOnOrderEventTriggersReconcile:
 # ─── Medium #8: ペーパートレードが FILLED で保存される ──────────────────
 
 
+def _added_trade(session) -> object:
+    """session.add() で渡された全オブジェクトから Trade のものを取り出す。
+
+    _record_trade() は Phase5/4.2 でOrderIntentも同じセッションへ add するため、
+    最初に add されたオブジェクトとは限らない（型で識別する）。
+    """
+    import src.data.database as db_mod
+    calls = session.add.call_args_list
+    assert calls, "session.add が呼ばれていない"
+    for c in calls:
+        obj = c[0][0]
+        if isinstance(obj, db_mod.Trade):
+            return obj
+    raise AssertionError("Trade が session.add されていない")
+
+
 class TestPaperTradeFilledStatus:
     def _first_trade_added(self, session) -> object:
-        calls = session.add.call_args_list
-        assert calls, "session.add が呼ばれていない"
-        return calls[0][0][0]
+        return _added_trade(session)
 
     def test_paper_buy_status_is_filled(self):
         """ペーパー BUY → status='FILLED'"""
@@ -299,7 +313,7 @@ class TestTradeSectorRecorded:
     解決できるようにする）"""
 
     def _first_trade_added(self, session) -> object:
-        return session.add.call_args_list[0][0][0]
+        return _added_trade(session)
 
     def test_paper_buy_records_sector(self):
         with _make_om(mode="paper") as (om, _, _, session):

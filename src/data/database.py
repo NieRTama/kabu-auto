@@ -8,7 +8,7 @@ from typing import Iterator, Optional
 from loguru import logger
 from sqlalchemy import (
     Column, Date, DateTime, Float, Index, Integer, String, Text,
-    create_engine, text,
+    create_engine, select, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -35,9 +35,34 @@ class OHLCV(Base):
     __table_args__ = (Index("ix_ohlcv_symbol_date", "symbol", "date", unique=True),)
 
 
+class OrderIntent(Base):
+    """発注の「意図」（Phase 5 / 4.2）。
+
+    戦略が「なぜ・何を」やりたいかを表す層。1つの意図から複数のBrokerOrder（trades行）が
+    生まれうる（タイムアウトキャンセル後の再発注・部分約定後の追撃等）。`Trade.intent_id` で
+    紐づく。意図そのものは取消・拒否されても消えない（再現性のため）。
+    """
+    __tablename__ = "order_intents"
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, default=clock.now)
+    symbol = Column(String(10), nullable=False)
+    side = Column(String(4), nullable=False)         # "BUY" / "SELL"
+    target_quantity = Column(Integer, nullable=False)
+    order_type = Column(String(10))                    # "LIMIT" / "MARKET"
+    limit_price = Column(Float)                        # 指値（成行はNone/0）
+    sector = Column(String(50))
+    rationale = Column(Text)    # シグナルスコア・損切り理由等（7.6 と同内容をここが正本として持つ）
+    source = Column(String(20))  # signal_scan / morning_execution / stop_loss / emergency / manual / approval / backfill
+    mode = Column(String(10))    # paper / live / dry_run / semi_live
+    status = Column(String(12), default="PENDING")  # PENDING/SUBMITTED/PARTIAL/COMPLETED/CANCELLED/REJECTED
+
+
 class Trade(Base):
+    """ブローカーへ送った1注文（= BrokerOrder。Phase 5 / 4.2 で意図(OrderIntent)・
+    約定明細(Fill)から分離した）。"""
     __tablename__ = "trades"
     id = Column(Integer, primary_key=True)
+    intent_id = Column(Integer)  # OrderIntent.id（紐づく意図。backfill対象の旧データはマイグレーションで補完）
     order_id = Column(String(50), unique=True)
     symbol = Column(String(10), nullable=False)
     side = Column(String(4), nullable=False)  # "BUY" or "SELL"
@@ -45,13 +70,16 @@ class Trade(Base):
     # 未約定BUYのセクター引当をPosition経由でなくここから直接解決できるようにする）
     quantity = Column(Integer, nullable=False)  # 発注数量
     price = Column(Float)  # 発注時の指値（成行は0）。実約定価格は filled_price を使う
-    filled_price = Column(Float)  # 実約定単価（約定イベント/注文照会から取得）
+    # filled_price/filled_quantity/pnl は Fill から積み上げる派生（非正規化）列。
+    # 既存の読み手（ダッシュボード・リスク管理・ジャーナル等）はこの列を読むだけで動くよう、
+    # _apply_fill() がFill確定ごとにここへロールアップする。
+    filled_price = Column(Float)  # 実約定単価（Fillの出来高加重平均=VWAP）
     filled_quantity = Column(Integer)  # 実約定数量（部分約定時は quantity 未満）
     filled_at = Column(DateTime)
     status = Column(String(20), default="PENDING")
-    pnl = Column(Float)
+    pnl = Column(Float)  # SELL: FIFOで確定した実現損益の合計（複数Fillに分かれた場合は加算）
     note = Column(Text)        # 利用者が後から書く自由記述メモ（取引ジャーナル）
-    rationale = Column(Text)   # 発注時に自動記録する売買根拠（シグナルスコア・損切り理由等。7.6）
+    rationale = Column(Text)   # 発注時に自動記録する売買根拠（intentからの複製。既存リーダー互換のため維持）
 
 
 class OrderApproval(Base):
@@ -72,8 +100,34 @@ class OrderApproval(Base):
     status = Column(String(12), default="PENDING")   # PENDING / APPROVED / REJECTED
     decided_at = Column(DateTime)
     resulting_order_id = Column(String(50))          # 承認実行で発注した注文ID
+    intent_id = Column(Integer)                       # 紐づくOrderIntent.id（承認時にTradeへ引き継ぐ）
     rationale = Column(Text)                          # 発注根拠（承認後にTradeへ引き継ぐ。7.6）
     note = Column(Text)
+
+
+class Fill(Base):
+    """1回の約定明細（Phase 5 / 4.2）。BUYの約定はFIFOロット台帳の単位にもなる。
+
+    BUY: `remaining_qty` がそのロットの未消費株数（0になったら売り切り済み）。
+    SELL: `realized_pnl` がこの約定でFIFO消費した分の確定損益。
+    `src/execution/lots.py` がこのテーブルを使ってFIFO消費・Position再構成を行う。
+    """
+    __tablename__ = "fills"
+    id = Column(Integer, primary_key=True)
+    broker_order_id = Column(Integer, nullable=False)  # Trade.id
+    symbol = Column(String(10), nullable=False)
+    side = Column(String(4), nullable=False)  # "BUY" / "SELL"
+    fill_qty = Column(Integer, nullable=False)
+    fill_price = Column(Float, nullable=False)
+    filled_at = Column(DateTime, nullable=False)
+    source = Column(String(20))  # ws / reconcile / paper / backfill
+    remaining_qty = Column(Integer)   # BUYのみ: FIFO未消費株数
+    realized_pnl = Column(Float)      # SELLのみ: この約定での確定損益
+
+    __table_args__ = (
+        Index("ix_fills_symbol_side_filled_at", "symbol", "side", "filled_at"),
+        Index("ix_fills_broker_order_id", "broker_order_id"),
+    )
 
 
 class Position(Base):
@@ -164,11 +218,112 @@ class BacktestTradeRecord(Base):
 
 # 現在のスキーマバージョン。順序付きマイグレーションを追加するたびに +1 する。
 # v1 = schema_version 導入時点のベースライン（既存テーブル群＋additive列追加で表現できる範囲）。
-SCHEMA_VERSION = 1
+# v2 = OrderIntent/Fill分離のバックフィル（Phase 5 / 4.2。下記 _migrate_v2_order_model_backfill）。
+SCHEMA_VERSION = 2
+
+
+def _backfill_intent_status(trade_status: str) -> str:
+    """旧Trade.statusから、バックフィルで生成するOrderIntent.statusを決める。"""
+    if trade_status == "REJECTED":
+        return "REJECTED"
+    if trade_status in ("FILLED", "DRY_RUN"):
+        return "COMPLETED"
+    if trade_status == "PARTIALLY_FILLED":
+        return "PARTIAL"
+    if trade_status in ("CANCELLED", "CANCEL_FAILED"):
+        return "CANCELLED"
+    return "SUBMITTED"
+
+
+def _migrate_v2_order_model_backfill(conn) -> None:
+    """v2: 既存 trades から OrderIntent・Fill をバックフィルし、FIFOで実現損益・Positionを
+    遡及再計算する（Phase 5 / 4.2: OrderIntent/BrokerOrder/Fill分離）。
+
+    1. 全TradeにOrderIntentを生成して紐付ける（intent_idが未設定のもののみ。履歴の追跡性確保）。
+    2. 約定済み(FILLED/PARTIALLY_FILLED)のTradeからFillを生成する。BUYは新規ロットとして
+       積み、SELLは `src/execution/lots.py` のFIFOロジックで既存ロットを古い順に消費する
+       （`fn(conn)` で受け取る Connection は `engine.begin()` の進行中トランザクションに
+       紐づくため、`Session(bind=conn)` でこれに合流させ、flush のみ行い commit はしない
+       ＝ 外側の `_run_migrations` のトランザクション境界に委ねる）。
+    3. SELLの実現損益(Trade.pnl)はFIFO消費結果で上書きする（平均単価会計→FIFOロット会計へ
+       遡及再計算。ユーザー確認済みの方針）。
+    4. Fillが生成された全symbolについて、最終的な残存ロットからPositionを再構成する。
+
+    冪等性: 既にintent_idが設定済みのTrade、既にFillが存在するTradeはスキップするため、
+    複数回実行しても安全（起動時に毎回 schema_version を見て1回だけ走るが、保険として）。
+    """
+    from src.execution import lots
+
+    session = Session(bind=conn)
+
+    # ─── 1. 全TradeへOrderIntentを生成 ─────────────────────────────────
+    trades = session.scalars(select(Trade)).all()
+    for t in trades:
+        if t.intent_id is not None:
+            continue
+        order_type = "MARKET" if (t.side == "SELL" and not t.price) else "LIMIT"
+        mode = (
+            "paper" if (t.order_id or "").startswith("PAPER-") else
+            "dry_run" if (t.order_id or "").startswith("DRYRUN-") else
+            "live"
+        )
+        intent = OrderIntent(
+            symbol=t.symbol, side=t.side, target_quantity=t.quantity,
+            order_type=order_type, limit_price=t.price if order_type == "LIMIT" else None,
+            sector=t.sector, rationale=t.rationale, source="backfill", mode=mode,
+            status=_backfill_intent_status(t.status),
+            created_at=t.filled_at or clock.now(),
+        )
+        session.add(intent)
+        session.flush()
+        t.intent_id = intent.id
+
+    # ─── 2-3. 約定済みTradeからFillを生成しFIFOで遡及再計算 ──────────────
+    filled_trades = [
+        t for t in trades
+        if t.status in ("FILLED", "PARTIALLY_FILLED") and (t.filled_quantity or 0) > 0
+    ]
+    has_fill = {
+        row[0] for row in session.execute(select(Fill.broker_order_id)).all()
+    }
+    touched_symbols: set = set()
+
+    # BUYを先にすべて積む（SELLのFIFO消費がこれらのロットを参照するため）
+    buys = sorted(
+        (t for t in filled_trades if t.side == "BUY" and t.id not in has_fill),
+        key=lambda t: (t.filled_at or clock.now(), t.id),
+    )
+    for t in buys:
+        price = t.filled_price if t.filled_price else t.price
+        lots.record_buy_fill(session, t.id, t.symbol, t.filled_quantity, price,
+                             t.filled_at or clock.now(), source="backfill")
+        touched_symbols.add(t.symbol)
+
+    sells = sorted(
+        (t for t in filled_trades if t.side == "SELL" and t.id not in has_fill),
+        key=lambda t: (t.filled_at or clock.now(), t.id),
+    )
+    for t in sells:
+        price = t.filled_price if t.filled_price else t.price
+        _, realized, _consumed = lots.consume_fifo(
+            session, t.id, t.symbol, t.filled_quantity, price,
+            t.filled_at or clock.now(), source="backfill",
+        )
+        t.pnl = realized  # 旧・平均単価会計の値をFIFO再計算で上書き
+        touched_symbols.add(t.symbol)
+
+    # ─── 4. Positionを最終残存ロットから再構成 ─────────────────────────
+    for symbol in touched_symbols:
+        lots.rebuild_position(session, symbol)
+
+    session.flush()
+
 
 # version -> 適用関数 fn(conn) の登録簿。additive な列追加では表現できない
-# 順序付きマイグレーション（データ変換等）を将来ここへ追加する。現状は空（ベースライン）。
-_MIGRATIONS: dict = {}
+# 順序付きマイグレーション（データ変換等）をここへ登録する。
+_MIGRATIONS: dict = {
+    2: _migrate_v2_order_model_backfill,
+}
 
 _engine = None
 _Session: Optional[sessionmaker] = None

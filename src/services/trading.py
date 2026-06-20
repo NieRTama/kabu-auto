@@ -239,12 +239,14 @@ class TradingServices:
                         qty = self.risk.calc_position_size(sym, close_price, cash)
                         if qty > 0:
                             self.order_mgr.buy(sym, close_price, qty, sector=sector,
-                                               rationale=_signal_rationale(sig))
+                                               rationale=_signal_rationale(sig),
+                                               source="signal_scan")
                     elif sig.action == "SELL":
                         qty = _get_position_qty(sym)
                         if qty > 0:
                             self.order_mgr.sell(sym, close_price, qty,
-                                                rationale=_signal_rationale(sig))
+                                                rationale=_signal_rationale(sig),
+                                                source="signal_scan")
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
 
@@ -281,7 +283,8 @@ class TradingServices:
                 if not price:
                     continue
                 self.order_mgr.sell(sig.symbol, float(price), qty,
-                                    rationale=_signal_rationale(sig))
+                                    rationale=_signal_rationale(sig),
+                                    source="morning_execution")
                 logger.info(f"朝売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
             except Exception as e:
                 logger.error(f"朝売り発注失敗: {sig.symbol} {e}")
@@ -311,7 +314,8 @@ class TradingServices:
                 if qty <= 0:
                     continue
                 order_id = self.order_mgr.buy(sig.symbol, float(price), qty, sector=sector,
-                                              rationale=_signal_rationale(sig))
+                                              rationale=_signal_rationale(sig),
+                                              source="morning_execution")
                 if order_id:
                     # 同一スキャン内の以降の銘柄が同じ余力を前提に判定しないよう、
                     # 発注成功分をその場で減算する（複数銘柄の資金二重計上を防ぐ。
