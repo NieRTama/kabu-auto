@@ -132,6 +132,20 @@ class BacktestRun(Base):
     archived = Column(Integer, default=0)  # 1=アーカイブ済み（一覧から除外。履歴は保持）
 
 
+class SchemaVersion(Base):
+    """DBスキーマのバージョンを記録する1行テーブル（P2-4）。
+
+    既存の `_migrate_add_missing_columns()` は「不足カラムの追加」という冪等な操作のみで、
+    既存データの変換を伴う順序付きマイグレーションは表現できない。将来そうした移行が必要に
+    なったとき（列の意味変更・データ移送・テーブル再編など）に、適用済みバージョンを基準に
+    一度だけ順番に流せるよう、現在のスキーマバージョンを永続化しておく。
+    """
+    __tablename__ = "schema_version"
+    id = Column(Integer, primary_key=True)  # 常に 1（単一行）
+    version = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=clock.now, onupdate=clock.now)
+
+
 class BacktestTradeRecord(Base):
     __tablename__ = "backtest_trades"
     id = Column(Integer, primary_key=True)
@@ -145,6 +159,14 @@ class BacktestTradeRecord(Base):
     pnl = Column(Float)
     exit_reason = Column(String(30))  # STOP_LOSS / SIGNAL_SELL / END_OF_PERIOD
 
+
+# 現在のスキーマバージョン。順序付きマイグレーションを追加するたびに +1 する。
+# v1 = schema_version 導入時点のベースライン（既存テーブル群＋additive列追加で表現できる範囲）。
+SCHEMA_VERSION = 1
+
+# version -> 適用関数 fn(conn) の登録簿。additive な列追加では表現できない
+# 順序付きマイグレーション（データ変換等）を将来ここへ追加する。現状は空（ベースライン）。
+_MIGRATIONS: dict = {}
 
 _engine = None
 _Session: Optional[sessionmaker] = None
@@ -165,9 +187,43 @@ def init() -> None:
         conn.commit()
 
     Base.metadata.create_all(_engine)
-    _migrate_add_missing_columns(_engine)
+    _run_migrations(_engine)
     _Session = sessionmaker(bind=_engine, expire_on_commit=False)
     logger.info(f"DB初期化完了: {db_path}")
+
+
+def _run_migrations(engine) -> None:
+    """スキーマ移行を実行する。
+
+    1. 不足カラムの追加（冪等。既存の additive マイグレーション）
+    2. schema_version を基準に、未適用の順序付きマイグレーションを番号順に1度だけ適用
+    3. schema_version を最新へ更新
+    """
+    _migrate_add_missing_columns(engine)
+    with engine.begin() as conn:
+        current = conn.execute(text("SELECT version FROM schema_version WHERE id=1")).scalar()
+        if current is None:
+            conn.execute(text("INSERT INTO schema_version (id, version) VALUES (1, 0)"))
+            current = 0
+        for v in range(current + 1, SCHEMA_VERSION + 1):
+            fn = _MIGRATIONS.get(v)
+            if fn is not None:
+                logger.info(f"スキーマ移行 v{v} を適用します")
+                fn(conn)
+        if current < SCHEMA_VERSION:
+            conn.execute(
+                text("UPDATE schema_version SET version=:v, updated_at=:t WHERE id=1"),
+                {"v": SCHEMA_VERSION, "t": clock.now()},
+            )
+            logger.info(f"スキーマバージョン: {current} → {SCHEMA_VERSION}")
+
+
+def get_schema_version() -> int:
+    """現在記録されているスキーマバージョンを返す（未初期化なら0）。"""
+    if _engine is None:
+        return 0
+    with _engine.connect() as conn:
+        return conn.execute(text("SELECT version FROM schema_version WHERE id=1")).scalar() or 0
 
 
 def _migrate_add_missing_columns(engine) -> None:

@@ -535,6 +535,112 @@ async def get_trades(limit: int = 50):
     ]
 
 
+# ─── 日次レポート・取引ジャーナル（Phase 5 / 7.4・7.9）────────────────────
+
+
+def _exit_value(t: Trade) -> Optional[float]:
+    """決済（SELL）の約定総額。成行は price=0 で filled_price に実単価が入る。"""
+    px = t.filled_price if t.filled_price else t.price
+    if not px:
+        return None
+    return px * (t.filled_quantity or t.quantity or 0)
+
+
+@app.get("/api/report/daily")
+async def get_daily_report(days: int = 30):
+    """日次の取引活動レポート（新しい順）。
+
+    各日について確定損益・約定件数・売買内訳・勝敗・勝率を集計する。
+    既存の `/api/pnl/daily`（損益のみ）に対し、こちらは「何件・どちら向き・勝敗」の
+    取引活動の側面を加えたもの。DRY_RUN は実取引でないため除外する。
+    """
+    with get_session() as session:
+        trades = session.scalars(
+            select(Trade).where(
+                Trade.filled_at.isnot(None),
+                Trade.status.in_(("FILLED", "PARTIALLY_FILLED")),
+            ).order_by(Trade.filled_at)
+        ).all()
+
+    daily: dict = {}
+    for t in trades:
+        d = t.filled_at.strftime("%Y-%m-%d")
+        row = daily.setdefault(d, {
+            "date": d, "realized_pnl": 0.0, "trade_count": 0,
+            "buy_count": 0, "sell_count": 0, "win_count": 0, "loss_count": 0,
+        })
+        row["trade_count"] += 1
+        if t.side == "BUY":
+            row["buy_count"] += 1
+        else:
+            row["sell_count"] += 1
+        if t.pnl is not None:
+            row["realized_pnl"] += t.pnl
+            if t.pnl > 0:
+                row["win_count"] += 1
+            elif t.pnl < 0:
+                row["loss_count"] += 1
+
+    result = []
+    for d in sorted(daily.keys(), reverse=True)[:days]:
+        row = daily[d]
+        decided = row["win_count"] + row["loss_count"]
+        row["realized_pnl"] = round(row["realized_pnl"], 0)
+        row["win_rate"] = round(row["win_count"] / decided, 3) if decided else None
+        result.append(row)
+    return result
+
+
+@app.get("/api/journal")
+async def get_trade_journal(limit: int = 100):
+    """取引ジャーナル: 損益が確定した取引（決済）を新しい順に、リターン率・メモ付きで返す。
+
+    リターン率は約定総額と損益から取得原価を逆算して算出する
+    （取得原価 = 約定総額 − 損益）。メモは `PUT /api/journal/{order_id}/note` で編集できる。
+    """
+    with get_session() as session:
+        trades = session.scalars(
+            select(Trade).where(Trade.pnl.isnot(None))
+            .order_by(Trade.filled_at.desc().nullslast(), Trade.id.desc())
+            .limit(limit)
+        ).all()
+    out = []
+    for t in trades:
+        exit_val = _exit_value(t)
+        cost_basis = (exit_val - t.pnl) if (exit_val is not None and t.pnl is not None) else None
+        return_pct = (round(t.pnl / cost_basis, 4)
+                      if cost_basis and cost_basis > 0 else None)
+        out.append({
+            "order_id": t.order_id,
+            "symbol": t.symbol,
+            "side": t.side,
+            "sector": t.sector,
+            "quantity": t.filled_quantity or t.quantity,
+            "exit_price": t.filled_price if t.filled_price else t.price,
+            "pnl": round(t.pnl, 0) if t.pnl is not None else None,
+            "return_pct": return_pct,
+            "filled_at": t.filled_at.isoformat() if t.filled_at else None,
+            "note": t.note,
+        })
+    return out
+
+
+class TradeNoteRequest(BaseModel):
+    note: str
+
+
+@app.put("/api/journal/{order_id}/note")
+async def set_trade_note(order_id: str, req: TradeNoteRequest):
+    """取引にメモを付ける（取引ジャーナル用）。"""
+    with get_session() as session:
+        trade = session.scalar(select(Trade).where(Trade.order_id == order_id))
+        if trade is None:
+            raise HTTPException(status_code=404, detail="取引が見つかりません")
+        trade.note = req.note[:1000]
+        session.commit()
+    return {"status": "ok", "order_id": order_id}
+
+
 @app.get("/api/pnl_summary")
 async def get_pnl_summary():
     with get_session() as session:

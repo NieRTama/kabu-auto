@@ -240,6 +240,31 @@
     </div>
   </div>
 
+  <!-- ─── 取引ジャーナル・日次レポート ───────────────────────────── -->
+  <div class="row">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <h2 style="margin-bottom:0;">📒 取引ジャーナル</h2>
+        <span style="font-size:0.78rem;color:#94a3b8;">確定した取引（メモ編集可）</span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table style="font-size:0.8rem;">
+          <thead><tr><th>日時</th><th>銘柄</th><th>売買</th><th>数量</th><th>損益</th><th>リターン%</th><th>メモ</th></tr></thead>
+          <tbody id="journal-tbody"><tr><td colspan="7" style="color:#64748b">なし</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h2>📅 日次レポート</h2>
+      <div style="overflow-x:auto;">
+        <table style="font-size:0.8rem;">
+          <thead><tr><th>日付</th><th>確定損益</th><th>取引</th><th>買/売</th><th>勝/負</th><th>勝率</th></tr></thead>
+          <tbody id="daily-report-tbody"><tr><td colspan="6" style="color:#64748b">なし</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── ウォッチリスト管理 ────────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px;">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
@@ -457,7 +482,63 @@
     await Promise.all([
       loadStatus(), loadPnlEnhancedSummary(), loadPositions(),
       loadSignals(), loadTrades(), loadPnlChart(),
+      loadJournal(), loadDailyReport(),
     ]);
+  }
+
+  // ── 取引ジャーナル・日次レポート ───────────────────────────────
+  async function loadJournal() {
+    const rows = await fetchJson('/api/journal?limit=100');
+    const tbody = document.getElementById('journal-tbody');
+    if (!rows.length) { tbody.innerHTML = '<tr><td colspan="7" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = rows.map(r => {
+      const dt = r.filled_at ? new Date(r.filled_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-';
+      const pnlColor = r.pnl > 0 ? '#4ade80' : r.pnl < 0 ? '#f87171' : '#e2e8f0';
+      const pct = r.return_pct != null ? (r.return_pct * 100).toFixed(1) + '%' : '-';
+      const note = escapeHtml(r.note || '');
+      return `<tr>
+        <td style="font-size:0.72rem;color:#94a3b8;">${dt}</td>
+        <td><strong>${symLabel(r.symbol)}</strong></td>
+        <td>${r.side === 'BUY' ? '買' : '売'}</td>
+        <td>${r.quantity}</td>
+        <td style="color:${pnlColor};font-weight:700;">¥${(r.pnl || 0).toLocaleString()}</td>
+        <td style="color:${pnlColor};">${pct}</td>
+        <td><span style="cursor:pointer;color:${note ? '#e2e8f0' : '#475569'};"
+          onclick="editJournalNote('${encodeURIComponent(r.order_id)}', this)"
+          title="クリックして編集">${note || '✎ メモ'}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function editJournalNote(orderIdEnc, el) {
+    const orderId = decodeURIComponent(orderIdEnc);
+    const current = el.textContent === '✎ メモ' ? '' : el.textContent;
+    const note = prompt('この取引のメモ:', current);
+    if (note === null) return;
+    const r = await fetch(API + `/api/journal/${encodeURIComponent(orderId)}/note`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note }),
+    });
+    if (r.ok) await loadJournal();
+  }
+
+  async function loadDailyReport() {
+    const rows = await fetchJson('/api/report/daily?days=30');
+    const tbody = document.getElementById('daily-report-tbody');
+    if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:#64748b">なし</td></tr>'; return; }
+    tbody.innerHTML = rows.map(r => {
+      const pnlColor = r.realized_pnl > 0 ? '#4ade80' : r.realized_pnl < 0 ? '#f87171' : '#e2e8f0';
+      const wr = r.win_rate != null ? (r.win_rate * 100).toFixed(0) + '%' : '-';
+      return `<tr>
+        <td style="font-size:0.75rem;">${r.date}</td>
+        <td style="color:${pnlColor};font-weight:700;">¥${(r.realized_pnl || 0).toLocaleString()}</td>
+        <td>${r.trade_count}</td>
+        <td style="font-size:0.75rem;color:#94a3b8;">${r.buy_count}/${r.sell_count}</td>
+        <td style="font-size:0.75rem;">${r.win_count}/${r.loss_count}</td>
+        <td>${wr}</td>
+      </tr>`;
+    }).join('');
   }
 
   // ── リスクプロファイル（ローリスク・ローリターン ⇔ ハイリスク・ハイリターン の2択） ──
