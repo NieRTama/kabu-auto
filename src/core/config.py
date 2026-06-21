@@ -29,9 +29,9 @@ def _apply_env_overrides(config: dict) -> None:
     env_password = os.environ.get("KABU_API_PASSWORD")
     if env_password:
         config.setdefault("kabu_station", {})["password"] = env_password
-    env_line_token = os.environ.get("LINE_NOTIFY_TOKEN")
-    if env_line_token:
-        config.setdefault("alerts", {})["line_notify_token"] = env_line_token
+    env_discord_webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+    if env_discord_webhook:
+        config.setdefault("alerts", {})["discord_webhook_url"] = env_discord_webhook
     env_dash_token = os.environ.get("KABU_DASHBOARD_TOKEN")
     if env_dash_token:
         config.setdefault("dashboard", {})["api_token"] = env_dash_token

@@ -123,10 +123,16 @@ dashboard:
   cookie_secure: false
 
 alerts:
-  # LINE Notify トークン（任意）。設定すると取引情報がLINEへ送信される。
-  # 環境変数 LINE_NOTIFY_TOKEN でも指定可能（平文をconfigに残さないため推奨）。
-  # ※ LINE Notify はサービス提供元による終了が告知されているため、利用可否に注意。
-  line_notify_token: ""
+  # Discord Webhook URL（任意）。設定すると取引情報がDiscordへ送信される。
+  # 環境変数 DISCORD_WEBHOOK_URL でも指定可能（平文をconfigに残さないため推奨）。
+  # 取得方法: Discordのチャンネル設定 → 連携サービス → ウェブフック → 新しいウェブフック
+  #          → 「ウェブフックURLをコピー」。このURL自体が秘密情報のため、
+  #          コピー後は他者に共有せず、ここに直接書く場合も誤コミットに注意（.envを推奨）。
+  # 詳細: docs/通知設定ガイド.md
+  discord_webhook_url: ""
+  # 将来 Slack/Telegram/email 等を追加する場合は、ここに provider 別のキーを追記し、
+  # src/core/alerts.py の build_providers() に対応する分岐を1つ追加する。
+  # 例: slack_webhook_url: ""
 
 logging:
   level: "INFO"
