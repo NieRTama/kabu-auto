@@ -34,17 +34,26 @@ def run_backtest(
     use_ml: bool = False,
     buy_threshold: Optional[float] = None,
     sell_threshold: Optional[float] = None,
+    slippage_pct: Optional[float] = None,
+    commission_pct: Optional[float] = None,
 ) -> int:
     """バックテストを実行してDBに保存し、run_id を返す。
 
     buy_threshold/sell_threshold を指定すると、アクティブなリスクプロファイル
     （config の strategy.buy_threshold/sell_threshold）を上書きしてこの実行だけに適用する。
     ライブ/ペーパー取引の設定には一切影響しない（探索的なバックテスト専用の上書き）。
+
+    slippage_pct/commission_pct は約定価格に不利方向へ加える片道スリッページ率・
+    片道手数料率（未指定時は config の `backtest` セクションから読む）。理想約定を仮定した
+    バックテストは実運用と乖離しやすいため、コスト控除後の成績を見られるようにする（レビュー ML）。
     """
     strat_conf = cfg.get_section("strategy")
     trade_conf = cfg.get_section("trading")
+    bt_conf = cfg.get_section("backtest")
     stop_loss_pct = trade_conf.get("stop_loss_pct", -0.05)
     max_pos_ratio = trade_conf.get("max_position_ratio", 0.20)
+    slip = float(slippage_pct if slippage_pct is not None else bt_conf.get("slippage_pct", 0.0) or 0.0)
+    comm = float(commission_pct if commission_pct is not None else bt_conf.get("commission_pct", 0.0) or 0.0)
     buy_thr = buy_threshold if buy_threshold is not None else strat_conf.get("buy_threshold", 0.6)
     sell_thr = sell_threshold if sell_threshold is not None else strat_conf.get("sell_threshold", -0.6)
     ml_weight = strat_conf.get("ml_weight", 0.5)
@@ -88,6 +97,7 @@ def run_backtest(
     cash = initial_capital
     pos_qty = 0
     pos_avg_cost = 0.0
+    pos_entry_commission = 0.0  # 現建玉のエントリ手数料（決済時にPnLへ反映）
     pos_entry_date: Optional[date] = None
     sim_trades = []
     equity_curve = []
@@ -109,11 +119,14 @@ def run_backtest(
             drawdown = (low_price - pos_avg_cost) / pos_avg_cost
             if drawdown <= stop_loss_pct:
                 stop_price = round(pos_avg_cost * (1 + stop_loss_pct), 2)
-                pnl = round((stop_price - pos_avg_cost) * pos_qty, 0)
-                cash += stop_price * pos_qty
+                exit_price = _sell_fill_price(stop_price, slip)
+                proceeds = exit_price * pos_qty
+                commission = proceeds * comm
+                pnl = round((exit_price - pos_avg_cost) * pos_qty - commission - pos_entry_commission, 0)
+                cash += proceeds - commission
                 sim_trades.append(_make_trade(
                     symbol, pos_entry_date, pos_avg_cost,
-                    dt_date, stop_price, pos_qty, pnl, "STOP_LOSS",
+                    dt_date, exit_price, pos_qty, pnl, "STOP_LOSS",
                 ))
                 pos_qty = 0
                 equity_curve.append({"date": dt_date.isoformat(), "equity": round(cash, 0)})
@@ -154,22 +167,28 @@ def run_backtest(
 
         # ── 売り判定 ──────────────────────────────────────────────
         if combined <= sell_thr and pos_qty > 0:
-            pnl = round((close_price - pos_avg_cost) * pos_qty, 0)
-            cash += close_price * pos_qty
+            exit_price = _sell_fill_price(close_price, slip)
+            proceeds = exit_price * pos_qty
+            commission = proceeds * comm
+            pnl = round((exit_price - pos_avg_cost) * pos_qty - commission - pos_entry_commission, 0)
+            cash += proceeds - commission
             sim_trades.append(_make_trade(
                 symbol, pos_entry_date, pos_avg_cost,
-                dt_date, close_price, pos_qty, pnl, "SIGNAL_SELL",
+                dt_date, exit_price, pos_qty, pnl, "SIGNAL_SELL",
             ))
             pos_qty = 0
 
         # ── 買い判定 ──────────────────────────────────────────────
         if combined >= buy_thr and pos_qty == 0:
+            entry_price = _buy_fill_price(close_price, slip)
             budget = cash * max_pos_ratio
-            qty = int(budget / close_price / 100) * 100  # 100株単位
-            if qty >= 100 and close_price * qty <= cash:
-                cash -= close_price * qty
+            qty = int(budget / entry_price / 100) * 100  # 100株単位
+            entry_cost = entry_price * qty * (1 + comm)
+            if qty >= 100 and entry_cost <= cash:
+                cash -= entry_cost
                 pos_qty = qty
-                pos_avg_cost = close_price
+                pos_avg_cost = entry_price
+                pos_entry_commission = entry_price * qty * comm
                 pos_entry_date = dt_date
             else:
                 # 1単元（100株）の購入に必要な額が資金配分上限を超えている
@@ -184,11 +203,14 @@ def run_backtest(
     if pos_qty > 0:
         last_idx = full_df.index[mask][-1]
         last_close = float(full_df.loc[last_idx, "close"])
-        pnl = round((last_close - pos_avg_cost) * pos_qty, 0)
-        cash += last_close * pos_qty
+        exit_price = _sell_fill_price(last_close, slip)
+        proceeds = exit_price * pos_qty
+        commission = proceeds * comm
+        pnl = round((exit_price - pos_avg_cost) * pos_qty - commission - pos_entry_commission, 0)
+        cash += proceeds - commission
         sim_trades.append(_make_trade(
             symbol, pos_entry_date, pos_avg_cost,
-            last_idx.date(), last_close, pos_qty, pnl, "END_OF_PERIOD",
+            last_idx.date(), exit_price, pos_qty, pnl, "END_OF_PERIOD",
         ))
 
     # ── スコア分布診断（取引が出ない原因を数値で特定する）──────────
@@ -201,7 +223,13 @@ def run_backtest(
     total_return = round((cash - initial_capital) / initial_capital, 4)
     max_dd = _max_drawdown(equity_curve, initial_capital)
     sharpe = _sharpe_ratio(equity_curve)
+    sortino = _sortino_ratio(equity_curve)
     win_rate = round(sum(1 for p in pnls if p > 0) / len(pnls), 3) if pnls else 0.0
+    profit_factor = _profit_factor(pnls)
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    avg_win = round(sum(wins) / len(wins), 0) if wins else 0.0
+    avg_loss = round(sum(losses) / len(losses), 0) if losses else 0.0
 
     # ── DBに保存 ──────────────────────────────────────────────────
     with get_session() as session:
@@ -214,7 +242,13 @@ def run_backtest(
             total_return=total_return,
             max_drawdown=max_dd,
             sharpe_ratio=sharpe,
+            sortino_ratio=sortino,
             win_rate=win_rate,
+            profit_factor=profit_factor,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            slippage_pct=slip,
+            commission_pct=comm,
             trade_count=len(sim_trades),
             use_ml=1 if model is not None else 0,
             created_at=clock.now(),
@@ -229,12 +263,38 @@ def run_backtest(
             session.add(BacktestTradeRecord(run_id=run_id, **t))
         session.commit()
 
+    pf_str = f"{profit_factor:.2f}" if profit_factor is not None else "—"
     logger.info(
         f"バックテスト完了: {symbol} {start}~{end} "
         f"リターン={total_return:.1%} MDD={max_dd:.1%} "
-        f"シャープ={sharpe:.2f} 取引数={len(sim_trades)}"
+        f"シャープ={sharpe:.2f} ソルティノ={sortino:.2f} PF={pf_str} "
+        f"取引数={len(sim_trades)}（slip={slip:.3%} 手数料={comm:.3%}）"
     )
     return run_id
+
+
+def _buy_fill_price(price: float, slippage_pct: float) -> float:
+    """買い約定価格（スリッページ分だけ不利=高く約定する）。"""
+    return round(price * (1 + slippage_pct), 2)
+
+
+def _sell_fill_price(price: float, slippage_pct: float) -> float:
+    """売り約定価格（スリッページ分だけ不利=安く約定する）。"""
+    return round(price * (1 - slippage_pct), 2)
+
+
+def _profit_factor(pnls: list) -> Optional[float]:
+    """プロフィットファクター = 総利益 / 総損失（絶対値）。
+
+    勝つ確率(win_rate)が高くても、損失が利益より大きければ負ける。PFは
+    「1取引あたりの勝ち負けの大きさ」まで含めて収益性を測る（レビュー ML）。
+    損失が無い場合は比が定義できないため None を返す。
+    """
+    gross_profit = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p < 0))
+    if gross_loss == 0:
+        return None
+    return round(gross_profit / gross_loss, 3)
 
 
 def _log_score_diagnostics(
@@ -353,3 +413,32 @@ def _sharpe_ratio(equity_curve: list) -> float:
     mean_r = float(np.mean(rets))
     std_r = float(np.std(rets, ddof=1))
     return round(mean_r / std_r * math.sqrt(252), 3) if std_r > 0 else 0.0
+
+
+def _sortino_ratio(equity_curve: list) -> float:
+    """ソルティノレシオ（年率換算）。下方リスク（目標0未満のリターンの偏差）だけで割る。
+
+    シャープは上振れのブレもリスク扱いするが、ソルティノは損失方向のブレのみを
+    リスクとみなすため、利益方向のボラティリティを過度にペナルティしない（レビュー ML）。
+
+    下方偏差（downside deviation）は教科書的な定義（target=0未満の偏差の二乗を
+    「全期間N」で平均してから平方根を取る母分散的な計算）に従う。シャープ
+    （`np.std(rets, ddof=1)`=不偏標本標準偏差・負側のみで平均）とは意図的に異なる
+    計算方式であり、ddof不一致ではない（レビュー再指摘で確認済み）。
+    """
+    equities = [e["equity"] for e in equity_curve]
+    if len(equities) < 2:
+        return 0.0
+    rets = [
+        (equities[i] - equities[i - 1]) / equities[i - 1]
+        for i in range(1, len(equities))
+        if equities[i - 1] > 0
+    ]
+    if len(rets) < 2:
+        return 0.0
+    mean_r = float(np.mean(rets))
+    if not any(r < 0 for r in rets):
+        return 0.0  # 下方リスクが無い（負リターン日なし）場合は定義困難なため0
+    downside_sq = [min(r, 0.0) ** 2 for r in rets]  # 非負リターンは0として全期間Nに含める
+    downside_dev = float(np.sqrt(np.mean(downside_sq)))
+    return round(mean_r / downside_dev * math.sqrt(252), 3) if downside_dev > 0 else 0.0

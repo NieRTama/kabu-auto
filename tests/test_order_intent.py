@@ -139,6 +139,58 @@ class TestSemiLiveApprovalSharesIntent:
             trade = s.scalar(select(Trade).where(Trade.order_id == result["order_id"]))
             assert trade.intent_id == original_intent_id  # 同じ意図に紐づく
 
+    def test_failed_order_reverts_to_pending(self, isolated_db):
+        """発注拒否時は承認を PENDING へ戻して再試行可能にする（クラッシュ安全クレームの復路）"""
+        from sqlalchemy import select
+        with _make_om("semi_live", send_result={"Result": 1, "Message": "ng"}) as (om, client):
+            with patch.object(mod, "alert"):
+                om.buy("7203", 1000.0, 100, sector="Auto", rationale="r1")
+            with get_session() as s:
+                ap = s.scalar(select(OrderApproval).where(OrderApproval.symbol == "7203"))
+                approval_id = ap.id
+            result = om.approve_order(approval_id)
+        assert result["ok"] is False
+        with get_session() as s:
+            ap = s.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
+            assert ap.status == "PENDING"  # 再試行できる
+
+    def test_approving_state_blocks_reapproval(self, isolated_db):
+        """APPROVING のまま残った承認は再承認されない（クラッシュ後の二重発注防止）"""
+        from sqlalchemy import select
+        with _make_om("semi_live") as (om, client):
+            with patch.object(mod, "alert"):
+                om.buy("7203", 1000.0, 100, sector="Auto", rationale="r1")
+            with get_session() as s:
+                ap = s.scalar(select(OrderApproval).where(OrderApproval.symbol == "7203"))
+                approval_id = ap.id
+                ap.status = "APPROVING"  # クラッシュで中断した状態を模す
+                s.commit()
+            result = om.approve_order(approval_id)
+        assert result["ok"] is False
+        assert "処理済み" in result["reason"]
+        assert client.send_order.call_count == 0  # 再発注しない
+
+    def test_stuck_approving_alerted_on_startup(self, isolated_db):
+        """前回クラッシュでAPPROVINGのまま残った承認は、起動時(sync_on_startup)で検知される"""
+        from sqlalchemy import select
+        with _make_om("semi_live") as (om, client):
+            with patch.object(mod, "alert"):
+                om.buy("7203", 1000.0, 100, sector="Auto", rationale="r1")
+            with get_session() as s:
+                ap = s.scalar(select(OrderApproval).where(OrderApproval.symbol == "7203"))
+                ap.status = "APPROVING"
+                s.commit()
+            with patch.object(mod, "alert") as mock_alert:
+                om.sync_on_startup()
+            assert mock_alert.call_count == 1
+            assert "中断" in mock_alert.call_args[0][0]
+
+    def test_no_alert_when_no_stuck_approvals(self, isolated_db):
+        with _make_om("semi_live") as (om, client):
+            with patch.object(mod, "alert") as mock_alert:
+                om.sync_on_startup()
+            mock_alert.assert_not_called()
+
     def test_concurrent_double_approve_only_sends_one_order(self, isolated_db):
         """再レビュー: 同じ承認IDへの同時承認リクエスト（ダッシュボードの二重クリック等）が
         来ても、実APIへの発注は1回だけになること（修正前は両方が成功し二重発注した）。

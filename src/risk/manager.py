@@ -110,13 +110,83 @@ class RiskManager:
         """当日損失上限（円。0 で無効）。"""
         return self._conf.get("max_daily_loss", 0)
 
+    def unrealized_pnl(self, snapshot: Optional[RiskSnapshot] = None) -> float:
+        """保有建玉の含み損益（円・正=含み益 / 負=含み損）を返す。
+
+        最新終値が取得できない銘柄は損益0扱いで合計から除外する（avg_costで代用すると
+        常に0になり「データが無い」ことを隠してしまうため）。除外した銘柄は
+        `unpriced_symbols()` で検知できるようにし、health.py がこれを警告として
+        表面化する（合計ドローダウンが静かに過小評価されたままにならないようにするため。
+        レビュー再指摘 Critical）。
+        """
+        total, _unpriced = self._unrealized_pnl_with_gaps(snapshot)
+        return total
+
+    def unpriced_symbols(self, snapshot: Optional[RiskSnapshot] = None) -> list[str]:
+        """保有中だが最新終値が取得できず、含み損益の計算から除外されている銘柄一覧。"""
+        _total, unpriced = self._unrealized_pnl_with_gaps(snapshot)
+        return unpriced
+
+    def _unrealized_pnl_with_gaps(
+        self, snapshot: Optional[RiskSnapshot] = None
+    ) -> tuple[float, list[str]]:
+        if snapshot is not None:
+            positions = snapshot.positions
+            closes = snapshot.closes
+        else:
+            with get_session() as session:
+                positions = list(session.scalars(
+                    select(Position).where(Position.quantity > 0)
+                ).all())
+            closes = latest_closes([p.symbol for p in positions])
+        total = 0.0
+        unpriced: list[str] = []
+        for p in positions:
+            close = closes.get(p.symbol)
+            if close and p.avg_cost:
+                total += (close - p.avg_cost) * p.quantity
+            elif p.avg_cost:
+                unpriced.append(p.symbol)
+        return total, unpriced
+
+    def current_total_drawdown(self, snapshot: Optional[RiskSnapshot] = None) -> float:
+        """当日の合計ドローダウン（円・正の値）= 実現損失 + 現在の含み損。
+
+        実現損失だけでは「決済前の大きな含み損」を見逃すため（レビュー P0-5）、
+        保有建玉の含み損も合算した保守的なドローダウン指標を返す。含み益は
+        実現損失を相殺しない（含み益は確定していないため、安全側に倒す）。
+        """
+        unrealized = self.unrealized_pnl(snapshot)
+        return self._daily_loss_yen + max(0.0, -unrealized)
+
     def is_daily_loss_limit_reached(self) -> tuple[bool, str]:
-        """当日損失上限チェック。(over_limit, reason) を返す"""
+        """当日損失上限チェック（実現損失のみ）。(over_limit, reason) を返す"""
         limit = self._conf.get("max_daily_loss", 0)
         if limit <= 0:
             return False, ""
         if self._daily_loss_yen >= limit:
             return True, f"当日損失上限({limit:,.0f}円)に達しました"
+        return False, ""
+
+    def is_total_loss_limit_reached(
+        self, snapshot: Optional[RiskSnapshot] = None
+    ) -> tuple[bool, str]:
+        """合計ドローダウン（実現損失+含み損）が上限に達したか。(over_limit, reason) を返す。
+
+        含み損を含めることで、含み損を抱えたまま新規発注を続けてリスクを積み増す事故を
+        防ぐ（レビュー P0-5）。発注ゲート(can_place_order)とハルト判定(health)の双方で使う。
+        """
+        limit = self._conf.get("max_daily_loss", 0)
+        if limit <= 0:
+            return False, ""
+        total = self.current_total_drawdown(snapshot)
+        if total >= limit:
+            realized = self._daily_loss_yen
+            unrealized_loss = max(0.0, -self.unrealized_pnl(snapshot))
+            return True, (
+                f"当日合計ドローダウン上限({limit:,.0f}円)に達しました"
+                f"（実現損失{realized:,.0f}円 + 含み損{unrealized_loss:,.0f}円）"
+            )
         return False, ""
 
     def can_place_order(self, snapshot: Optional[RiskSnapshot] = None) -> tuple[bool, str]:
@@ -130,7 +200,9 @@ class RiskManager:
         limit = self._conf.get("daily_order_limit", 100)
         if self._daily_order_count >= limit:
             return False, f"1日の注文上限({limit})に達しました"
-        over, reason = self.is_daily_loss_limit_reached()
+        # 実現損失だけでなく含み損も合算した合計ドローダウンで新規発注を抑止する（P0-5）。
+        # 退出系(sell_market reason=...)はこのゲート自体をバイパスするため止まらない。
+        over, reason = self.is_total_loss_limit_reached(snapshot)
         if over:
             return False, reason
         # 状態不明・キャンセル失敗の注文が残っている間は新規発注を抑止する

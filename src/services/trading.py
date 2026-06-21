@@ -23,6 +23,7 @@ from src.core.alerts import alert
 from src.core.scheduler import TradingScheduler
 from src.data.database import Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
+from src.risk import liquidity
 from src.strategy import ml_model
 from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 
@@ -122,6 +123,7 @@ class TradingServices:
         self.model = model
         self.trading_conf = cfg.get_section("trading")
         self.data_conf = cfg.get_section("data")
+        self.liquidity_conf = cfg.get_section("liquidity")
 
     # ─── データ更新 ─────────────────────────────────────
     def data_update(self) -> None:
@@ -244,6 +246,11 @@ class TradingServices:
                         if not ok:
                             logger.info(f"買い見送り: {sym} - {reason}")
                             continue
+                        ok_liq, liq_reason = liquidity.check_liquidity(
+                            sym, df, self.liquidity_conf)
+                        if not ok_liq:
+                            logger.info(f"買い見送り: {liq_reason}")
+                            continue
                         qty = self.risk.calc_position_size(sym, close_price, cash)
                         if qty > 0:
                             self.order_mgr.buy(sym, close_price, qty, sector=sector,
@@ -300,6 +307,11 @@ class TradingServices:
         # ── BUY シグナル: 余力を確認して買う ──────────────────────
         if not buy_signals:
             return
+        # 大引け間際の新規BUYは薄商い・不利約定を招きやすいので見送る（P0-6。0で無効）
+        near_close_min = int(self.liquidity_conf.get("no_new_buy_minutes_before_close", 0) or 0)
+        if TradingScheduler.is_near_close(near_close_min):
+            logger.info(f"朝買い見送り: 大引け{near_close_min}分前以降のため新規BUYを抑止")
+            return
         try:
             wallet = self.client.get_wallet()
             cash = float(wallet.get("StockAccountWallet", 0))
@@ -317,6 +329,15 @@ class TradingServices:
                 ok, reason = self.risk.validate_buy(sig.symbol, float(price), cash, sector)
                 if not ok:
                     logger.info(f"朝買い見送り: {sig.symbol} - {reason}")
+                    continue
+                ok_liq, liq_reason = liquidity.check_liquidity(
+                    sig.symbol, load_ohlcv(sig.symbol), self.liquidity_conf)
+                if not ok_liq:
+                    logger.info(f"朝買い見送り: {liq_reason}")
+                    continue
+                ok_sp, sp_reason = liquidity.check_spread(board, self.liquidity_conf)
+                if not ok_sp:
+                    logger.info(f"朝買い見送り: {sig.symbol} - {sp_reason}")
                     continue
                 qty = self.risk.calc_position_size(sig.symbol, float(price), cash)
                 if qty <= 0:

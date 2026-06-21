@@ -70,6 +70,21 @@ strategy:
   tb_stop_mult: 2.0    # 損切りバリア   = 終値 ×(1 - mult × ボラティリティ)
   tb_max_holding: 10   # 時間バリア（最大保有日数、スイング想定）
   tb_vol_span: 20      # ボラティリティ推定の指数加重期間
+  # MLモデルのSHA256メタ情報が無い（旧モデル/初回移行）場合でもロードを許可するか。
+  # 既定 false = fail-closed（メタが無ければロード拒否。改ざん検知の迂回を防ぐため）。
+  # 既存モデルを一度だけ移行したい場合のみ true にし、移行後は false に戻すこと。
+  allow_unverified_model_load: false
+
+# ─── 流動性フィルタ（レビュー P0-6）──────────────────────────────────────────
+# 薄商い銘柄への新規BUYは「約定しない/不利約定/退出時に売り抜けられない」リスクが
+# 高いため、直近の平均売買代金などで足切りする。閾値0で無効（既定）。
+# 実運用では銘柄ユニバースに合わせて有効化することを推奨（例: 5000万円）。
+liquidity:
+  min_avg_turnover_yen: 0      # 直近平均売買代金の下限（円）。0で無効。例: 50000000
+  avg_window: 20               # 平均を取る日数
+  max_spread_ratio: 0          # 板スプレッド許容率((ask-bid)/mid)。live/dry_runのみ。0で無効。例: 0.01
+  # 大引け前のこの分数は新規BUYを見送る（薄商い・引け間際の不利約定回避）。0で無効。
+  no_new_buy_minutes_before_close: 0
 
 runtime:
   # 同一PCでの多重起動を検知した際の挙動（再レビュー対応）。
@@ -78,6 +93,12 @@ runtime:
   # 汚染リスクがあるため既定では中断する。意図的に複数のpaperインスタンスを
   # 同時起動したい場合のみ true にする。
   allow_multiple_paper_instances: false
+
+backtest:
+  # 理想約定を仮定したバックテストは実運用と乖離する。約定価格へ不利方向に加える
+  # 片道スリッページ率・片道手数料率を控除した「実運用に近い」成績を出す（レビュー ML）。
+  slippage_pct: 0.001    # 片道スリッページ率（0.1%）
+  commission_pct: 0.0    # 片道手数料率（ネット証券の現物は無料前提。必要に応じ設定）
 
 data:
   db_path: "data/kabu_auto.db"
@@ -96,6 +117,10 @@ dashboard:
   # PBKDF2ハッシュで保存される（初回はブラウザのログイン画面で作成）。
   auth_file: "data/auth.json"
   session_ttl_hours: 168  # ログインセッションの有効期間（時間。既定7日）
+  # Cookie に Secure 属性を付与するか。HTTPS（リバースプロキシ等）経由で運用する場合は
+  # true にする。素のHTTP（LAN内直アクセス）では Secure を付けるとCookieが送られず
+  # ログインできなくなるため false。既定 false。
+  cookie_secure: false
 
 alerts:
   # LINE Notify トークン（任意）。設定すると取引情報がLINEへ送信される。

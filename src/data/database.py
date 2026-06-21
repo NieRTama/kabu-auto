@@ -97,7 +97,7 @@ class OrderApproval(Base):
     price = Column(Float)                             # 指値（成行は0/None）
     quantity = Column(Integer, nullable=False)
     sector = Column(String(50))
-    status = Column(String(12), default="PENDING")   # PENDING / APPROVED / REJECTED
+    status = Column(String(12), default="PENDING")   # PENDING / APPROVING / APPROVED / REJECTED
     decided_at = Column(DateTime)
     resulting_order_id = Column(String(50))          # 承認実行で発注した注文ID
     intent_id = Column(Integer)                       # 紐づくOrderIntent.id（承認時にTradeへ引き継ぐ）
@@ -161,6 +161,10 @@ class ModelMetrics(Base):
     trained_at = Column(DateTime)
     cv_mean_accuracy = Column(Float)
     cv_std_accuracy = Column(Float)
+    # 精度(accuracy)だけでは収益性・確率の信頼性を測れないため、確率予測の質を測る指標も記録する
+    # （レビュー ML: AUC=順位付けの良さ / Brier=確率校正の良さ。小さいほど良い）。
+    cv_auc = Column(Float)
+    cv_brier = Column(Float)
     n_samples = Column(Integer)
     n_estimators = Column(Integer)
     feature_importances_json = Column(Text)  # JSON: {"feature": importance_score}
@@ -179,6 +183,13 @@ class BacktestRun(Base):
     max_drawdown = Column(Float)
     sharpe_ratio = Column(Float)
     win_rate = Column(Float)
+    # スリッページ・手数料控除後の収益性指標（レビュー ML/Backtest）。
+    profit_factor = Column(Float)   # 総利益 / 総損失（>1で利益超過。損失0ならNone）
+    sortino_ratio = Column(Float)   # 下方リスク調整後リターン（年率換算）
+    avg_win = Column(Float)         # 勝ちトレードの平均損益（円）
+    avg_loss = Column(Float)        # 負けトレードの平均損益（円・負値）
+    slippage_pct = Column(Float)    # 適用した片道スリッページ率
+    commission_pct = Column(Float)  # 適用した片道手数料率
     trade_count = Column(Integer)
     use_ml = Column(Integer, default=0)
     created_at = Column(DateTime)

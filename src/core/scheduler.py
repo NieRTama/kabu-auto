@@ -10,6 +10,7 @@ APSchedulerによるジョブスケジューラ
 - 土曜: メンテナンス時間帯の回避
 """
 from datetime import datetime
+from typing import Optional
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -119,3 +120,20 @@ class TradingScheduler:
         """土曜深夜のメンテナンス時間帯かチェック"""
         now = datetime.now(TZ)
         return now.weekday() == 5 and 1 <= now.hour <= 5
+
+    @staticmethod
+    def is_near_close(minutes: int, now: Optional[datetime] = None) -> bool:
+        """大引け(15:30)まで minutes 分以内かを返す（新規BUY見送り判定用。P0-6）。
+
+        minutes<=0 なら常に False（無効）。場が引けた後（15:30以降）も「新規は出さない」
+        意図に合わせて True を返す。平日かつ後場の引け間際のみ意味を持つ。
+        """
+        if minutes <= 0:
+            return False
+        now = now or datetime.now(TZ)
+        if now.weekday() >= 5:
+            return False
+        close_min = 15 * 60 + 30  # 15:30
+        now_min = now.hour * 60 + now.minute
+        # 後場（12:30以降）で、引けまで minutes 分以内、または引け後
+        return now_min >= close_min - minutes and now_min >= 12 * 60 + 30

@@ -32,10 +32,14 @@ def _patch_unresolved(count):
         yield
 
 
-def _risk(loss=0.0, limit=30000):
+def _risk(loss=0.0, limit=30000, unrealized=0.0, unpriced=None):
     r = MagicMock()
     r.current_daily_loss.return_value = loss
     r.daily_loss_limit.return_value = limit
+    r.unrealized_pnl.return_value = unrealized
+    # 合計ドローダウン = 実現損失 + 含み損（含み益は相殺しない）
+    r.current_total_drawdown.return_value = loss + max(0.0, -unrealized)
+    r.unpriced_symbols.return_value = unpriced or []
     return r
 
 
@@ -75,6 +79,40 @@ class TestCheckAnomalies:
             assert any(i["key"] == "halted" for i in items)
         finally:
             halt.release()
+
+    def test_total_drawdown_limit_includes_unrealized(self):
+        # 実現損失は上限未満だが、含み損を足すと上限到達 → total_drawdown_limit
+        with _patch_unresolved(0):
+            items = health.check_anomalies(
+                _risk(loss=10000, limit=30000, unrealized=-25000))
+        assert any(i["key"] == "total_drawdown_limit" and i["level"] == health.CRITICAL
+                   for i in items)
+        # 実現損失単独では上限未満なので daily_loss_limit は出ない
+        assert not any(i["key"] == "daily_loss_limit" for i in items)
+
+    def test_total_drawdown_warn_at_80pct(self):
+        with _patch_unresolved(0):
+            items = health.check_anomalies(
+                _risk(loss=0, limit=30000, unrealized=-24000))  # 80%
+        assert any(i["key"] == "total_drawdown_warn" for i in items)
+
+    def test_unpriced_positions_warns(self):
+        with _patch_unresolved(0):
+            items = health.check_anomalies(_risk(unpriced=["9999"]))
+        assert any(i["key"] == "unpriced_positions" and i["level"] == health.WARNING
+                   for i in items)
+
+    def test_no_unpriced_no_warning(self):
+        with _patch_unresolved(0):
+            items = health.check_anomalies(_risk(unpriced=[]))
+        assert not any(i["key"] == "unpriced_positions" for i in items)
+
+    def test_unrealized_profit_does_not_offset(self):
+        # 含み益は実現損失を相殺しない（安全側）
+        with _patch_unresolved(0):
+            items = health.check_anomalies(
+                _risk(loss=5000, limit=30000, unrealized=100000))
+        assert not any("total_drawdown" in i["key"] for i in items)
 
 
 class TestRunAndAlert:

@@ -25,16 +25,17 @@ from src.data.database import Fill, OrderApproval, OrderIntent, Position, Trade,
 from src.data.market_data import latest_closes
 from src.execution import lots
 from src.execution import order_status as st
+from src.execution.broker_gateway import BrokerGateway
 from src.risk.manager import RiskManager
 
 
 class OrderManager:
     def __init__(self, client: KabuClient, risk: RiskManager):
-        self._client = client
+        # ブローカーAPIとの境界（発注ペイロード構築・送信・取消・照会）はここに集約する（C3）。
+        # OrderManager 自身は client を直接保持しない（旧経路が誤って復活するのを防ぐ）。
+        self._broker = BrokerGateway(client)
         self._risk = risk
         self._conf = cfg.get_section("trading")
-        # パスワードは kabu_station セクションから取得する
-        self._kabu_password = cfg.get_section("kabu_station").get("password", "")
         self._mode = self._conf.get("mode", "paper")
         self._is_paper = tm.is_paper(self._mode)
         self._pending_orders: dict[str, threading.Timer] = {}
@@ -60,10 +61,14 @@ class OrderManager:
         APIに全く見つからない未解決注文は、約定済みを誤って取消扱いにしないよう
         CANCELLED ではなく UNKNOWN とし、人手確認を促す（UNKNOWN が残る間は発注抑止）。
         """
+        # semi_live承認中（APPROVING）にプロセスが落ちると、実発注が成立したか不明な
+        # まま承認レコードが取り残される。再承認はブロックされ続けるが、運用者が気付かなければ
+        # いつまでも放置されうるため、モードに関わらず起動時に検知してアラートする（レビュー再指摘 High）。
+        self._alert_stuck_approvals()
         if self._is_paper:
             return
         try:
-            api_orders = self._client.get_orders()
+            api_orders = self._broker.get_orders()
             by_id = {}
             for o in api_orders:
                 oid = o.get("ID") or o.get("OrderId")
@@ -160,7 +165,7 @@ class OrderManager:
         if not open_trades:
             return
         try:
-            orders = self._client.get_orders()
+            orders = self._broker.get_orders()
         except Exception as e:
             logger.warning(f"注文照合失敗（次回再試行）: {e}")
             return
@@ -185,7 +190,7 @@ class OrderManager:
         if self._is_paper or self._mode == tm.DRY_RUN:
             return {"ok": True, "drift": []}
         try:
-            broker_positions = self._client.get_positions()
+            broker_positions = self._broker.get_positions()
         except Exception as e:
             logger.warning(f"建玉照合失敗（次回再試行）: {e}")
             return {"ok": False, "drift": [], "error": str(e)}
@@ -226,7 +231,7 @@ class OrderManager:
     def _reconcile_trade(self, trade: Trade) -> None:
         """1件のTradeをAPI照会で取得し直して状態を収束させる（on_order_event用）。"""
         try:
-            orders = self._client.get_orders()
+            orders = self._broker.get_orders()
         except Exception as e:
             logger.warning(f"約定通知トリガのAPI照会失敗: {trade.order_id} {e}")
             return
@@ -369,24 +374,9 @@ class OrderManager:
         intent_id を渡すと既存のOrderIntent（semi_live承認時等）に紐付ける。
         省略時は `_record_trade()` が新規にOrderIntentを作る。
         """
-        order = {
-            "Password": self._kabu_password,
-            "Symbol": symbol,
-            "Exchange": 1,
-            "SecurityType": 1,  # 株式
-            "Side": "2",  # 買い
-            "CashMargin": 1,  # 現物
-            "DelivType": 2,  # 自動振替
-            "FundType": "  ",
-            "AccountType": 4,  # 特定口座
-            "Qty": quantity,
-            "Price": price,
-            "ExpireDay": 0,  # 当日中
-            "FrontOrderType": 20,  # 指値
-        }
         try:
-            result = self._client.send_order(order)
-            if result.get("Result") != 0:
+            result = self._broker.send_buy_limit(symbol, price, quantity)
+            if not self._broker.is_accepted(result):
                 logger.error(
                     f"買い注文拒否: {symbol} Result={result.get('Result')} "
                     f"Message={result.get('Message', '')}"
@@ -397,9 +387,8 @@ class OrderManager:
                     intent_id=intent_id, source=source, order_type="LIMIT",
                 )
                 return None
-            order_id = result.get("OrderId")
+            order_id = self._broker.order_id_of(result)
             if not order_id:
-                logger.error(f"買い注文: OrderId 未取得: {symbol} {result}")
                 return None
             self._risk.increment_order_count()
             self._record_trade(order_id, symbol, "BUY", quantity, price, sector=sector,
@@ -451,24 +440,9 @@ class OrderManager:
                    rationale: Optional[str] = None, *,
                    intent_id: Optional[int] = None, source: str = "manual") -> Optional[str]:
         """実APIへ指値売りを送る（live / semi_live承認実行の共通実体）。"""
-        order = {
-            "Password": self._kabu_password,
-            "Symbol": symbol,
-            "Exchange": 1,
-            "SecurityType": 1,
-            "Side": "1",  # 売り
-            "CashMargin": 1,
-            "DelivType": 2,
-            "FundType": "  ",
-            "AccountType": 4,
-            "Qty": quantity,
-            "Price": price,
-            "ExpireDay": 0,
-            "FrontOrderType": 20,
-        }
         try:
-            result = self._client.send_order(order)
-            if result.get("Result") != 0:
+            result = self._broker.send_sell_limit(symbol, price, quantity)
+            if not self._broker.is_accepted(result):
                 logger.error(
                     f"売り注文拒否: {symbol} Result={result.get('Result')} "
                     f"Message={result.get('Message', '')}"
@@ -479,9 +453,8 @@ class OrderManager:
                     intent_id=intent_id, source=source, order_type="LIMIT",
                 )
                 return None
-            order_id = result.get("OrderId")
+            order_id = self._broker.order_id_of(result)
             if not order_id:
-                logger.error(f"売り注文: OrderId 未取得: {symbol} {result}")
                 return None
             self._risk.increment_order_count()
             self._record_trade(order_id, symbol, "SELL", quantity, price, rationale=rationale,
@@ -573,24 +546,9 @@ class OrderManager:
                           intent_id: Optional[int] = None,
                           source: str = "manual") -> Optional[str]:
         """実APIへ成行売りを送る（live / semi_live退出・承認実行の共通実体）。"""
-        order = {
-            "Password": self._kabu_password,
-            "Symbol": symbol,
-            "Exchange": 1,
-            "SecurityType": 1,
-            "Side": "1",  # 売り
-            "CashMargin": 1,
-            "DelivType": 2,
-            "FundType": "  ",
-            "AccountType": 4,
-            "Qty": quantity,
-            "Price": 0,  # 成行は0
-            "ExpireDay": 0,
-            "FrontOrderType": 10,  # 成行
-        }
         try:
-            result = self._client.send_order(order)
-            if result.get("Result") != 0:
+            result = self._broker.send_sell_market(symbol, quantity)
+            if not self._broker.is_accepted(result):
                 logger.error(
                     f"成行売り注文拒否: {symbol} Result={result.get('Result')} "
                     f"Message={result.get('Message', '')}"
@@ -601,9 +559,8 @@ class OrderManager:
                     intent_id=intent_id, source=source, order_type="MARKET",
                 )
                 return None
-            order_id = result.get("OrderId")
+            order_id = self._broker.order_id_of(result)
             if not order_id:
-                logger.error(f"成行売り注文: OrderId 未取得: {symbol} {result}")
                 return None
             self._risk.increment_order_count()
             # 成行は発注時に価格未確定。price=0 で記録し、約定時に filled_price で確定する
@@ -639,39 +596,16 @@ class OrderManager:
             )
             return None
 
-        order = {
-            "Password": self._kabu_password,
-            "Symbol": symbol,
-            "Exchange": 1,
-            "SecurityType": 1,
-            "Side": "1",  # 売り
-            "CashMargin": 1,
-            "DelivType": 2,
-            "FundType": "  ",
-            "AccountType": 4,
-            "Qty": quantity,
-            "FrontOrderType": 30,  # 逆指値
-            "Price": 0,
-            "ExpireDay": 0,
-            "ReverseLimitOrder": {
-                "TriggerSec": 1,            # 発注銘柄でトリガー
-                "TriggerPrice": trigger_price,
-                "UnderOver": 1,             # 1=以下（下落してトリガー価格以下で発動）
-                "AfterHitOrderType": 1,     # 1=成行（発動後は確実な約定を優先）
-                "AfterHitPrice": 0,
-            },
-        }
         try:
-            result = self._client.send_order(order)
-            if result.get("Result") != 0:
+            result = self._broker.send_stop_loss_market(symbol, quantity, trigger_price)
+            if not self._broker.is_accepted(result):
                 logger.error(
                     f"逆指値ストップ注文拒否: {symbol} Result={result.get('Result')} "
                     f"Message={result.get('Message', '')}"
                 )
                 return None
-            order_id = result.get("OrderId")
+            order_id = self._broker.order_id_of(result)
             if not order_id:
-                logger.error(f"逆指値ストップ: OrderId 未取得: {symbol} {result}")
                 return None
             self._risk.increment_order_count()
             # ストップは発動まで生かすためタイムアウトキャンセルは設定しない
@@ -713,7 +647,7 @@ class OrderManager:
             return
 
         try:
-            broker_positions = self._client.get_positions()
+            broker_positions = self._broker.get_positions()
         except Exception as e:
             logger.critical(f"緊急決済ブロック: ブローカー /positions 取得失敗: {e}")
             alert(
@@ -793,6 +727,28 @@ class OrderManager:
             }
         state = halt.release()
         return {"ok": True, "reason": "", "state": state}
+
+    def _alert_stuck_approvals(self) -> None:
+        """前回終了時にクラッシュ等で APPROVING のまま残った承認があれば critical alert する。
+
+        APPROVING はクラッシュ安全のための一時状態であり、正常終了時は APPROVED/PENDING
+        いずれかに必ず遷移している（_approve_order_locked 参照）。これが残っている場合、
+        実発注が成立したか不明なまま再承認もブロックされ続けるため、人手で実口座と
+        突合する必要がある（レビュー再指摘 High）。
+        """
+        with get_session() as session:
+            stuck = session.scalars(
+                select(OrderApproval).where(OrderApproval.status == "APPROVING")
+            ).all()
+        if not stuck:
+            return
+        detail = ", ".join(f"id={a.id} {a.side} {a.symbol} {a.quantity}株" for a in stuck)
+        logger.critical(
+            f"前回終了時に承認処理が中断された注文が{len(stuck)}件残っています: {detail}。"
+            "実口座で発注が成立しているか確認してください"
+        )
+        alert("承認処理が中断されたまま残っています（要確認）",
+              f"{len(stuck)}件: {detail}。実口座と突合し、必要なら手動で記録を是正してください")
 
     def _count_unresolved(self) -> int:
         with get_session() as session:
@@ -929,6 +885,11 @@ class OrderManager:
             return self._approve_order_locked(approval_id)
 
     def _approve_order_locked(self, approval_id: int) -> dict:
+        # ── 1. 「承認中(APPROVING)」へ原子的にクレームする ─────────────────
+        # 実発注より「前」に状態を PENDING→APPROVING で確定コミットしておく。これにより
+        # 「実発注は成功したが APPROVED への更新前にプロセスが落ちた」場合でも、再起動後に
+        # PENDING のまま残って再承認＝二重発注、という事故を防ぐ（クラッシュ安全。レビュー P1-3）。
+        # APPROVING が残っていたら自動再試行はせず、人手での実口座照合に委ねる。
         with get_session() as session:
             ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
             if ap is None:
@@ -941,7 +902,10 @@ class OrderManager:
             quantity, sector = ap.quantity, ap.sector
             rationale = ap.rationale
             intent_id = ap.intent_id
+            ap.status = "APPROVING"
+            session.commit()
 
+        # ── 2. 実APIへ発注 ───────────────────────────────────────────────
         if side == "BUY":
             order_id = self._live_buy(symbol, price, quantity, sector, rationale,
                                       intent_id=intent_id, source="approval")
@@ -952,15 +916,38 @@ class OrderManager:
             order_id = self._live_sell(symbol, price, quantity, rationale,
                                        intent_id=intent_id, source="approval")
 
+        # ── 3a. 発注失敗（拒否=Result!=0 など実発注に至らなかったケース）─────
+        # _live_* は拒否時に REJECTED の Trade を記録して None を返す。発注は成立して
+        # いないため、承認を PENDING へ戻して再試行可能にする（従来挙動を維持）。
         if not order_id:
+            with get_session() as session:
+                ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
+                if ap is not None and ap.status == "APPROVING":
+                    ap.status = "PENDING"
+                    session.commit()
             return {"ok": False, "order_id": None,
                     "reason": "発注に失敗しました（拒否/接続エラー等）。承認は保留のままです"}
-        with get_session() as session:
-            ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
-            ap.status = "APPROVED"
-            ap.decided_at = clock.now()
-            ap.resulting_order_id = order_id
-            session.commit()
+
+        # ── 3b. 発注成功 → APPROVED 確定 ─────────────────────────────────
+        try:
+            with get_session() as session:
+                ap = session.scalar(select(OrderApproval).where(OrderApproval.id == approval_id))
+                ap.status = "APPROVED"
+                ap.decided_at = clock.now()
+                ap.resulting_order_id = order_id
+                session.commit()
+        except Exception as e:
+            # 発注は成立済みだが承認レコードの確定に失敗。APPROVING のまま残るため
+            # 再承認はされない（PENDINGに戻らない）。人手で order_id を照合する。
+            logger.critical(
+                f"[semi-live] 発注成功(order_id={order_id})後の承認確定に失敗: id={approval_id} {e}。"
+                "承認は APPROVING のまま残ります（再発注はされません）。実口座を確認してください"
+            )
+            alert("承認確定エラー（要確認）",
+                  f"id={approval_id} の発注({order_id})は成立しましたが記録更新に失敗しました。"
+                  "実口座と突合してください")
+            return {"ok": True, "order_id": order_id,
+                    "reason": "発注成立。ただし承認記録の確定に失敗（要確認）"}
         logger.warning(f"[semi-live] 承認・発注: id={approval_id} {side} {symbol} → {order_id}")
         return {"ok": True, "order_id": order_id, "reason": ""}
 
@@ -1025,7 +1012,7 @@ class OrderManager:
         """
         self._cancel_timeout_timer(order_id)
         try:
-            result = self._client.cancel_order(order_id)
+            result = self._broker.cancel(order_id)
         except Exception as e:
             logger.error(f"キャンセル失敗: {order_id} {e}")
             self._update_trade_status(order_id, st.CANCEL_FAILED)
@@ -1102,7 +1089,15 @@ class OrderManager:
             )
             session.add(trade)
             session.commit()
-            return trade.id
+            trade_id = trade.id
+        # 注文ライフサイクルの相関ログ（P2-5）。order_id / intent_id を相関IDとして
+        # 全モード共通のこの1点に必ず出すことで、発注→同期→約定→取消の追跡を
+        # `order_id=...` のgrepで辿れるようにする。
+        logger.info(
+            f"注文記録: {side} {symbol} {quantity}株 @{price:.0f} status={status} "
+            f"mode={self._mode} source={source} order_id={order_id} intent_id={intent_id}"
+        )
+        return trade_id
 
     @staticmethod
     def _initial_intent_status(trade_status: str) -> str:

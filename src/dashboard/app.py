@@ -11,6 +11,8 @@ import json
 import os
 import secrets
 import socket
+import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -42,6 +44,52 @@ _data_update_fn = None
 _emergency_token: Optional[str] = None
 _dashboard_token: Optional[str] = None
 _auth_required: bool = False
+# Cookie に Secure 属性を付けるか（HTTPS 運用時に true。既定は素のHTTP運用のため false）。
+_cookie_secure: bool = False
+
+# ─── ログイン試行のレート制限（総当たり対策。LAN公開時の備え）──────────────
+# 既知の制約（レビュー再指摘）:
+#  - インメモリ実装のため、プロセス再起動でカウントがリセットされ、複数プロセス/
+#    マルチワーカー構成では各プロセスが別カウントを持つ（共有しない）。単一プロセス
+#    常駐を前提とする本ツールの運用形態では許容している。
+#  - IPは request.client.host のみを見る。リバースプロキシ配下に置く場合、
+#    プロキシ自身のIPに集約されて「全クライアントが同一IPに見える」誤ブロック、
+#    または X-Forwarded-For 偽装によるバイパスが起こりうる。プロキシ配下で運用する
+#    場合は、信頼できるプロキシからの X-Forwarded-For のみを使うようこの関数を
+#    拡張すること（未信頼ヘッダをそのまま信用すると偽装されるため、安易な追加は避ける）。
+LOGIN_MAX_ATTEMPTS = 5      # ウィンドウ内に許す失敗回数
+LOGIN_WINDOW_SEC = 300      # 失敗カウントのウィンドウ（秒）
+_login_failures: dict = {}  # ip -> [失敗時刻, ...]
+_login_lock = threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _login_rate_limited(ip: str) -> bool:
+    """直近ウィンドウ内の失敗回数が上限以上ならTrue（=拒否）。"""
+    now = time.monotonic()
+    with _login_lock:
+        recent = [t for t in _login_failures.get(ip, []) if now - t < LOGIN_WINDOW_SEC]
+        _login_failures[ip] = recent
+        return len(recent) >= LOGIN_MAX_ATTEMPTS
+
+
+def _record_login_failure(ip: str) -> None:
+    with _login_lock:
+        _login_failures.setdefault(ip, []).append(time.monotonic())
+
+
+def _reset_login_failures(ip: str) -> None:
+    with _login_lock:
+        _login_failures.pop(ip, None)
+
+
+def _set_token_cookie(response) -> None:
+    """API トークン Cookie（kabu_token）を発行する（HttpOnly/SameSite=strict、必要に応じ Secure）。"""
+    response.set_cookie("kabu_token", _dashboard_token, httponly=True,
+                        samesite="strict", secure=_cookie_secure)
 _system_status = {
     "running": False,
     "ws_connected": False,
@@ -77,8 +125,9 @@ def init_auth() -> None:
 
     トークンはログには出さず、コンソールに一度だけアクセスURLとして表示する。
     """
-    global _dashboard_token, _auth_required
+    global _dashboard_token, _auth_required, _cookie_secure
     dash = cfg.get_section("dashboard")
+    _cookie_secure = bool(dash.get("cookie_secure", False))
     # ログイン認証情報（Authファイル）を読み込む
     auth_store.load(
         dash.get("auth_file", "data/auth.json"),
@@ -163,16 +212,28 @@ async def _auth_middleware(request: Request, call_next):
     session_token = request.cookies.get("kabu_session")
     authorized = auth_store.validate_session(session_token) or _has_valid_token(request)
 
+    accepts_html = "text/html" in request.headers.get("accept", "")
     if not authorized:
-        accepts_html = "text/html" in request.headers.get("accept", "")
         if accepts_html and not path.startswith("/api/"):
             return RedirectResponse(url="/login", status_code=303)
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
+    has_query_token = bool(request.query_params.get("token"))
+    # ブラウザで ?token= 付きURLを直開きした場合、トークンを Cookie へ移し、URLから
+    # トークンを取り除いたクリーンなURLへ即リダイレクトする。これによりブラウザ履歴・
+    # Referer・スクリーンショット・プロキシログにトークンが残るのを防ぐ（レビュー C4）。
+    if has_query_token and accepts_html and request.method == "GET" \
+            and not path.startswith("/api/"):
+        clean = request.url.remove_query_params("token")
+        target = clean.path + (f"?{clean.query}" if clean.query else "")
+        redirect = RedirectResponse(url=target, status_code=303)
+        _set_token_cookie(redirect)
+        return redirect
+
     response = await call_next(request)
-    if request.query_params.get("token"):
-        # ブラウザでトークン付きURLを直開きした場合、以後の fetch 用に Cookie へ保存する
-        response.set_cookie("kabu_token", _dashboard_token, httponly=True, samesite="strict")
+    if has_query_token:
+        # API/XHR で ?token= が来た場合は以後の fetch 用に Cookie へ保存する
+        _set_token_cookie(response)
     return response
 
 
@@ -277,7 +338,8 @@ class CredentialsRequest(BaseModel):
 
 def _issue_session(response: JSONResponse) -> JSONResponse:
     token = auth_store.create_session()
-    response.set_cookie("kabu_session", token, httponly=True, samesite="strict")
+    response.set_cookie("kabu_session", token, httponly=True,
+                        samesite="strict", secure=_cookie_secure)
     return response
 
 
@@ -292,12 +354,23 @@ async def setup_credentials(req: CredentialsRequest):
 
 
 @app.post("/api/login")
-async def login(req: CredentialsRequest):
-    """ユーザーID・パスワードでログインする。"""
+async def login(req: CredentialsRequest, request: Request):
+    """ユーザーID・パスワードでログインする。
+
+    総当たり対策として、同一IPからの連続失敗が一定回数を超えたら一時的に拒否する（429）。
+    """
     if not auth_store.is_configured():
         raise HTTPException(status_code=400, detail="初期設定が未完了です")
+    ip = _client_ip(request)
+    if _login_rate_limited(ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"ログイン試行が多すぎます。{LOGIN_WINDOW_SEC // 60}分ほど待って再試行してください",
+        )
     if not auth_store.verify(req.username, req.password):
+        _record_login_failure(ip)
         raise HTTPException(status_code=401, detail="ユーザーIDまたはパスワードが違います")
+    _reset_login_failures(ip)
     return _issue_session(JSONResponse({"status": "ok", "message": "ログインしました"}))
 
 

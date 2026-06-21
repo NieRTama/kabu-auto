@@ -67,32 +67,41 @@ def _make_om(mode: str = "paper", limit_reached: bool = False):
 
 
 class TestPasswordSource:
-    def test_buy_uses_kabu_station_password(self):
-        """ライブ BUY 注文のパスワードが kabu_station セクションから取得されること"""
-        with _make_om(mode="live") as (om, client, risk, _):
-            om.buy("7203", 1000.0, 100)
+    """パスワード取得は config.get_api_password() に一元化された（レビュー Security）。
 
-        sent = client.send_order.call_args[0][0]
-        assert sent["Password"] == "secret_kabu_pw", (
-            f"パスワードが kabu_station セクションから取得されていない: {sent['Password']!r}"
-        )
+    BrokerGateway は発注ペイロード組み立て時にこのヘルパからパスワードを取得する。
+    """
 
-    def test_sell_uses_kabu_station_password(self):
-        """ライブ SELL 注文のパスワードが kabu_station セクションから取得されること"""
-        with _make_om(mode="live") as (om, client, risk, _):
-            om.sell("7203", 1100.0, 100)
+    def test_get_api_password_prefers_env(self, monkeypatch):
+        """環境変数 KABU_API_PASSWORD を最優先する"""
+        import src.core.config as config
+        monkeypatch.setenv("KABU_API_PASSWORD", "env_pw")
+        assert config.get_api_password() == "env_pw"
 
+    def test_get_api_password_falls_back_to_kabu_station(self, monkeypatch):
+        """環境変数が無ければ config の kabu_station.password を使う"""
+        import src.core.config as config
+        monkeypatch.delenv("KABU_API_PASSWORD", raising=False)
+        monkeypatch.setattr(config, "_config", {"kabu_station": {"password": "cfg_pw"}})
+        assert config.get_api_password() == "cfg_pw"
+
+    def test_get_api_password_not_from_trading_section(self, monkeypatch):
+        """trading セクション（不正な参照先）からは取得しない"""
+        import src.core.config as config
+        monkeypatch.delenv("KABU_API_PASSWORD", raising=False)
+        monkeypatch.setattr(config, "_config",
+                            {"trading": {"password": "wrong"}, "kabu_station": {}})
+        assert config.get_api_password() == ""
+
+    def test_buy_order_embeds_password_from_helper(self, monkeypatch):
+        """BrokerGateway の発注ペイロードに get_api_password() の値が入ること"""
+        import src.execution.broker_gateway as bg
+        monkeypatch.setattr(bg.cfg, "get_api_password", lambda: "secret_kabu_pw")
+        client = MagicMock()
+        client.send_order.return_value = {"Result": 0, "OrderId": "X"}
+        bg.BrokerGateway(client).send_buy_limit("7203", 1000.0, 100)
         sent = client.send_order.call_args[0][0]
         assert sent["Password"] == "secret_kabu_pw"
-
-    def test_password_not_from_trading_section(self):
-        """パスワードが trading セクション（不正な参照先）から取得されていないこと"""
-        with _make_om(mode="live") as (om, client, risk, _):
-            om.buy("7203", 1000.0, 100)
-
-        sent = client.send_order.call_args[0][0]
-        # trading セクションには "password" キーがないので空文字になるはずがない
-        assert sent["Password"] != "", "trading セクションから空パスワードを取得している"
 
 
 # ─── Critical #2: can_place_order タプルバグ ────────────────────────────

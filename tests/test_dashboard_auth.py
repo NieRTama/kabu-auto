@@ -75,6 +75,68 @@ class TestDashboardAuth:
         assert second.status_code == 200
 
 
+class TestQueryTokenHardening:
+    def test_html_query_token_redirects_to_clean_url(self, auth_enabled):
+        """?token= でHTMLを直開きすると、トークンを消したURLへ303リダイレクトしCookieを払い出す（C4）"""
+        client = TestClient(dash.app)
+        r = client.get(
+            f"/?token={auth_enabled}",
+            headers={"accept": "text/html"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        # リダイレクト先のURLにトークンが含まれない
+        assert "token=" not in r.headers["location"]
+        # 以後の fetch 用に Cookie が払い出される
+        assert "kabu_token" in r.cookies
+
+    def test_clean_redirect_preserves_other_query_params(self, auth_enabled):
+        client = TestClient(dash.app)
+        r = client.get(
+            f"/?tab=trades&token={auth_enabled}",
+            headers={"accept": "text/html"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        loc = r.headers["location"]
+        assert "tab=trades" in loc
+        assert "token=" not in loc
+
+
+class TestLoginRateLimit:
+    def test_login_blocks_after_repeated_failures(self, auth_enabled):
+        dash._login_failures.clear()
+        setup_client = TestClient(dash.app)
+        setup_client.post("/api/setup", json={"username": "trader", "password": "s3cretpw!"})
+        client = TestClient(dash.app)
+        try:
+            for _ in range(dash.LOGIN_MAX_ATTEMPTS):
+                bad = client.post("/api/login", json={"username": "trader", "password": "x"})
+                assert bad.status_code == 401
+            # 上限到達後は正しいパスワードでも一時的に429で拒否される
+            blocked = client.post("/api/login",
+                                  json={"username": "trader", "password": "s3cretpw!"})
+            assert blocked.status_code == 429
+        finally:
+            dash._login_failures.clear()
+
+    def test_successful_login_resets_failures(self, auth_enabled):
+        dash._login_failures.clear()
+        setup_client = TestClient(dash.app)
+        setup_client.post("/api/setup", json={"username": "trader", "password": "s3cretpw!"})
+        client = TestClient(dash.app)
+        try:
+            for _ in range(dash.LOGIN_MAX_ATTEMPTS - 1):
+                client.post("/api/login", json={"username": "trader", "password": "x"})
+            good = client.post("/api/login",
+                               json={"username": "trader", "password": "s3cretpw!"})
+            assert good.status_code == 200
+            # 成功で失敗カウントがリセットされ、再び試行できる
+            assert not dash._login_failures.get("testclient")
+        finally:
+            dash._login_failures.clear()
+
+
 class TestAuthDisabledByDefault:
     def test_localhost_without_token_disables_auth(self):
         """host=127.0.0.1 かつトークン未設定なら認証なし（ローカル専用の後方互換）"""

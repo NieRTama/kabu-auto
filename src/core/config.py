@@ -45,3 +45,22 @@ def get() -> dict:
 
 def get_section(section: str) -> dict:
     return get().get(section, {})
+
+
+def get_api_password() -> str:
+    """kabuステーションAPIパスワードを取得する唯一の入口（レビュー Security）。
+
+    環境変数 KABU_API_PASSWORD を最優先し、無ければ config.yaml の値を使う
+    （平文を config に残さない運用を推奨）。値そのものは絶対にログへ出さない。
+    """
+    return os.environ.get("KABU_API_PASSWORD") or get_section("kabu_station").get("password", "")
+
+
+def require_api_password() -> str:
+    """APIパスワードを取得し、未設定なら例外を投げる（live/semi_live の発注前チェック用）。"""
+    pw = get_api_password()
+    if not pw:
+        raise RuntimeError(
+            "kabuステーションAPIパスワードが未設定です。.env の KABU_API_PASSWORD を設定してください"
+        )
+    return pw

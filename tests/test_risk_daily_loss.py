@@ -116,6 +116,57 @@ class TestCanPlaceOrderWithLossLimit:
             assert reason == ""
 
 
+class TestTotalDrawdownLimit:
+    def _pos(self, symbol, qty, avg_cost):
+        p = MagicMock()
+        p.symbol = symbol
+        p.quantity = qty
+        p.avg_cost = avg_cost
+        return p
+
+    def test_unrealized_loss_pushes_over_limit(self):
+        """実現損失が上限未満でも、含み損を足すと合計ドローダウン上限で発注が止まる"""
+        with _make_risk(max_daily_loss=30000) as risk:
+            risk.record_loss(-10000)
+            snap = mod.RiskSnapshot(
+                positions=[self._pos("7203", 100, 3000)],
+                closes={"7203": 2700},  # 含み損 = (2700-3000)*100 = -30000
+            )
+            over, reason = risk.is_total_loss_limit_reached(snap)
+            assert over is True
+            assert "合計ドローダウン" in reason
+            ok, block = risk.can_place_order(snap)
+            assert ok is False
+
+    def test_unrealized_profit_does_not_offset_realized(self):
+        """含み益は実現損失を相殺しない（安全側）"""
+        with _make_risk(max_daily_loss=30000) as risk:
+            risk.record_loss(-5000)
+            snap = mod.RiskSnapshot(
+                positions=[self._pos("7203", 100, 3000)],
+                closes={"7203": 4000},  # 含み益 +100000
+            )
+            over, _ = risk.is_total_loss_limit_reached(snap)
+            assert over is False
+
+    def test_unpriced_symbol_excluded_and_flagged(self):
+        """終値が取れない銘柄は合計から除外され、unpriced_symbols() で検知できる"""
+        with _make_risk(max_daily_loss=30000) as risk:
+            snap = mod.RiskSnapshot(
+                positions=[self._pos("9999", 100, 3000)],
+                closes={},  # 終値取得不可
+            )
+            assert risk.unrealized_pnl(snap) == 0.0
+            assert risk.unpriced_symbols(snap) == ["9999"]
+
+    def test_no_positions_equals_realized(self):
+        """建玉が無ければ合計ドローダウン = 実現損失"""
+        with _make_risk(max_daily_loss=30000) as risk:
+            risk.record_loss(-30000)
+            snap = mod.RiskSnapshot(positions=[], closes={})
+            assert risk.current_total_drawdown(snap) == 30000.0
+
+
 class TestResetDailyCounters:
     def test_reset_clears_loss(self):
         """reset_daily_counters() は _daily_loss_yen をリセットする"""

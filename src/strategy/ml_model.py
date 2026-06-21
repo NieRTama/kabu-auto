@@ -6,6 +6,7 @@
 ラベリングはトリプルバリア法（labeling.py）を用い、ラベル期間の重なりに対する
 サンプル一意性重みを付与してルックアヘッド・過学習を抑制する。
 """
+import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -15,14 +16,62 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from loguru import logger
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, brier_score_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
 from src.core import clock
+from src.core import config as cfg
 from src.strategy.indicators import FEATURE_COLS, build_features
 from src.strategy.labeling import build_training_set
 
 MODEL_PATH = Path("models/lgb_model.pkl")
+
+
+def _meta_path() -> Path:
+    """モデルのメタ情報（SHA256ハッシュ・学習日時等）のサイドカーパス。"""
+    return MODEL_PATH.with_suffix(".meta.json")
+
+
+def _sha256_file(path: Path) -> str:
+    """ファイルのSHA256を計算する（大きいモデルでもメモリを食わないよう逐次読み）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_model_meta(n_samples: int, n_estimators: int,
+                      cv_mean: float, cv_std: float) -> None:
+    """保存済みモデルのSHA256とメタ情報をサイドカーJSONに書き出す。
+
+    pickle はロード時に任意コードを実行しうるため、配置後にハッシュを記録し、
+    次回ロード時に改ざん・破損を検出できるようにする（レビュー Security）。
+    """
+    meta = {
+        "sha256": _sha256_file(MODEL_PATH),
+        "trained_at": clock.now().isoformat(),
+        "n_samples": n_samples,
+        "n_estimators": n_estimators,
+        "cv_mean_accuracy": round(cv_mean, 4),
+        "cv_std_accuracy": round(cv_std, 4),
+        "features": list(FEATURE_COLS),
+        "lightgbm_version": lgb.__version__,
+    }
+    _meta_path().write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"MLモデルメタ保存: sha256={meta['sha256'][:12]}… trained_at={meta['trained_at']}")
+
+
+def _read_model_meta() -> Optional[dict]:
+    path = _meta_path()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"モデルメタ読み込み失敗: {e}")
+        return None
 
 
 def train(df: pd.DataFrame, trigger: Optional[str] = None,
@@ -86,6 +135,8 @@ def _fit(X: pd.DataFrame, y: pd.Series, weights: np.ndarray,
 
     tscv = TimeSeriesSplit(n_splits=5)
     scores = []
+    auc_scores = []
+    brier_scores = []
     best_n_list = []
     for train_idx, val_idx in tscv.split(X):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -100,12 +151,25 @@ def _fit(X: pd.DataFrame, y: pd.Series, weights: np.ndarray,
         preds = m.predict(X_val)
         scores.append(accuracy_score(y_val, preds))
         best_n_list.append(m.best_iteration_ or 200)
+        # 精度だけでは収益性・確率の信頼性を測れないため、確率予測の質も評価する
+        # （AUC=順位付けの良さ / Brier=確率校正の良さ。レビュー ML）。
+        # 検証foldが片側クラスのみだとAUCは未定義になるためスキップ。
+        proba = m.predict_proba(X_val)[:, 1]
+        if len(np.unique(y_val)) > 1:
+            auc_scores.append(roc_auc_score(y_val, proba))
+        brier_scores.append(brier_score_loss(y_val, proba))
 
     best_n_estimators = int(np.mean(best_n_list))
     cv_mean = float(np.mean(scores))
     cv_std = float(np.std(scores))
+    cv_auc = float(np.mean(auc_scores)) if auc_scores else None
+    cv_brier = float(np.mean(brier_scores)) if brier_scores else None
 
-    logger.info(f"MLモデルCV精度: {cv_mean:.3f} (+/-{cv_std:.3f})")
+    auc_str = f"{cv_auc:.3f}" if cv_auc is not None else "—"
+    brier_str = f"{cv_brier:.3f}" if cv_brier is not None else "—"
+    logger.info(
+        f"MLモデルCV精度: {cv_mean:.3f} (+/-{cv_std:.3f}) AUC={auc_str} Brier={brier_str}"
+    )
 
     # CV後に全データで最終モデルを学習（サンプル重み込み）
     model = lgb.LGBMClassifier(n_estimators=best_n_estimators, learning_rate=0.05,
@@ -117,11 +181,16 @@ def _fit(X: pd.DataFrame, y: pd.Series, weights: np.ndarray,
         MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(MODEL_PATH, "wb") as f:
             pickle.dump(model, f)
+        _write_model_meta(
+            n_samples=len(X), n_estimators=best_n_estimators,
+            cv_mean=cv_mean, cv_std=cv_std)
 
     if trigger is not None:
         _save_metrics(
             cv_mean=cv_mean,
             cv_std=cv_std,
+            cv_auc=cv_auc,
+            cv_brier=cv_brier,
             n_samples=len(X),
             n_estimators=best_n_estimators,
             feature_importances=dict(zip(FEATURE_COLS, model.feature_importances_.tolist())),
@@ -134,6 +203,7 @@ def _fit(X: pd.DataFrame, y: pd.Series, weights: np.ndarray,
 def _save_metrics(
     cv_mean: float, cv_std: float, n_samples: int,
     n_estimators: int, feature_importances: dict, trigger: str,
+    cv_auc: Optional[float] = None, cv_brier: Optional[float] = None,
 ) -> None:
     from src.data.database import ModelMetrics, get_session
     with get_session() as session:
@@ -141,6 +211,8 @@ def _save_metrics(
             trained_at=clock.now(),
             cv_mean_accuracy=round(cv_mean, 4),
             cv_std_accuracy=round(cv_std, 4),
+            cv_auc=round(cv_auc, 4) if cv_auc is not None else None,
+            cv_brier=round(cv_brier, 4) if cv_brier is not None else None,
             n_samples=n_samples,
             n_estimators=n_estimators,
             feature_importances_json=json.dumps(feature_importances),
@@ -151,10 +223,73 @@ def _save_metrics(
 
 
 def load() -> Optional[lgb.LGBMClassifier]:
+    """学習済みモデルを読み込む。
+
+    pickle.load は任意コード実行のリスクがあるため、ロード前にファイルのSHA256を
+    メタ情報（_meta_path）と照合する（レビュー Security）。
+    - メタのハッシュと不一致 → 改ざん/破損とみなしロード中止（fail-closed）。
+    - メタが無い旧モデル → 既定では fail-closed でロードを拒否する（攻撃者がモデルを
+      改ざんし、メタファイルも削除すれば検証自体を無効化できてしまうため。レビュー
+      再指摘 Critical）。`strategy.allow_unverified_model_load: true` を明示設定した
+      場合のみ、警告のうえロードして現在のハッシュをメタに記録する（移行用の救済弁）。
+    起動時にハッシュと学習日時をログへ出す（監査・運用可視化）。
+    """
     if not MODEL_PATH.exists():
         return None
+    try:
+        digest = _sha256_file(MODEL_PATH)
+    except OSError as e:
+        logger.error(f"MLモデル読み込み失敗（ハッシュ計算）: {e}")
+        return None
+
+    from src.core.alerts import alert
+    meta = _read_model_meta()
+    if meta and meta.get("sha256"):
+        if meta["sha256"] != digest:
+            logger.critical(
+                "MLモデルのSHA256が記録と不一致です（改ざん/破損の可能性）。"
+                f"ロードを中止しました。期待={meta['sha256'][:12]}… 実際={digest[:12]}…"
+            )
+            alert("MLモデル検証失敗",
+                  "models/lgb_model.pkl のSHA256が記録と一致しません。ロードを中止しました。")
+            return None
+        logger.info(
+            f"MLモデルロード: sha256={digest[:12]}… "
+            f"trained_at={meta.get('trained_at', '不明')} "
+            f"CV精度={meta.get('cv_mean_accuracy', '?')}"
+        )
+    else:
+        allow_unverified = bool(
+            cfg.get_section("strategy").get("allow_unverified_model_load", False))
+        if not allow_unverified:
+            logger.critical(
+                "MLモデルのメタ情報（SHA256記録）がありません。改ざん検知できないため"
+                "ロードを拒否しました（fail-closed）。意図的な初回移行であれば "
+                "config.yaml の strategy.allow_unverified_model_load: true を設定して"
+                "ください（設定後はこのモデルのハッシュが正として記録されます）"
+            )
+            alert("MLモデル検証失敗（メタ無し）",
+                  "models/lgb_model.pkl にハッシュ記録がなく、ロードを拒否しました。"
+                  "意図的な移行なら strategy.allow_unverified_model_load を設定してください")
+            return None
+        logger.warning(
+            f"MLモデルのメタ情報がありません（hash未検証でロード）。sha256={digest[:12]}… を記録します"
+        )
+
     with open(MODEL_PATH, "rb") as f:
-        return pickle.load(f)
+        model = pickle.load(f)
+
+    # 旧モデル（メタ無し・明示許可あり）は今回のハッシュを記録し、次回から検証対象にする
+    if not meta:
+        try:
+            _meta_path().write_text(
+                json.dumps({"sha256": digest, "trained_at": None,
+                            "note": "legacy model; hash recorded at first load"},
+                           ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"モデルメタの記録に失敗: {e}")
+    return model
 
 
 def predict_proba(model: lgb.LGBMClassifier, df: pd.DataFrame) -> float:
