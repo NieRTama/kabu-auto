@@ -3,6 +3,7 @@ APSchedulerによるジョブスケジューラ
 - 毎朝8:25: 日次リスクカウンタリセット
 - 毎朝8:30: APIトークン更新
 - 毎日16:00: データ更新
+- 毎日16:05: ニュース取得・センチメント採点（data_update後・signal_scan前）
 - 毎日16:20: シグナルスキャン（data_updateの完了を待つため16:00より後ろに設定）
 - 毎日17:00: DBバックアップ
 - 毎週日曜2:00: MLモデル再学習（週次）
@@ -64,6 +65,14 @@ class TradingScheduler:
                 day_of_week="mon-fri",
                 hour="9-15", minute="*/5",
                 id="stop_loss_check",
+            )
+        if "news_update" in cb:
+            # data_update（16:00）後・signal_scan（16:20）前にニュースを取得・採点する。
+            # signal_scan が当日分のニュース特徴量を使えるよう、必ずこの間の時刻にすること。
+            self._scheduler.add_job(
+                cb["news_update"], "cron",
+                day_of_week="mon-fri",
+                hour=16, minute=5, id="news_update",
             )
         if "signal_scan" in cb:
             # 後場終了後、当日分のOHLCV更新（data_update 16:00）が完了してから

@@ -171,6 +171,7 @@ def main() -> None:
     scheduler.register("risk_reset", risk.reset_daily_counters)
     scheduler.register("token_refresh", token_refresh)
     scheduler.register("data_update", services.data_update)
+    scheduler.register("news_update", services.news_update)
     scheduler.register("db_backup", db_backup)
     scheduler.register("ml_retrain", services.ml_retrain)
     scheduler.register("stop_loss_check", services.stop_loss_check)

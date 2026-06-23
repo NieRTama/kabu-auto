@@ -152,7 +152,41 @@ class Signal(Base):
     rule_score = Column(Float)
     ml_score = Column(Float)
     combined_score = Column(Float)
-    action = Column(String(10))  # "BUY", "SELL", "HOLD"
+    action = Column(String(10))  # "BUY", "SELL", "HOLD"（本番＝価格のみスコアから決定）
+    # ─── シャドーA/B用（ニュース特徴量＋アンサンブルの「もし使っていたら」スコア）──
+    # 本番売買には一切影響しない（action は上の本番スコアに固定）。前進収集で
+    # 本番 vs シャドーのヒット率を比較し、優位なら use_news_features を ON にする。
+    # すべて nullable のため _migrate_add_missing_columns が既存DBへ自動追加する。
+    ml_score_shadow = Column(Float)        # ニュース＋アンサンブルのMLスコア
+    combined_score_shadow = Column(Float)  # シャドーの合成スコア
+    action_shadow = Column(String(10))     # シャドーが出したであろうアクション（比較用・非執行）
+
+
+class NewsSentiment(Base):
+    """ニュースから採点した日次センチメント（マクロ／個別銘柄）。
+
+    前進収集専用（過去履歴のバックフィルはしない）。`news_update`（16:05）が当日分を
+    upsert する。リーク防止のため、`date` は 16:00 JST カットオフで「そのニュースが
+    遅くとも当日大引け後に知り得た取引日」へ正規化済みの日付を入れる
+    （16:00以降公開のニュースは翌営業日として保存する。news_features.py 参照）。
+
+    scope="macro" のときは symbol="_MACRO_"（市場全体の経済ニュース）。
+    scope="symbol" のときは symbol=銘柄コード（個別ニュース）。
+    """
+    __tablename__ = "news_sentiment"
+    id = Column(Integer, primary_key=True)
+    scope = Column(String(8), nullable=False)   # "macro" / "symbol"
+    symbol = Column(String(10), nullable=False)  # macro は "_MACRO_"
+    date = Column(Date, nullable=False)          # 16:00カットオフ正規化後の取引日
+    sentiment_score = Column(Float)              # [-1.0, +1.0]（記事の平均）
+    article_count = Column(Integer, default=0)   # 集計に使った記事数
+    event_flags = Column(String(100))            # "boj,cpi" 等のイベント種別（任意）
+    source = Column(String(20))                  # "rss" / "yfinance" 等
+    created_at = Column(DateTime, default=clock.now)
+
+    __table_args__ = (
+        Index("ix_news_scope_symbol_date", "scope", "symbol", "date", unique=True),
+    )
 
 
 class ModelMetrics(Base):

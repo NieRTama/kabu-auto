@@ -135,6 +135,22 @@ class TradingServices:
             except Exception as e:
                 logger.error(f"データ更新失敗: {sym} {e}")
 
+    # ─── ニュースセンチメント収集 ───────────────────────
+    def news_update(self) -> None:
+        """16:05（data_update 後・signal_scan 前）にニュースを取得・採点して保存する。
+
+        前進収集専用。use_news_features が OFF でも収集自体は行い（A/B検証用データを
+        貯める）、特徴量として使うかどうかはフラグで制御する。news.enabled が False、
+        または採点モデル（FinBERT）が未導入の環境では何もしない（コアは影響を受けない）。
+        """
+        if not cfg.get_section("news").get("enabled", True):
+            return
+        try:
+            from src.strategy import news_features
+            news_features.update_news_sentiment(watchlist_store.get_all_codes())
+        except Exception as e:
+            logger.error(f"ニュース更新失敗: {e}")
+
     # ─── ML週次再学習 ───────────────────────────────────
     def ml_retrain(self) -> None:
         logger.info("MLモデル週次再学習を開始...")

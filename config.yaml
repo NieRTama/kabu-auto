@@ -74,6 +74,35 @@ strategy:
   # 既定 false = fail-closed（メタが無ければロード拒否。改ざん検知の迂回を防ぐため）。
   # 既存モデルを一度だけ移行したい場合のみ true にし、移行後は false に戻すこと。
   allow_unverified_model_load: false
+  # ─── ニュースセンチメント特徴量（前進収集でA/B検証中）────────────────────────
+  # use_news_features を ON にすると、active_feature_cols() にニュース特徴量列が加わる。
+  # 既定 OFF。フラグを切り替えたら必ずモデルを再学習すること（load() の整合ガードが
+  # フラグとモデルの desync を検知してロードを拒否する）。requirements-ml.txt が必要。
+  use_news_features: false
+  # ─── LSTM アンサンブル（ツリー＋系列のハイブリッド。論文サーベイ推奨）────────
+  # use_ensemble を ON にすると、推論時に ml_s = gbm_weight*GBM + lstm_weight*LSTM。
+  # LSTM成果物（models/lstm_model.pt）が無ければ自動で純GBMにフォールバックする。
+  use_ensemble: false
+  ensemble_gbm_weight: 0.6
+  ensemble_lstm_weight: 0.4
+  lstm_seq_len: 20            # LSTMに与える系列長（営業日）
+
+# ─── ニュース取得・センチメント採点 ─────────────────────────────────────────
+sentiment:
+  # 日本語金融センチメントのローカルモデル（transformers のモデル名）。重みは初回に
+  # ダウンロードしてローカルキャッシュへ固定する（毎回DLしない）。
+  model_name: "christian-phu/bert-finetuned-japanese-sentiment"
+  ma_windows: [3, 5]          # 日次センチメントの移動平均日数（5≒「直近1週間」）
+  decay_halflife_days: 3      # 減衰加重の半減期（日）
+news:
+  enabled: true
+  macro_news: true            # マクロ（市場全体）の経済ニュースを収集
+  symbol_news: true           # 銘柄個別ニュース（yfinance）を収集
+  # マクロニュースのRSSソース（日本語の経済ニュース）。
+  macro_sources:
+    - "https://assets.wor.jp/rss/rdf/reuters/business.rdf"
+    - "https://assets.wor.jp/rss/rdf/nikkei/markets.rdf"
+  cutoff_hour: 16             # この時刻(JST)以降公開のニュースは翌営業日へ繰り上げ（リーク防止）
 
 # ─── 流動性フィルタ（レビュー P0-6）──────────────────────────────────────────
 # 薄商い銘柄への新規BUYは「約定しない/不利約定/退出時に売り抜けられない」リスクが

@@ -1,0 +1,18 @@
+# 追加MLスタック（ニュースセンチメント＋LSTMアンサンブル用）
+# ───────────────────────────────────────────────────────────────
+# これらは重い依存（特に torch / unidic）のため、コアの requirements.txt とは
+# 分離している。CI（.github/workflows/test.yml）は requirements.txt のみを導入し、
+# 本ファイルの依存はローカルの常時稼働ノートPCにのみ入れる。
+#   pip install -r requirements-ml.txt
+#
+# sentiment.py / lstm_model.py はこれらを「遅延 import」する。未インストールでも
+# use_news_features / use_ensemble を OFF にしておけばコアは従来どおり動作する。
+
+# 日本語金融センチメント（FinBERT）推論
+torch>=2.0,<3.0           # CPUホイールで十分（CUDA不要）
+transformers>=4.38,<5.0
+fugashi>=1.3              # 日本語形態素解析（多くの日本語BERTがMeCabトークナイズを要求）
+unidic-lite>=1.0.8        # fugashi 用の軽量辞書（フル unidic の~1GBダウンロードを避ける）
+
+# ニュース取得（RSS）
+feedparser>=6.0

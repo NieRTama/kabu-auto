@@ -91,9 +91,10 @@ def build_features(df: pd.DataFrame, news_df: Optional[pd.DataFrame] = None) -> 
     # dropna は基本テクニカル列のみ（ニュース列で落とさない）
     df = df.dropna(subset=BASE_TECHNICAL_COLS)
 
-    if _news_enabled() and news_df is not None and not df.empty:
-        # 遅延 import（news_features は torch/transformers に依存しないが、
-        # 役割分離のためフラグ有効時のみ読む）
+    if _news_enabled():
+        # フラグ有効時はニュース列を必ず付与する（news_df が無ければ中立0で埋める）。
+        # active_feature_cols() が常にニュース列を要求するため、列の欠落で
+        # 学習・推論時に KeyError を起こさないようにするのが目的。
         from src.strategy.news_features import join_news_features
         df = join_news_features(df, news_df)
 
