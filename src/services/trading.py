@@ -188,6 +188,38 @@ class TradingServices:
         except Exception as e:
             logger.error(f"異常検知ジョブエラー: {e}")
 
+    # ─── 日次レポートのX投稿 ─────────────────────────────
+    def post_daily_summary_to_x(self) -> None:
+        """当日/週次/月次/総合の損益サマリ・勝率をXへ投稿する（x.enabled=trueのときのみ）。
+
+        基準資金（%算出用）はpaperはtrading.paper_initial_capital、他は
+        reference_capital_store（ダッシュボードGUIで設定）から取得する。未設定なら%は省略される。
+        """
+        try:
+            from src.core import reference_capital as ref_capital_store
+            from src.core import x_poster
+            mode = self.trading_conf.get("mode", "paper")
+            paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
+            basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+            x_poster.post_daily_report(mode, basis)
+        except Exception as e:
+            logger.error(f"X日次レポート投稿エラー: {e}")
+
+    # ─── 日次レポートのDiscord投稿 ───────────────────────
+    def post_daily_summary_to_discord(self) -> None:
+        """当日/週次/月次/総合の損益サマリ・勝率をDiscordへ投稿する
+        （discord_report.enabled=trueのときのみ）。基準資金の扱いはpost_daily_summary_to_xと同じ。
+        """
+        try:
+            from src.core import discord_report
+            from src.core import reference_capital as ref_capital_store
+            mode = self.trading_conf.get("mode", "paper")
+            paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
+            basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+            discord_report.post_daily_report(mode, basis)
+        except Exception as e:
+            logger.error(f"Discord日次レポート投稿エラー: {e}")
+
     # ─── 損切り監視 ─────────────────────────────────────
     def stop_loss_check(self) -> None:
         if not TradingScheduler.is_market_open():

@@ -20,3 +20,4 @@ python-dotenv==1.0.0
 PyYAML==6.0.1
 httpx==0.25.2
 tzdata==2026.2  # Windowsで zoneinfo(Asia/Tokyo) を使うために必要。tzルール更新時は適宜引き上げる
+tweepy==4.14.0  # X（旧Twitter）への日次レポート投稿用（任意機能。x.enabled=falseなら未使用）

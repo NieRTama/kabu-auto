@@ -5,6 +5,7 @@ APSchedulerによるジョブスケジューラ
 - 毎日16:00: データ更新
 - 毎日16:20: シグナルスキャン（data_updateの完了を待つため16:00より後ろに設定）
 - 毎日17:00: DBバックアップ
+- 平日17:30: 日次損益サマリをX/Discordへ投稿（それぞれ x.enabled / discord_report.enabled=trueのとき）
 - 毎週日曜2:00: MLモデル再学習（週次）
 - 15秒ごと: 注文状態の照合（reconcile_orders。市場時間中のみコールバック側で実働）
 - 土曜: メンテナンス時間帯の回避
@@ -88,6 +89,18 @@ class TradingScheduler:
                 cb["health_check"], "cron",
                 day_of_week="mon-fri", hour="8-23", minute="*/15",
                 id="health_check",
+            )
+        if "x_daily_report" in cb:
+            # DBバックアップ(17:00)の後、当日分の取引が確定してから日次レポートを投稿する
+            self._scheduler.add_job(
+                cb["x_daily_report"], "cron",
+                day_of_week="mon-fri", hour=17, minute=30, id="x_daily_report",
+            )
+        if "discord_daily_report" in cb:
+            # Xと同じ日次レポートをDiscordへも投稿する（無料・Webhookのみで完結する代替/併用先）
+            self._scheduler.add_job(
+                cb["discord_daily_report"], "cron",
+                day_of_week="mon-fri", hour=17, minute=30, id="discord_daily_report",
             )
         if "reconcile_orders" in cb:
             # WebSocketイベントの取り逃し・切断・再起動を跨いでDB↔ブローカーの

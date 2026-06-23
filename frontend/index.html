@@ -173,6 +173,35 @@
     <span id="rp-msg" style="font-size:0.8rem;color:#f87171;"></span>
   </div>
 
+  <!-- ─── 日次レポート自動投稿（X / Discord）────────────────────────── -->
+  <div class="card" style="margin-bottom:24px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <h2 style="margin-bottom:0;">📣 日次レポート自動投稿（X / Discord）</h2>
+      <span style="font-size:0.8rem;color:#94a3b8;">平日17:30に当日/週次/月次/総合の損益を自動投稿（要config.yamlのx.enabled / discord_report.enabled）</span>
+    </div>
+    <div style="font-size:0.8rem;color:#94a3b8;margin-bottom:10px;">
+      paper以外（live/dry_run/semi_live）は損益%算出の基準資金をモードごとに設定してください（未設定なら%は省略されます）。
+      Discordは無料（Webhook URLのみ）、Xは従量課金です（詳細: docs/日次レポート投稿ガイド.md）。
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+      <select id="rc-mode" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 8px;border-radius:6px;font-size:0.85rem;">
+        <option value="live">ライブ</option>
+        <option value="dry_run">ドライラン</option>
+        <option value="semi_live">セミライブ</option>
+      </select>
+      <input id="rc-amount" type="number" min="0" step="1000" placeholder="基準資金（円）"
+        style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 8px;border-radius:6px;font-size:0.85rem;width:160px;">
+      <button onclick="saveReferenceCapital()" style="background:#0c4a6e;color:#7dd3fc;border:1px solid #0369a1;padding:6px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;">保存</button>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+      <button onclick="testXPost()" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;">🐦 X投稿テキストを確認（実際には投稿しない）</button>
+      <button onclick="testDiscordReportPost()" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;padding:6px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;">💬 Discord投稿テキストを確認（実際には投稿しない）</button>
+    </div>
+    <div id="rc-current" style="font-size:0.78rem;color:#94a3b8;margin-bottom:8px;"></div>
+    <pre id="x-preview" style="font-size:0.8rem;color:#e2e8f0;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:10px;white-space:pre-wrap;display:none;"></pre>
+    <span id="x-msg" style="font-size:0.8rem;color:#f87171;"></span>
+  </div>
+
   <!-- ─── 損益グラフ ────────────────────────────────────────────── -->
   <div class="row">
     <div class="card">
@@ -706,6 +735,66 @@
       msg.textContent = 'エラー: ' + err.message;
     }
   });
+
+  // ── X連携（基準資金設定・投稿テキストのテスト確認）──────────────────
+  async function loadReferenceCapital() {
+    const d = await fetchJson('/api/reference_capital');
+    const values = d.values || {};
+    const labelMap = { live: 'ライブ', dry_run: 'ドライラン', semi_live: 'セミライブ' };
+    document.getElementById('rc-current').textContent = Object.entries(values)
+      .map(([mode, amount]) => `${labelMap[mode] || mode}: ${amount ? '¥' + amount.toLocaleString() : '未設定'}`)
+      .join('　|　');
+  }
+
+  async function saveReferenceCapital() {
+    const mode = document.getElementById('rc-mode').value;
+    const amount = parseFloat(document.getElementById('rc-amount').value);
+    const msg = document.getElementById('x-msg');
+    msg.textContent = '';
+    if (!amount || amount < 0) { msg.textContent = '基準資金を入力してください'; return; }
+    try {
+      const r = await fetch(API + '/api/reference_capital', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, amount }),
+      });
+      const d = await r.json();
+      if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+      await loadReferenceCapital();
+    } catch (err) {
+      msg.textContent = 'エラー: ' + err.message;
+    }
+  }
+
+  async function testXPost() {
+    const msg = document.getElementById('x-msg');
+    const pre = document.getElementById('x-preview');
+    msg.textContent = '';
+    try {
+      const r = await fetch(API + '/api/x/test_post', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+      pre.style.display = 'block';
+      pre.textContent = d.text + `\n\n(${d.length}文字 / 280文字)`;
+    } catch (err) {
+      msg.textContent = 'エラー: ' + err.message;
+    }
+  }
+
+  async function testDiscordReportPost() {
+    const msg = document.getElementById('x-msg');
+    const pre = document.getElementById('x-preview');
+    msg.textContent = '';
+    try {
+      const r = await fetch(API + '/api/discord_report/test_post', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) { msg.textContent = 'エラー: ' + (d.detail || r.statusText); return; }
+      pre.style.display = 'block';
+      pre.textContent = d.text + `\n\n(${d.length}文字 / 2000文字)`;
+    } catch (err) {
+      msg.textContent = 'エラー: ' + err.message;
+    }
+  }
 
   // ── カスタムリスクプロファイル管理（作成/clone/削除/比較）──────────
   async function createCustomProfile() {
@@ -1675,6 +1764,7 @@
     loadWatchlistSelector();
   });
   loadRiskProfile();
+  loadReferenceCapital();
   loadModelMetrics();
   loadDailyPnlChart();
   initLogoutButton();

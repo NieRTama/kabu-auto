@@ -35,6 +35,24 @@ def _apply_env_overrides(config: dict) -> None:
     env_dash_token = os.environ.get("KABU_DASHBOARD_TOKEN")
     if env_dash_token:
         config.setdefault("dashboard", {})["api_token"] = env_dash_token
+    env_discord_report_webhook = os.environ.get("DISCORD_REPORT_WEBHOOK_URL")
+    if env_discord_report_webhook:
+        config.setdefault("discord_report", {})["webhook_url"] = env_discord_report_webhook
+    _apply_x_env_overrides(config)
+
+
+def _apply_x_env_overrides(config: dict) -> None:
+    """X（旧Twitter）APIの4つの鍵を環境変数から上書きする（config.yamlへの平文保存を避ける）。"""
+    mapping = {
+        "X_API_KEY": "api_key",
+        "X_API_SECRET": "api_secret",
+        "X_ACCESS_TOKEN": "access_token",
+        "X_ACCESS_TOKEN_SECRET": "access_token_secret",
+    }
+    for env_name, key in mapping.items():
+        value = os.environ.get(env_name)
+        if value:
+            config.setdefault("x", {})[key] = value
 
 
 def get() -> dict:

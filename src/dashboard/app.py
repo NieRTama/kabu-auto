@@ -29,7 +29,8 @@ from sqlalchemy import func, select
 
 from src.core import (
     config as cfg, watchlist as watchlist_store, risk_profile as risk_profile_store,
-    auth as auth_store, clock,
+    auth as auth_store, clock, reference_capital as reference_capital_store,
+    trading_mode as tm,
 )
 from src.data.database import (
     BacktestRun, BacktestTradeRecord, ModelMetrics, Position, Signal, Trade, get_session,
@@ -425,6 +426,54 @@ async def get_risk_profile():
         "profiles": profiles,
         "builtin": [n for n in profiles if risk_profile_store.is_builtin(n)],
     }
+
+
+@app.get("/api/reference_capital")
+async def get_reference_capital():
+    """X日次レポートの%算出用・モード別基準資金の現在値を返す（paper以外。0=未設定）。"""
+    return {"values": reference_capital_store.get_all()}
+
+
+class ReferenceCapitalRequest(BaseModel):
+    mode: str
+    amount: float
+
+
+@app.post("/api/reference_capital")
+async def set_reference_capital(req: ReferenceCapitalRequest):
+    """指定モードの基準資金を設定する（X日次レポートの%算出に使う。paperは設定不可）。"""
+    try:
+        values = reference_capital_store.set_value(req.mode, req.amount)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"values": values}
+
+
+@app.post("/api/x/test_post")
+async def test_x_post():
+    """X連携の動作確認: 実際に投稿せず、投稿予定のテキストのみ返す（x.enabled設定に関わらず）。"""
+    from src.core import pnl_report, x_poster
+    trading_conf = cfg.get_section("trading")
+    mode = _system_status.get("mode", trading_conf.get("mode", "paper"))
+    paper_base = float(trading_conf.get("paper_initial_capital", 500_000))
+    basis = reference_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+    report = pnl_report.build_report(basis)
+    text = x_poster.format_daily_report(mode, report)
+    return {"text": text, "length": len(text)}
+
+
+@app.post("/api/discord_report/test_post")
+async def test_discord_report_post():
+    """Discord日次レポートの動作確認: 実際に投稿せず、投稿予定のテキストのみ返す
+    （discord_report.enabled設定に関わらず）。"""
+    from src.core import discord_report, pnl_report
+    trading_conf = cfg.get_section("trading")
+    mode = _system_status.get("mode", trading_conf.get("mode", "paper"))
+    paper_base = float(trading_conf.get("paper_initial_capital", 500_000))
+    basis = reference_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+    report = pnl_report.build_report(basis)
+    text = discord_report.format_for_discord(mode, report)
+    return {"text": text, "length": len(text)}
 
 
 def _requires_live_confirmation(confirm: bool) -> None:

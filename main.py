@@ -20,7 +20,7 @@ from loguru import logger
 from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
-    process_lock,
+    process_lock, reference_capital as reference_capital_store,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -42,6 +42,7 @@ def main() -> None:
     cfg.load("config.yaml")
     watchlist_store.load("watchlists.json")  # 旧 watchlist.json があれば自動移行される
     risk_profile_store.load("risk_profile.json")  # アクティブなリスクプロファイルを config に適用
+    reference_capital_store.load("reference_capital.json")  # X日次レポートの%算出用基準資金
     halt_store.load("data/trading_halt.json")  # 取引停止スイッチの状態を復元（停止中なら起動後も維持）
     log_setup.setup()
     db.init()
@@ -178,6 +179,8 @@ def main() -> None:
     scheduler.register("morning_execution", services.morning_execution)
     scheduler.register("reconcile_orders", services.reconcile_orders)
     scheduler.register("health_check", services.health_check)
+    scheduler.register("x_daily_report", services.post_daily_summary_to_x)
+    scheduler.register("discord_daily_report", services.post_daily_summary_to_discord)
 
     # ─── WebSocket 開始 ────────────────────────────────────
     client.start_websocket(on_order_event=order_mgr.on_order_event)

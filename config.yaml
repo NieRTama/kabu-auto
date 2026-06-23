@@ -134,6 +134,28 @@ alerts:
   # src/core/alerts.py の build_providers() に対応する分岐を1つ追加する。
   # 例: slack_webhook_url: ""
 
+# ─── X（旧Twitter）日次レポート投稿 ──────────────────────────────────────────
+# 平日17:30に当日/週次/月次/総合の損益サマリ・勝率をXへ自動投稿する任意機能。
+# 取得手順・OAuth鍵の取り方は docs/日次レポート投稿ガイド.md を参照。鍵は.envで設定するのを推奨
+# （api_key/api_secret/access_token/access_token_secretの4つすべて環境変数で上書き可能）。
+# Xは2026年時点で無料枠が無く従量課金（投稿1件あたり約$0.015）。無料で済ませたい場合は
+# 下のdiscord_reportのみを使う（XとDiscordは独立しており、両方/片方どちらでも有効化できる）。
+x:
+  enabled: false  # trueにすると実際に投稿される（鍵未設定なら投稿はスキップされるだけ）
+  api_key: ""
+  api_secret: ""
+  access_token: ""
+  access_token_secret: ""
+
+# ─── Discord 日次レポート投稿（無料） ────────────────────────────────────────
+# Xと同内容の日次レポートをDiscordへ自動投稿する任意機能。完全無料（Webhook URLのみで
+# 動作し、API審査やトークン管理は不要）。取得方法は docs/日次レポート投稿ガイド.md を参照。
+# alerts.discord_webhook_url（異常時アラート用）とは別チャンネル想定。同じURLを設定すれば
+# 同一チャンネルにまとめることもできる。
+discord_report:
+  enabled: false  # trueにすると実際に投稿される（URL未設定なら投稿はスキップされるだけ）
+  webhook_url: ""
+
 logging:
   level: "INFO"
   # ログは log/ フォルダに格納され、1日単位で区切られ、ファイル名末尾に日付が付く。
