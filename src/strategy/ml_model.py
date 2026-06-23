@@ -77,19 +77,20 @@ def _read_model_meta() -> Optional[dict]:
 
 
 def train(df: pd.DataFrame, trigger: Optional[str] = None,
-          save: bool = True) -> lgb.LGBMClassifier:
+          save: bool = True, news_df: Optional[pd.DataFrame] = None) -> lgb.LGBMClassifier:
     """単一銘柄のOHLCVからトリプルバリアラベル＋サンプル重みでLightGBMを学習し保存する。
 
     trigger が指定された場合（"weekly_schedule" / "manual"）、
     CV精度・特徴量重要度をDBに保存する。
     バックテスト内での学習時は trigger=None で呼び出してDBに記録しない。
+    news_df を渡すと（use_news_features 有効時）ニュース特徴量を単一銘柄の枠内で結合する。
 
     注意: df は単一銘柄の時系列であること。複数銘柄を学習する場合は
     train_multi() を使う（build_features の rolling/ewm や トリプルバリア法の
     「N日後」判定は単一時系列前提のため、複数銘柄を結合したdfを渡すと
     銘柄境界をまたいで指標・ラベルが破壊される）。
     """
-    X, y, weights = build_training_set(df)
+    X, y, weights = build_training_set(df, news_df=news_df)
     return _fit(X, y, weights, trigger=trigger, save=save)
 
 

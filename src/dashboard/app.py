@@ -741,6 +741,16 @@ async def get_performance():
     return compute_performance(trades)
 
 
+@app.get("/api/shadow_ab")
+async def get_shadow_ab(horizon: int = 5):
+    """シャドーA/B: 本番（純GBM）vs シャドー（GBM+LSTMアンサンブル）のフォワード・ヒット率。
+
+    ニュース＋アンサンブルを本番採用すべきかを、資金リスクなしで前進評価する材料。
+    """
+    from src.analytics.shadow_ab import compare_shadow_ab
+    return compare_shadow_ab(horizon=horizon)
+
+
 @app.get("/api/pnl_summary")
 async def get_pnl_summary():
     with get_session() as session:

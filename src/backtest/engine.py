@@ -71,8 +71,20 @@ def run_backtest(
     if not mask.any():
         raise ValueError(f"指定期間にデータがありません: {start} ~ {end}")
 
+    # ─── ニュース特徴量（use_news_features 有効時のみ）────────────────
+    # news_df は後ろ向き移動平均のみで構成されるため、各日の特徴量はその日以前の
+    # ニュースにしか依存しない（一括結合してもルックアヘッドしない）。前進収集のため、
+    # ニュースが無い期間は中立0で埋まる（A/B検証は収集開始日以降が有効）。
+    news_df = None
+    if cfg.get_section("strategy").get("use_news_features", False):
+        try:
+            from src.strategy.news_features import load_news_frame
+            news_df = load_news_frame(symbol)
+        except Exception as e:
+            logger.warning(f"バックテスト用ニュース特徴量ロード失敗 {symbol}: {e}")
+
     # ─── 指標を全期間で一括計算（毎日再計算を避けて高速化）──────────
-    featured_df = build_features(full_df)
+    featured_df = build_features(full_df, news_df=news_df)
 
     # ─── MLモデル: テスト開始前データのみで学習 ──────────────────
     model = None
@@ -82,7 +94,7 @@ def run_backtest(
         pre_df = full_df[full_df.index.date < start]
         if len(pre_df) >= 200:
             try:
-                model = ml_model.train(pre_df, save=False)
+                model = ml_model.train(pre_df, save=False, news_df=news_df)
                 effective_ml_weight = ml_weight
                 effective_rule_weight = rule_weight
                 logger.info(f"バックテスト用MLモデル学習完了: {len(pre_df)}件")
