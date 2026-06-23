@@ -101,7 +101,13 @@ def _paper_available_cash(base_capital: float) -> float:
     return max(0.0, base_capital + float(realized) - invested)
 
 
-def _save_signal(sig: TradeSignal) -> None:
+def _save_signal(sig: TradeSignal, shadow: Optional[TradeSignal] = None) -> None:
+    """シグナルを保存する。shadow が渡された場合は A/B 用のシャドー列にも記録する。
+
+    本番の action は sig（本番スコア）に固定し、shadow は比較用の列にのみ入れる
+    （morning_execution / _select_latest_signals は action しか見ないため、シャドーが
+    実発注へ漏れない）。
+    """
     with get_session() as session:
         session.add(Signal(
             symbol=sig.symbol,
@@ -109,6 +115,9 @@ def _save_signal(sig: TradeSignal) -> None:
             ml_score=sig.ml_score,
             combined_score=sig.combined_score,
             action=sig.action,
+            ml_score_shadow=shadow.ml_score if shadow else None,
+            combined_score_shadow=shadow.combined_score if shadow else None,
+            action_shadow=shadow.action if shadow else None,
         ))
         session.commit()
 
@@ -116,11 +125,12 @@ def _save_signal(sig: TradeSignal) -> None:
 class TradingServices:
     """スケジューラに登録される取引ジョブ群。依存と可変modelを保持する。"""
 
-    def __init__(self, client, risk, order_mgr, model=None):
+    def __init__(self, client, risk, order_mgr, model=None, lstm_model=None):
         self.client = client
         self.risk = risk
         self.order_mgr = order_mgr
         self.model = model
+        self.lstm_model = lstm_model  # アンサンブル用LSTM（任意・None で純GBM）
         self.trading_conf = cfg.get_section("trading")
         self.data_conf = cfg.get_section("data")
         self.liquidity_conf = cfg.get_section("liquidity")
@@ -151,6 +161,16 @@ class TradingServices:
         except Exception as e:
             logger.error(f"ニュース更新失敗: {e}")
 
+    @staticmethod
+    def _load_news(symbol: str):
+        """単一銘柄のニュース特徴量フレームを読む（失敗時 None で純価格にフォールバック）。"""
+        try:
+            from src.strategy import news_features
+            return news_features.load_news_frame(symbol)
+        except Exception as e:
+            logger.warning(f"ニュース特徴量ロード失敗 {symbol}: {e}")
+            return None
+
     # ─── ML週次再学習 ───────────────────────────────────
     def ml_retrain(self) -> None:
         logger.info("MLモデル週次再学習を開始...")
@@ -158,20 +178,41 @@ class TradingServices:
         # 各銘柄のOHLCVは単純結合せず、銘柄ごとに train_multi() 内で特徴量・ラベルを
         # 作ってから連結する（移動平均/RSI/トリプルバリア法が銘柄境界をまたいで
         # 壊れるのを防ぐため。詳細は ml_model.train_multi() のdocstring参照）。
+        use_news = cfg.get_section("strategy").get("use_news_features", False)
         dfs = []
+        news_map: dict = {}
         for sym in watchlist_store.get_all_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 200:
                     continue
+                if use_news:
+                    # 銘柄ごとのニュース特徴量フレーム（単一銘柄の枠内で結合するため）
+                    from src.strategy import news_features
+                    news_map[len(dfs)] = news_features.load_news_frame(sym)
                 dfs.append(df)
             except Exception as e:
                 logger.error(f"データ読み込み失敗: {sym} {e}")
-        if dfs:
-            try:
-                self.model = ml_model.train_multi(dfs, trigger="weekly_schedule")
-            except Exception as e:
-                logger.error(f"再学習失敗: {e}")
+        if not dfs:
+            return
+        try:
+            self.model = ml_model.train_multi(
+                dfs, news_map=(news_map if use_news else None),
+                trigger="weekly_schedule")
+        except Exception as e:
+            logger.error(f"再学習失敗: {e}")
+        # LSTMも再学習する（torch未導入なら train_multi が None を返しスキップ）。
+        # use_ensemble が OFF でも学習しておくことで、本番（純GBM）に対する
+        # シャドーA/B候補（GBM+LSTM）を前進収集できる。
+        try:
+            from src.strategy import lstm_model
+            trained = lstm_model.train_multi(
+                dfs, news_map=(news_map if use_news else None),
+                trigger="weekly_schedule")
+            if trained is not None:
+                self.lstm_model = trained
+        except Exception as e:
+            logger.error(f"LSTM再学習失敗: {e}")
 
     # ─── 注文状態の定期照合 ─────────────────────────────
     def reconcile_orders(self) -> None:
@@ -241,13 +282,26 @@ class TradingServices:
         is_paper = self.trading_conf.get("mode", "paper") == "paper"
         sectors = watchlist_store.get_sectors()
         paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
+        strat_conf = cfg.get_section("strategy")
+        use_news = strat_conf.get("use_news_features", False)
+        use_ens = strat_conf.get("use_ensemble", False)
         for sym in watchlist_store.get_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 30:
                     continue
-                sig = gen_signal(sym, df, self.model)
-                _save_signal(sig)
+                news_df = self._load_news(sym) if use_news else None
+                # 本番シグナル（フラグに従う。action はこれに固定）
+                prod_lstm = self.lstm_model if use_ens else None
+                sig = gen_signal(sym, df, self.model,
+                                 lstm_model=prod_lstm, news_df=news_df)
+                # シャドー（前進A/B）: 本番が純GBMのとき、GBM+LSTMアンサンブル候補を併走記録。
+                # 実発注には一切影響しない（action_shadow は比較用）。
+                shadow = None
+                if self.lstm_model is not None and not use_ens:
+                    shadow = gen_signal(sym, df, self.model,
+                                        lstm_model=self.lstm_model, news_df=news_df)
+                _save_signal(sig, shadow)
                 if sig.action not in ("BUY", "SELL"):
                     continue
                 logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")

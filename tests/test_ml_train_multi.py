@@ -83,7 +83,7 @@ class TestTrainMulti:
         """各dfごとにbuild_training_setを呼び、結果を連結してから1回だけ学習する"""
         sizes = [120, 150, 100]  # 銘柄ごとに異なる学習サンプル数を模す
 
-        def fake_build_training_set(df):
+        def fake_build_training_set(df, news_df=None):
             n = sizes.pop(0)
             X = pd.DataFrame(np.random.randn(n, 10))
             y = pd.Series(np.random.randint(0, 2, n))
@@ -111,7 +111,7 @@ class TestTrainMulti:
         """1銘柄でbuild_training_setがValueErrorを出しても、他の銘柄で学習を続行する"""
         call_count = {"n": 0}
 
-        def fake_build_training_set(df):
+        def fake_build_training_set(df, news_df=None):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise ValueError("データ不足")

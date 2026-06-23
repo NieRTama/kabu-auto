@@ -67,22 +67,57 @@ def compute_rule_score(df: pd.DataFrame) -> float:
     return max(-1.0, min(1.0, score))
 
 
+def _ensemble_proba(model, lstm, df: pd.DataFrame,
+                    news_df: Optional[pd.DataFrame], symbol: str) -> float:
+    """GBM（必須）とLSTM（任意）の上昇確率を重み付き平均する。
+
+    lstm が渡されれば ensemble、None なら純GBM（フラグの解釈は呼び出し側が行い、
+    アンサンブルしたいときだけ lstm を渡す）。LSTM推論に失敗した場合も純GBMへ
+    フォールバックする（LSTMの欠如は既定状態であり異常ではない）。
+    """
+    gbm_proba = ml_model.predict_proba(model, df, news_df=news_df)
+    if lstm is None:
+        return gbm_proba
+    try:
+        from src.strategy import lstm_model as lstm_mod
+        lstm_proba = lstm_mod.predict_proba(lstm, df, news_df=news_df)
+    except Exception as e:
+        logger.warning(f"LSTM推論失敗 ({symbol})→純GBM: {e}")
+        return gbm_proba
+    conf = cfg.get_section("strategy")
+    w_gbm = float(conf.get("ensemble_gbm_weight", 0.6))
+    w_lstm = float(conf.get("ensemble_lstm_weight", 0.4))
+    total = w_gbm + w_lstm
+    if total <= 0:
+        return gbm_proba
+    return (w_gbm * gbm_proba + w_lstm * lstm_proba) / total
+
+
 def generate(symbol: str, df: pd.DataFrame,
-             model: Optional[object] = None) -> Signal:
-    """シグナルを生成する"""
+             model: Optional[object] = None,
+             lstm_model: Optional[object] = None,
+             news_df: Optional[pd.DataFrame] = None) -> Signal:
+    """シグナルを生成する。
+
+    lstm_model を渡すとアンサンブル（GBM＋LSTM）、None なら純GBM。news_df は
+    use_news_features が有効なときだけ build_features 内で結合される。フラグの解釈は
+    呼び出し側（signal_scan）が行い、本番／シャドーで lstm_model・news_df の有無を
+    切り替える。既定（lstm_model=None・news_df=None）では従来どおり純GBM・価格のみで
+    完全に同一挙動。
+    """
     conf = cfg.get_section("strategy")
     ml_weight = conf.get("ml_weight", 0.5)
     rule_weight = conf.get("rule_weight", 0.5)
     buy_thr = conf.get("buy_threshold", 0.6)
     sell_thr = conf.get("sell_threshold", -0.6)
 
-    df = build_features(df)
+    df = build_features(df, news_df=news_df)
     rule_s = compute_rule_score(df)
 
     ml_s = 0.0
     if model is not None:
         try:
-            proba = ml_model.predict_proba(model, df)
+            proba = _ensemble_proba(model, lstm_model, df, news_df, symbol)
             ml_s = (proba - 0.5) * 2  # 0.5基準で-1〜+1に変換
         except Exception as e:
             logger.warning(f"ML推論失敗 ({symbol}): {e}")

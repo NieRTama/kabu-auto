@@ -154,3 +154,47 @@ def build_training_set(
     y = pd.Series(labels[mask], name="label").astype(int).reset_index(drop=True)
     w = weights[mask]
     return X, y, w
+
+
+def build_sequence_set(
+    df: pd.DataFrame, seq_len: int, news_df: Optional[pd.DataFrame] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """LSTM用に、長さ seq_len の特徴量系列とラベル・重みを生成する（単一銘柄）。
+
+    build_training_set がラベルNaN行をマスクで落として行に「穴」を作るのに対し、
+    本関数は連続した特徴量フレーム上で各系列窓を構成してから、終端行のラベルが
+    有効なサンプルだけを残す。これにより系列が銘柄境界やマスク欠損をまたがない。
+
+    戻り値:
+        X_seq: shape (n_samples, seq_len, n_features)
+        y:     shape (n_samples,)  int
+        w:     shape (n_samples,)  float
+    """
+    _assert_single_symbol_timeseries(df)
+    conf = cfg.get_section("strategy")
+    pt_mult = conf.get("tb_profit_mult", 2.0)
+    sl_mult = conf.get("tb_stop_mult", 2.0)
+    max_holding = conf.get("tb_max_holding", 10)
+    vol_span = conf.get("tb_vol_span", 20)
+
+    feat = build_features(df, news_df=news_df).reset_index(drop=True)
+    labels, t_ends = triple_barrier_labels(feat, pt_mult, sl_mult, max_holding, vol_span)
+    weights = get_sample_weights(t_ends)
+
+    cols = active_feature_cols()
+    feat_arr = feat[cols].to_numpy(dtype=float)
+    n = len(feat_arr)
+
+    seqs, ys, ws = [], [], []
+    # 終端行 i の系列は feat[i-seq_len+1 .. i]。i は seq_len-1 以上かつラベル有効な行のみ。
+    for i in range(seq_len - 1, n):
+        if np.isnan(labels[i]):
+            continue
+        seqs.append(feat_arr[i - seq_len + 1: i + 1])
+        ys.append(int(labels[i]))
+        ws.append(float(weights[i]))
+
+    if not seqs:
+        return (np.empty((0, seq_len, len(cols))),
+                np.empty((0,), dtype=int), np.empty((0,)))
+    return np.stack(seqs), np.array(ys, dtype=int), np.array(ws, dtype=float)

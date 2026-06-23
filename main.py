@@ -146,10 +146,16 @@ def main() -> None:
     if model is None:
         logger.info("学習済みモデルなし。十分なデータが揃い次第 /retrain を実行してください。")
 
+    # LSTM（アンサンブル用・任意）。torch未導入や成果物なしなら None で純GBM動作。
+    lstm = None
+    if cfg.get_section("strategy").get("use_ensemble", False):
+        from src.strategy import lstm_model
+        lstm = lstm_model.load()
+
     # ─── 取引サービス（スケジューラジョブの実体）────────────
     # ウォッチリストは各ジョブ内で watchlist_store から毎回最新を取得するため、
     # GUIでの追加・削除がプロセス再起動なしで次回実行から反映される。
-    services = TradingServices(client, risk, order_mgr, model)
+    services = TradingServices(client, risk, order_mgr, model, lstm_model=lstm)
 
     # ─── インフラ系の小ジョブ（composition root に置く）──────
     def token_refresh():

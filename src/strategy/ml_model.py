@@ -94,17 +94,21 @@ def train(df: pd.DataFrame, trigger: Optional[str] = None,
 
 
 def train_multi(dfs: list[pd.DataFrame], trigger: Optional[str] = None,
-                 save: bool = True) -> lgb.LGBMClassifier:
+                 save: bool = True, news_map: Optional[dict] = None) -> lgb.LGBMClassifier:
     """複数銘柄のOHLCVから学習する。
 
     各dfごとに個別に build_training_set() で特徴量・ラベル・サンプル重みを
     作成してから連結する（生のOHLCVをconcatしてから処理すると、移動平均/RSI/
     トリプルバリア法が銘柄境界をまたいで壊れるため、これは行わない）。
+
+    news_map: {index: news_df}（任意）。use_news_features が有効なとき、各銘柄の
+    ニュース特徴量フレームを単一銘柄の枠内で結合する（dfs と同じ並びの index で引く）。
     """
     X_parts, y_parts, w_parts = [], [], []
-    for df in dfs:
+    for i, df in enumerate(dfs):
+        news_df = news_map.get(i) if isinstance(news_map, dict) else None
         try:
-            X, y, w = build_training_set(df)
+            X, y, w = build_training_set(df, news_df=news_df)
         except ValueError as e:
             logger.warning(f"学習データ生成をスキップ: {e}")
             continue
