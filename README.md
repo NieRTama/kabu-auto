@@ -16,6 +16,8 @@
 | Webダッシュボード | ブラウザで損益・ポジション・取引履歴・シグナルをリアルタイム確認 |
 | 損益可視化 | 日次損益棒グラフ・累積損益折れ線・MTD/YTD・シャープレシオ・最大ドローダウン |
 | MLモデル精度追跡 | 各学習ごとに精度・AUC・特徴量重要度を記録・グラフ表示 |
+| 経済ニュース特徴量（任意） | マクロ＋個別ニュースを日本語FinBERTでセンチメント化しML特徴量に追加（リーク防止・既定オフ） |
+| LSTMアンサンブル（任意） | LightGBM＋LSTMのハイブリッド。シャドーA/Bで本番に勝ってから採用（既定オフ） |
 | 複数ウォッチリスト | 用途別に複数リストを保持し、ダッシュボードから切替・新規作成・改名・削除。JSONで外部出力・取込も可能 |
 | リスクプロファイル切替 | 「ローリスク・ローリターン」⇔「ハイリスク・ハイリターン」をダッシュボードからワンクリックで切替 |
 | リスク管理 | 損切り・最大保有銘柄数・セクター集中制限・1日注文数上限・当日損失上限（プロセス再起動後もDBから復元） |
@@ -31,27 +33,32 @@
 kabu-auto/
 ├── src/
 │   ├── api/           # kabuステーションAPI クライアント（REST + WebSocket）
-│   ├── data/          # OHLCV取得・SQLite管理（WALモード）
+│   ├── data/          # OHLCV取得・SQLite管理（WALモード）・ニュース取得（news.py）
 │   ├── strategy/
-│   │   ├── indicators.py   # テクニカル指標（MA/RSI/BB/MACD）
-│   │   ├── labeling.py     # トリプルバリア法ラベリング
-│   │   ├── ml_model.py     # LightGBM 学習・推論
-│   │   └── signal.py       # ルール＋ML 合成シグナル生成
+│   │   ├── indicators.py     # テクニカル指標（MA/RSI/BB/MACD）・active_feature_cols
+│   │   ├── labeling.py       # トリプルバリア法ラベリング・LSTM系列構成
+│   │   ├── ml_model.py       # LightGBM 学習・推論（特徴量セット整合ガード付き）
+│   │   ├── lstm_model.py     # LSTM 系列モデル（アンサンブル用・torch遅延import）
+│   │   ├── sentiment.py      # 日本語FinBERTセンチメント採点（遅延import）
+│   │   ├── news_features.py  # ニュース集約・特徴量化（16:00カットオフ・リーク防止）
+│   │   └── signal.py         # ルール＋ML（アンサンブル）合成シグナル生成
 │   ├── execution/     # 発注・ポジション管理・約定確認
 │   ├── risk/          # リスク管理（損切り・集中制限・日次カウンタ復元）
 │   ├── backtest/      # ウォークフォワードバックテストエンジン（閾値オーバーライド対応）
+│   ├── analytics/     # パフォーマンス分析・シャドーA/B比較（shadow_ab.py）
 │   ├── dashboard/     # FastAPI バックエンド（トークン認証付き）
 │   └── core/          # 設定・ウォッチリスト（複数管理）・リスクプロファイル・ログ・スケジューラ・アラート
 ├── frontend/
 │   └── index.html     # ダッシュボードUI（Chart.js）
-├── models/            # 学習済み LightGBM モデル（.pkl）
+├── models/            # 学習済みモデル（LightGBM .pkl / LSTM .pt・各SHA256メタ付き）
 ├── data/              # SQLite DB・バックアップ
 ├── log/               # ログ（日付別・INFO以下/WARNING以上で別ファイル・既定15日保持。自動生成）
 ├── docs/              # 概要設計書・詳細設計書
 ├── config.yaml        # 設定ファイル
 ├── LICENSE            # 使用許諾契約
 ├── SETUP-CHECKLIST.md # 購入者向けセットアップ・チェックリスト
-├── requirements.txt
+├── requirements.txt       # コア依存
+├── requirements-ml.txt    # 追加MLスタック（ニュース＋LSTM。任意・既定オフ機能用）
 └── main.py            # エントリポイント
 ```
 
@@ -401,6 +408,45 @@ curl -X POST http://localhost:8080/api/backtest/run \
 
 ---
 
+## 経済ニュース特徴量とLSTMアンサンブル（実験的・既定オフ）
+
+最新の市場分析論文（2024–2026）のサーベイに基づく拡張。タブラーデータで強い
+LightGBM を主軸に残しつつ、**経済ニュースのセンチメント特徴量**と**系列を捉える
+LSTM とのハイブリッドアンサンブル**を追加できる。いずれも**既定オフ**で、価格のみの
+本番モデルには一切影響しない。
+
+### 仕組み
+- **ニュース取得（16:05）**: マクロ経済ニュース（RSS）と銘柄個別ニュース（yfinance）を
+  取得し、ローカルの**日本語 FinBERT** でセンチメント[-1,1]に採点して `news_sentiment`
+  テーブルへ保存する。
+- **リーク防止**: 公開時刻を 16:00 JST でカットオフし「遅くとも当日大引け後に知り得た
+  取引日」へ正規化（16:00以降は翌営業日）。特徴量（`*_ma3`/`*_ma5`≒直近1週間の移動平均・
+  変化量）はすべて後ろ向きに計算する。
+- **モデル**: `use_news_features` でニュース特徴量を、`use_ensemble` で LSTM を有効化。
+  LSTM 成果物が無ければ自動で純 LightGBM にフォールバックする。
+- **前進A/B検証**: フラグがオフでも、毎週の再学習で LSTM を裏で学習し、本番（純GBM）に
+  対する候補（GBM+LSTM）のシグナルを `signals` のシャドー列へ毎日記録する。資金を
+  リスクに晒さずに `GET /api/shadow_ab` でフォワード・ヒット率を比較でき、優位が
+  確認できてから本番フラグをオンにする運用を想定している。
+
+### 有効化手順
+```bash
+# 1. 追加の重い依存（torch / transformers / 日本語FinBERT / feedparser）を入れる
+pip install -r requirements-ml.txt
+```
+```yaml
+# 2. config.yaml の strategy: で（A/Bでシャドーが本番を上回ってから）
+strategy:
+  use_news_features: true   # ニュース特徴量を学習・推論に使う
+  use_ensemble: true        # LightGBM + LSTM アンサンブル
+```
+> **重要**: フラグを切り替えたら必ずモデルを再学習すること（`/retrain`）。学習時の特徴量
+> セットと現在の設定が食い違う場合、`ml_model.load()` の整合ガードがロードを拒否して
+> 誤推論を防ぐ。`requirements-ml.txt` 未導入の環境ではフラグをオフのままにすれば
+> コア機能は従来どおり動作する（センチメント採点・LSTMは自動で無効化される）。
+
+---
+
 ## リスク管理の設定
 
 ### リスクプロファイル切替（推奨）
@@ -501,6 +547,7 @@ strategy:
 | 09:05 | 前日シグナルを元に発注（ライブモード: SELL優先 → BUY） |
 | 09:00〜15:30（5分毎） | 損切りチェック |
 | 16:00 | 日次OHLCVデータ更新 |
+| 16:05 | ニュース取得・センチメント採点（データ更新後・シグナルスキャン前） |
 | 16:20 | シグナルスキャン・翌営業日の売買候補をスキャン（必ずデータ更新の後） |
 | 17:00 | SQLite 日次バックアップ |
 | 毎週日曜 02:00 | LightGBM モデル自動再学習（週次） |
@@ -532,6 +579,7 @@ strategy:
 | GET | `/api/journal` | 取引ジャーナル（確定取引・リターン率・発注根拠・メモ付き。`limit`） |
 | PUT | `/api/journal/{order_id}/note` | 取引にメモを付ける（`{note}`） |
 | GET | `/api/performance` | パフォーマンス分析（PF・期待値・連勝連敗・銘柄/セクター別） |
+| GET | `/api/shadow_ab` | シャドーA/B（本番=純GBM vs シャドー=GBM+LSTMのフォワード・ヒット率。`horizon`） |
 | GET | `/api/health` | 運用異常の現在一覧（未解決注文・損失上限接近・kill switch） |
 | POST | `/api/stop_loss` | 保有ポジションにブローカー側逆指値ストップを発注（`X-Emergency-Token` 必須） |
 | GET | `/api/signals` | シグナル履歴 |
