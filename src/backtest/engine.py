@@ -22,7 +22,7 @@ from src.core import config as cfg
 from src.data.database import BacktestRun, BacktestTradeRecord, get_session
 from src.data.market_data import load_ohlcv
 from src.strategy import ml_model
-from src.strategy.indicators import FEATURE_COLS, build_features
+from src.strategy.indicators import active_feature_cols, build_features
 from src.strategy.signal import compute_rule_score
 
 
@@ -154,7 +154,8 @@ def run_backtest(
         ml_s = 0.0
         if model is not None:
             try:
-                today_feats = featured_df.loc[[dt], FEATURE_COLS]
+                model_cols = getattr(model, "feature_name_", None) or active_feature_cols()
+                today_feats = featured_df.loc[[dt], model_cols]
                 proba = float(model.predict_proba(today_feats)[0][1])
                 ml_s = (proba - 0.5) * 2
             except Exception:

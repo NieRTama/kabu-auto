@@ -21,7 +21,7 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from src.core import clock
 from src.core import config as cfg
-from src.strategy.indicators import FEATURE_COLS, build_features
+from src.strategy.indicators import active_feature_cols, build_features
 from src.strategy.labeling import build_training_set
 
 MODEL_PATH = Path("models/lgb_model.pkl")
@@ -55,7 +55,9 @@ def _write_model_meta(n_samples: int, n_estimators: int,
         "n_estimators": n_estimators,
         "cv_mean_accuracy": round(cv_mean, 4),
         "cv_std_accuracy": round(cv_std, 4),
-        "features": list(FEATURE_COLS),
+        # 学習時に実際に使った特徴量セットを記録する。ロード時にこの集合と
+        # active_feature_cols() を照合し、フラグ切替によるシェイプ不一致を検知する。
+        "features": list(active_feature_cols()),
         "lightgbm_version": lgb.__version__,
     }
     _meta_path().write_text(
@@ -186,6 +188,14 @@ def _fit(X: pd.DataFrame, y: pd.Series, weights: np.ndarray,
             cv_mean=cv_mean, cv_std=cv_std)
 
     if trigger is not None:
+        # zip はサイレントに短い方で切り詰めるため、列数と重要度数の一致を明示検査する
+        cols = active_feature_cols()
+        importances = model.feature_importances_.tolist()
+        if len(cols) != len(importances):
+            raise ValueError(
+                f"特徴量数の不一致: active_feature_cols={len(cols)} "
+                f"feature_importances={len(importances)}"
+            )
         _save_metrics(
             cv_mean=cv_mean,
             cv_std=cv_std,
@@ -193,7 +203,7 @@ def _fit(X: pd.DataFrame, y: pd.Series, weights: np.ndarray,
             cv_brier=cv_brier,
             n_samples=len(X),
             n_estimators=best_n_estimators,
-            feature_importances=dict(zip(FEATURE_COLS, model.feature_importances_.tolist())),
+            feature_importances=dict(zip(cols, importances)),
             trigger=trigger,
         )
 
@@ -276,6 +286,25 @@ def load() -> Optional[lgb.LGBMClassifier]:
             f"MLモデルのメタ情報がありません（hash未検証でロード）。sha256={digest[:12]}… を記録します"
         )
 
+    # ── 特徴量セットの整合検証（SHA256はファイル完全性のみ、feature不一致は別途検知）──
+    # メタに記録した学習時の特徴量と、現在の active_feature_cols() が食い違う場合、
+    # use_news_features フラグの切替とモデル再学習が非同期になっている（desync）。
+    # そのままでは predict 時にシェイプ不一致や誤推論を招くため fail-closed する。
+    if meta and meta.get("features") is not None:
+        trained_features = list(meta["features"])
+        active = list(active_feature_cols())
+        if trained_features != active:
+            from src.core.alerts import alert
+            logger.critical(
+                "MLモデルの特徴量セットが現在の設定と不一致です（フラグとモデルのdesync）。"
+                "ロードを中止しました。use_news_features を切り替えた場合は再学習が必要です。"
+                f" 学習時={trained_features} / 現在={active}"
+            )
+            alert("MLモデル特徴量不一致",
+                  "学習済みモデルの特徴量セットが現在の use_news_features 設定と一致しません。"
+                  "ロードを中止しました。フラグ切替後は再学習してください。")
+            return None
+
     with open(MODEL_PATH, "rb") as f:
         model = pickle.load(f)
 
@@ -292,14 +321,22 @@ def load() -> Optional[lgb.LGBMClassifier]:
     return model
 
 
-def predict_proba(model: lgb.LGBMClassifier, df: pd.DataFrame) -> float:
+def predict_proba(model: lgb.LGBMClassifier, df: pd.DataFrame,
+                  news_df: Optional[pd.DataFrame] = None) -> float:
     """最新の特徴量で上昇確率を返す（0.0〜1.0）。
     df に既に特徴量列がある場合は再計算しない。
+
+    列はモデル自身が学習した特徴量（model.feature_name_）で選択する。これにより
+    フラグ切替で active_feature_cols() がモデルとずれた場合に、黙ってスライスして
+    誤推論するのではなく KeyError を送出して上位（signal.generate）で検知できる。
     """
-    if FEATURE_COLS[0] not in df.columns:
-        df = build_features(df)
+    cols = active_feature_cols()
+    if cols[0] not in df.columns:
+        df = build_features(df, news_df=news_df)
     if df.empty or len(df) < 2:
         return 0.5
-    latest = df[FEATURE_COLS].iloc[[-1]]
+    # モデルが学習した特徴量順で選択する（学習時と推論時の列順・列集合を厳密一致させる）
+    model_cols = getattr(model, "feature_name_", None) or cols
+    latest = df[model_cols].iloc[[-1]]
     proba = model.predict_proba(latest)[0][1]
     return float(proba)

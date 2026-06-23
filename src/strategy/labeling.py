@@ -11,13 +11,13 @@
 （label concurrency）がIID仮定を破る問題に対し、サンプルの一意性に
 基づく重み（sample uniqueness weight）を付与して過学習を抑える。
 """
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from src.core import config as cfg
-from src.strategy.indicators import FEATURE_COLS, build_features
+from src.strategy.indicators import active_feature_cols, build_features
 
 
 def get_daily_volatility(close: pd.Series, span: int = 20) -> pd.Series:
@@ -124,11 +124,17 @@ def _assert_single_symbol_timeseries(df: pd.DataFrame) -> None:
         )
 
 
-def build_training_set(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
+def build_training_set(
+    df: pd.DataFrame, news_df: Optional[pd.DataFrame] = None
+) -> Tuple[pd.DataFrame, pd.Series, np.ndarray]:
     """特徴量・トリプルバリアラベル・サンプル重みを生成する。
 
     df は単一銘柄の時系列（日付インデックス・重複なし・昇順）であること。
     複数銘柄を学習する場合は ml_model.train_multi() を使う。
+
+    news_df を渡すと（かつ strategy.use_news_features が有効なら）ニュース特徴量を
+    結合する。ニュース結合はこの単一銘柄・単調 index のフレーム内でのみ行うこと
+    （グローバル連結前に結合すると銘柄境界をまたいで指標・ラベルが壊れる）。
 
     戻り値: (X, y, sample_weights)
     """
@@ -139,12 +145,12 @@ def build_training_set(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, np.nd
     max_holding = conf.get("tb_max_holding", 10)
     vol_span = conf.get("tb_vol_span", 20)
 
-    feat = build_features(df).reset_index(drop=True)
+    feat = build_features(df, news_df=news_df).reset_index(drop=True)
     labels, t_ends = triple_barrier_labels(feat, pt_mult, sl_mult, max_holding, vol_span)
     weights = get_sample_weights(t_ends)
 
     mask = ~np.isnan(labels)
-    X = feat.loc[mask, FEATURE_COLS].reset_index(drop=True)
+    X = feat.loc[mask, active_feature_cols()].reset_index(drop=True)
     y = pd.Series(labels[mask], name="label").astype(int).reset_index(drop=True)
     w = weights[mask]
     return X, y, w

@@ -190,3 +190,51 @@ class TestLoadVerification:
         assert "save=False" in source, (
             "backtest/engine.py の run_backtest は ml_model.train(save=False) を渡すべき"
         )
+
+
+class TestFeatureSetGuard:
+    """学習時の特徴量セットと現在の active_feature_cols() の整合検証（フラグ desync 検知）"""
+
+    def test_load_refuses_on_feature_set_mismatch(self, tmp_path):
+        """SHA256は一致しても、メタの features が現在の active セットと異なれば拒否する"""
+        import json
+        import src.strategy.ml_model as mod
+
+        original_path = mod.MODEL_PATH
+        try:
+            mod.MODEL_PATH = tmp_path / "lgb_model.pkl"
+            mod.MODEL_PATH.write_bytes(b"model-bytes")
+            digest = mod._sha256_file(mod.MODEL_PATH)
+            # features をわざと現在の active セットと食い違わせる
+            mod._meta_path().write_text(
+                json.dumps({"sha256": digest, "trained_at": "2026-01-01T00:00:00",
+                            "features": ["mismatched_feature"]}),
+                encoding="utf-8")
+            with patch("src.strategy.ml_model.pickle.load") as mock_load:
+                result = mod.load()
+            assert result is None
+            mock_load.assert_not_called()  # feature不一致時は pickle.load を呼ばない
+        finally:
+            mod.MODEL_PATH = original_path
+
+    def test_load_ok_when_feature_set_matches(self, tmp_path):
+        """メタの features が active_feature_cols() と一致すればロードする"""
+        import json
+        import src.strategy.ml_model as mod
+        from src.strategy.indicators import active_feature_cols
+
+        original_path = mod.MODEL_PATH
+        try:
+            mod.MODEL_PATH = tmp_path / "lgb_model.pkl"
+            mod.MODEL_PATH.write_bytes(b"model-bytes")
+            digest = mod._sha256_file(mod.MODEL_PATH)
+            mod._meta_path().write_text(
+                json.dumps({"sha256": digest, "trained_at": "2026-01-01T00:00:00",
+                            "features": list(active_feature_cols())}),
+                encoding="utf-8")
+            sentinel = object()
+            with patch("src.strategy.ml_model.pickle.load", return_value=sentinel):
+                result = mod.load()
+            assert result is sentinel
+        finally:
+            mod.MODEL_PATH = original_path
