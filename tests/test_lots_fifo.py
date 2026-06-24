@@ -206,3 +206,73 @@ class TestRebuildPosition:
         with get_session() as s:
             result = lots.rebuild_position(s, "9999")
             assert result is None
+
+
+class TestPeakPriceLifecycle:
+    """トレーリングストップ用 Position.peak_price の初期化・リセット"""
+
+    def test_new_position_initializes_peak_to_avg_cost(self, isolated_db):
+        with get_session() as s:
+            lots.record_buy_fill(s, 1, "7203", 100, 1000.0, _dt(9))
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            pos = s.scalar(select(Position).where(Position.symbol == "7203"))
+            assert pos.peak_price == 1000.0
+
+    def test_full_close_resets_peak_to_none(self, isolated_db):
+        with get_session() as s:
+            lots.record_buy_fill(s, 1, "7203", 100, 1000.0, _dt(9))
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            from src.data.database import Position as P
+            pos = s.scalar(select(P).where(P.symbol == "7203"))
+            pos.peak_price = 1500.0  # 値動き中にピークが更新された想定
+            s.commit()
+        with get_session() as s:
+            lots.consume_fifo(s, 2, "7203", 100, 1400.0, _dt(10))
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            pos = s.scalar(select(Position).where(Position.symbol == "7203"))
+            assert pos.quantity == 0
+            assert pos.peak_price is None
+
+    def test_reentry_after_full_close_reinitializes_peak(self, isolated_db):
+        """完全決済→再エントリーで、古いピークを引き継がず新しいavg_costから再スタートする"""
+        with get_session() as s:
+            lots.record_buy_fill(s, 1, "7203", 100, 1000.0, _dt(9))
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            lots.consume_fifo(s, 2, "7203", 100, 1500.0, _dt(10))  # 完全決済（ピーク→None）
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            lots.record_buy_fill(s, 3, "7203", 100, 800.0, _dt(11))  # 再エントリー（新値で）
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            pos = s.scalar(select(Position).where(Position.symbol == "7203"))
+            assert pos.peak_price == 800.0  # 古いピーク(1500/1000)を引き継いでいない
+
+    def test_partial_sell_keeps_peak(self, isolated_db):
+        """部分決済（quantity>0が継続）ではピークをリセットしない"""
+        with get_session() as s:
+            lots.record_buy_fill(s, 1, "7203", 100, 1000.0, _dt(9))
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            from src.data.database import Position as P
+            pos = s.scalar(select(P).where(P.symbol == "7203"))
+            pos.peak_price = 1500.0
+            s.commit()
+        with get_session() as s:
+            lots.consume_fifo(s, 2, "7203", 40, 1400.0, _dt(10))  # 100→60（部分決済）
+            lots.rebuild_position(s, "7203")
+            s.commit()
+        with get_session() as s:
+            pos = s.scalar(select(Position).where(Position.symbol == "7203"))
+            assert pos.quantity == 60
+            assert pos.peak_price == 1500.0  # 保持される

@@ -354,18 +354,56 @@ class RiskManager:
             return False, f"セクター集中率が上限({max_ratio:.0%})超: {sector}"
         return True, ""
 
-    def should_stop_loss(self, symbol: str, current_price: float) -> bool:
-        """損切りラインを超えているか判定"""
+    def evaluate_exit(self, symbol: str, current_price: float) -> tuple[bool, str]:
+        """損切り・ブレークイーブン・トレーリングストップを統合した退出判定。
+
+        呼び出しのたびに保有開始以降の最高値(Position.peak_price)を観測値で更新・永続化する
+        （5分間隔のstop_loss_check等から呼ばれる前提。市場時間中ずっと監視するのはこの値のため）。
+
+        ロジック:
+          1. 基準ライン = avg_cost × (1 + stop_loss_pct)（従来の損切りラインそのまま）
+          2. ピーク時の含み益率が breakeven_trigger_pct 以上に達したら、基準ラインを
+             avg_cost（ブレークイーブン）まで引き上げる（一度上がった分、元本割れの
+             リスクを取らない）。
+          3. 同時にトレーリングストップ（ピーク × (1 - trailing_stop_pct)）も有効化し、
+             基準ラインと比べて高い方（より安全な方）を採用する（ピークが伸びるほど
+             ラインも追随して上がる）。
+          breakeven_trigger_pct / trailing_stop_pct が0（未設定）ならこの2機能は無効になり、
+          従来の損切りのみの挙動と完全に一致する。
+
+        戻り値: (退出すべきか, 理由)。理由は "stop_loss"（基準ライン到達） /
+        "trailing_stop"（ブレークイーブン/トレーリングで保全した利益の確定）。
+        """
         stop_pct = self._conf.get("stop_loss_pct", -0.05)
+        trailing_pct = self._conf.get("trailing_stop_pct", 0.0)
+        breakeven_trigger_pct = self._conf.get("breakeven_trigger_pct", 0.0)
+
         with get_session() as session:
             pos = session.scalar(select(Position).where(Position.symbol == symbol))
-        if pos is None or pos.avg_cost <= 0:
-            return False
-        pnl_pct = (current_price - pos.avg_cost) / pos.avg_cost
-        if pnl_pct <= stop_pct:
-            logger.warning(f"損切りライン到達: {symbol} 損益率={pnl_pct:.2%}")
-            return True
-        return False
+            if pos is None or pos.avg_cost <= 0:
+                return False, ""
+            avg_cost = pos.avg_cost
+            new_peak = max(pos.peak_price or avg_cost, current_price)
+            if new_peak != pos.peak_price:
+                pos.peak_price = new_peak
+                session.commit()
+            peak = new_peak
+
+        effective_stop_price = avg_cost * (1 + stop_pct)
+        peak_gain_pct = (peak - avg_cost) / avg_cost
+        armed = breakeven_trigger_pct > 0 and peak_gain_pct >= breakeven_trigger_pct
+        if armed:
+            effective_stop_price = max(effective_stop_price, avg_cost)
+            if trailing_pct > 0:
+                effective_stop_price = max(effective_stop_price, peak * (1 - trailing_pct))
+
+        if current_price <= effective_stop_price:
+            pnl_pct = (current_price - avg_cost) / avg_cost
+            reason = "trailing_stop" if armed else "stop_loss"
+            label = "トレーリングストップ/ブレークイーブン到達" if armed else "損切りライン到達"
+            logger.warning(f"{label}: {symbol} 損益率={pnl_pct:.2%} ピーク以降の最高値={peak:.0f}")
+            return True, reason
+        return False, ""
 
     def validate_buy(self, symbol: str, price: float,
                      cash_balance: float, sector: Optional[str] = None) -> tuple[bool, str]:

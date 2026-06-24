@@ -237,13 +237,17 @@ class TradingServices:
                 else:
                     board = self.client.get_board(sym)
                     price = board.get("CurrentPrice", 0)
-                if price and self.risk.should_stop_loss(sym, price):
-                    logger.warning(f"損切り発動: {sym}")
-                    # 損切りは確実な約定を優先し成行で発注する（指値だと急変時に約定しない）。
-                    # reason="stop_loss" により日次上限・損失上限等の新規発注ゲートを
-                    # バイパスする（損切りは既存リスクを減らす退出操作のため止めてはいけない）
-                    self.order_mgr.sell_market(sym, qty, reason="stop_loss")
-                    alert("損切り実行", f"{sym} @{price:.0f}円")
+                if not price:
+                    continue
+                should_exit, exit_reason = self.risk.evaluate_exit(sym, price)
+                if should_exit:
+                    logger.warning(f"退出発動: {sym} ({exit_reason})")
+                    # 損切り・トレーリングストップとも確実な約定を優先し成行で発注する
+                    # （指値だと急変時に約定しない）。reason経由で日次上限・損失上限等の
+                    # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
+                    self.order_mgr.sell_market(sym, qty, reason=exit_reason)
+                    title = "利益確定（トレーリングストップ）実行" if exit_reason == "trailing_stop" else "損切り実行"
+                    alert(title, f"{sym} @{price:.0f}円")
             except Exception as e:
                 logger.error(f"損切りチェックエラー: {sym} {e}")
 

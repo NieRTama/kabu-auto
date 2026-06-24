@@ -87,12 +87,21 @@ def rebuild_position(session, symbol: str, sector: Optional[str] = None) -> Opti
     if pos is None:
         if total_qty <= 0:
             return None
-        pos = Position(symbol=symbol, quantity=total_qty, avg_cost=avg_cost, sector=sector)
+        pos = Position(symbol=symbol, quantity=total_qty, avg_cost=avg_cost, sector=sector,
+                       peak_price=avg_cost)
         session.add(pos)
     else:
+        was_closed = pos.quantity <= 0
         pos.quantity = total_qty
         pos.avg_cost = avg_cost
         pos.updated_at = clock.now()
         if sector and not pos.sector:
             pos.sector = sector
+        # トレーリングストップ用のピーク値（src/risk/manager.py の evaluate_exit が使う）。
+        # 完全決済でNoneに戻し、再エントリー時はその時点のavg_costで再初期化する
+        # （前サイクルの古いピークを引き継いで誤判定しないようにする）。
+        if total_qty <= 0:
+            pos.peak_price = None
+        elif was_closed:
+            pos.peak_price = avg_cost
     return pos

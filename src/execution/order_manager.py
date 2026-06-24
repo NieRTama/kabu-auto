@@ -475,14 +475,16 @@ class OrderManager:
         reason:
           - "normal":    通常の売却。新規発注と同じリスクゲート（日次上限・損失上限・
                          未解決注文ガード・同銘柄pending重複）を適用する。
-          - "stop_loss" / "emergency": 既存リスクを減らす退出操作なので、新規発注用の
-                         ゲートは適用しない（日次上限/損失上限到達中でも・未解決注文が
-                         残っていても、退出だけは止めない）。ただし同銘柄の未約定注文は
+          - "stop_loss" / "trailing_stop" / "emergency": 既存リスクを減らす退出操作なので、
+                         新規発注用のゲートは適用しない（日次上限/損失上限到達中でも・
+                         未解決注文が残っていても、退出だけは止めない）。trailing_stopは
+                         ピーク値からの下落・ブレークイーブン到達による利益確定/保全の退出
+                         （RiskManager.evaluate_exit参照）。ただし同銘柄の未約定注文は
                          先にキャンセルしてから成行売りを送る（競合発注を避けるため）。
         """
         if quantity <= 0:
             return None
-        is_exit = reason in ("stop_loss", "emergency")
+        is_exit = reason in ("stop_loss", "trailing_stop", "emergency")
         # OrderIntent.source へ記録する発注のきっかけ（4.2）。reasonを直接転記する。
         source = reason if is_exit else "manual"
         # 退出系は理由が明確な根拠なので、明示指定が無ければ reason を根拠として記録する（7.6）

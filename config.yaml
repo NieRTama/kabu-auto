@@ -15,6 +15,12 @@ trading:
   max_positions: 5  # 最大同時保有銘柄数
   max_position_ratio: 0.25  # 1銘柄あたり最大資金比率 (25%)
   stop_loss_pct: -0.07  # 損切りライン (-7%)
+  # ブレークイーブン到達後トレーリングストップ（0で無効。両方0なら従来の損切りのみの挙動と同一）。
+  # 保有開始後のピーク含み益率がbreakeven_trigger_pctに達したら、損切りラインを取得単価
+  # （ブレークイーブン）まで引き上げ、以後はピーク×(1-trailing_stop_pct)も基準に追加する
+  # （ピークが伸びるほどラインも追随して上がる＝利益を伸ばしつつ確定する）。
+  breakeven_trigger_pct: 0.03  # 含み益+3%でブレークイーブン発動
+  trailing_stop_pct: 0.05      # 発動後はピークから-5%で利益確定
   max_sector_ratio: 0.40  # 同一セクター最大集中率
   order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
   daily_order_limit: 100  # 1日の最大注文数

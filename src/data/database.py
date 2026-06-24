@@ -137,6 +137,9 @@ class Position(Base):
     quantity = Column(Integer, nullable=False, default=0)
     avg_cost = Column(Float, nullable=False, default=0.0)
     sector = Column(String(50))
+    # 保有開始以降に観測された最高値（トレーリングストップ・ブレークイーブン判定用）。
+    # 完全決済でNoneに戻し、再エントリー時はavg_costで再初期化する（src/execution/lots.py）。
+    peak_price = Column(Float)
     # 日時はプロジェクト全体で JST naive に統一する（scheduler・order・ml も datetime.now()=JST）。
     # 旧 datetime.utcnow と混在すると morning_execution の cutoff 比較が9時間ずれて
     # 前日シグナルを取りこぼすため、必ず datetime.now を使うこと。
