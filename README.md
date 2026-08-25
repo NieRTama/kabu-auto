@@ -218,6 +218,43 @@ CONFIRM_LIVE_TRADING=true python main.py
 
 未設定の場合は起動時にエラーメッセージを表示して終了します（`dry_run` は読み取りのみのため不要）。
 
+### かんたんモード切替（`switch-mode.bat`）
+
+`config.yaml` を手で編集しなくても、`switch-mode.bat` をダブルクリックすればメニューから
+モードを切り替えられる。モードに応じて **接続先（本番 18080 / 検証 18081）と `.env` の
+`KABU_API_PASSWORD`（本番用 / 検証用）も自動で整合**させ、編集前に `config.yaml.bak` /
+`.env.bak` を自動バックアップする。
+
+> **パスワードの持ち方**: スクリプトは APIパスワードの値を持たない。`.env`（gitignore 済み）に
+> `KABU_API_PASSWORD_LIVE` / `KABU_API_PASSWORD_VERIFY` を定義しておくと、切替時にその値を
+> `KABU_API_PASSWORD` へコピーする。未定義の場合はモードと接続先だけ切り替え、
+> `KABU_API_PASSWORD` は変更しない（警告を表示）。APIパスワードの平文は `.env` にのみ置き、
+> スクリプトや `config.yaml`、ドキュメントへ書き写さないこと。
+
+```
+現在: paper （接続先: 18081 / パスワード: 検証用）
+
+  [1] paper      ペーパー（仮想取引・発注なし）※実口座から隔離
+  [2] dry_run    ドライラン（実口座読取・発注なし）
+  [3] semi_live  セミライブ（承認後に実発注）
+  [4] live       本番（実資金で実発注）
+  [Q] 終了
+```
+
+- **接続先の自動整合**: `paper` は検証系（18081 / 検証パスワード）に隔離し、`dry_run` /
+  `semi_live` / `live` は本番系（18080 / 本番パスワード）に揃える。
+  （`paper` の日足価格は yfinance から取得するため、検証環境が停止していても支障なく動く。）
+- **`live` / `semi_live` を選ぶと** `yes` の確認を求め、確定後に `CONFIRM_LIVE_TRADING=true` を
+  セットして `python main.py` まで起動する。`paper` / `dry_run` は起動可否を `y/N` で確認する。
+- **ペーパーに戻す**ときは `[1]` を選ぶだけ。接続先とパスワードも検証系へ自動で戻る。
+- 非対話（バッチ/CI）で使う場合:
+  `powershell -File scripts\switch_mode.ps1 -Mode paper -NoLaunch`
+  （`-NoLaunch` を付けると切替のみ行い起動しない。`live` / `semi_live` は誤起動防止のため
+  非対話では自動起動しない。）
+
+> モードの反映には kabu-auto の再起動が必要（起動時に一度だけ `config.yaml` を読むため、
+> 稼働中プロセスへは影響しない）。
+
 ### プリフライトチェック（起動前の安全確認）
 
 `paper` 以外のモードでは起動時に自動でプリフライトチェックを実行します。
