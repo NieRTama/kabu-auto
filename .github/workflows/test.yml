@@ -5,6 +5,18 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
+  # push 契機だけだと、コードを変更しない期間の劣化に気づけない。
+  #   - 実時刻に依存するテストの「時限爆弾」化（絶対日付のハードコード等）
+  #   - 依存パッケージの破壊的更新（requirements.txt はバージョン範囲を許す箇所がある）
+  #   - 外部API・データソース側の仕様変更
+  # 実際、2026-06〜08 の約2か月間テストが壊れたままだったのを、次の push まで検知できなかった。
+  # 毎週月曜 00:00 UTC = 月曜 09:00 JST（週明けに結果を確認できる時刻）に実行する。
+  # 注意: GitHub はリポジトリが60日間無活動だと schedule を自動で停止する。
+  #       長期間 push しない場合は Actions タブで有効化し直すこと（下の workflow_dispatch で手動実行も可）。
+  schedule:
+    - cron: "0 0 * * 1"
+  # 手動実行（Actions タブの "Run workflow"）。原因調査・再実行に使う。
+  workflow_dispatch:
 
 jobs:
   test:
