@@ -182,7 +182,7 @@ x:
 # alerts.discord_webhook_url（異常時アラート用）とは別チャンネル想定。同じURLを設定すれば
 # 同一チャンネルにまとめることもできる。
 discord_report:
-  enabled: false  # trueにすると実際に投稿される（URL未設定なら投稿はスキップされるだけ）
+  enabled: true  # trueにすると実際に投稿される（URL未設定なら投稿はスキップされるだけ）
   webhook_url: ""
 
 logging:
