@@ -234,6 +234,7 @@ def main() -> None:
     scheduler.register("afternoon_execution", services.afternoon_execution)
     scheduler.register("reconcile_orders", services.reconcile_orders)
     scheduler.register("health_check", services.health_check)
+    scheduler.register("heartbeat", services.heartbeat)
     scheduler.register("x_daily_report", services.post_daily_summary_to_x)
     scheduler.register("discord_daily_report", services.post_daily_summary_to_discord)
 

@@ -188,6 +188,26 @@ class TradingServices:
         except Exception as e:
             logger.error(f"異常検知ジョブエラー: {e}")
 
+    # ─── 生存確認（ハートビート）─────────────────────────
+    def heartbeat(self) -> None:
+        """毎営業日の場前に「稼働中です」を通知する。
+
+        異常検知はプロセスが生きていることが前提で、落ちていれば通知も来ない。
+        「異常がない」と「死んでいる」を区別できるようにするための能動的な生存信号
+        （2026-08-26/27 は通知が来ないことを正常と誤認し、2営業日気づけなかった）。
+        """
+        try:
+            from src.core import heartbeat as hb
+            mode = self.trading_conf.get("mode", "paper")
+            snapshot = self.order_mgr.status_snapshot()
+            with get_session() as session:
+                count = session.scalar(
+                    select(func.count(Position.id)).where(Position.quantity > 0)
+                ) or 0
+            hb.send(mode, snapshot, count)
+        except Exception as e:
+            logger.error(f"ハートビートジョブエラー: {e}")
+
     # ─── 日次レポートのX投稿 ─────────────────────────────
     def post_daily_summary_to_x(self) -> None:
         """当日/週次/月次/総合の損益サマリ・勝率をXへ投稿する（x.enabled=trueのときのみ）。

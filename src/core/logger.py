@@ -52,4 +52,12 @@ def setup() -> None:
         retention=retention,
         encoding="utf-8",
     )
+
+    # ERROR以上を時間窓で数えるシンク（health_check がこの件数を見て異常を通知する）。
+    # 個々のバグは予測できないが「壊れたらエラーが増える」のは普遍的に成り立つため、
+    # 未知の障害に対する防御になる（2026-08 の認証切れ・KeyError はどちらも
+    # 既存の異常検知をすり抜けたが、エラー数では捉えられていた）。
+    from src.core import error_rate
+    logger.add(error_rate.make_sink(), level="ERROR")
+
     logger.info("Logger initialized")

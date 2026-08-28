@@ -11,10 +11,13 @@
   - 取引停止スイッチ（kill switch）が ON のまま（warning）
 """
 import threading
+import time
 
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import config as cfg
+from src.core import error_rate
 from src.core import halt
 from src.core.alerts import alert
 from src.data.database import Trade, get_session
@@ -99,6 +102,24 @@ def check_anomalies(risk) -> list[dict]:
             "key": "halted", "level": WARNING,
             "message": f"取引停止スイッチがONです（{halt.get_state().get('reason') or '手動停止'}）",
         })
+
+    # 直近のエラー多発を検知する（未知の障害に対する防御）。
+    # 上の各チェックは「取引の結果」を見るもので、「システムが機能しているか」は
+    # 見ていない。実際 2026-08 の認証切れ（401が178回）とトレーリングストップの
+    # KeyError はどちらもすり抜けたが、エラー数では捉えられていた。
+    conf = cfg.get_section("runtime")
+    window = float(conf.get("error_rate_window_seconds", error_rate.DEFAULT_WINDOW_SECONDS))
+    threshold = int(conf.get("error_rate_threshold", error_rate.DEFAULT_THRESHOLD))
+    if threshold > 0:
+        snap = error_rate.snapshot(now=time.monotonic(), window_seconds=window)
+        if snap["count"] >= threshold:
+            items.append({
+                "key": "error_rate_high", "level": CRITICAL,
+                "message": (
+                    f"直近{window / 60:.0f}分でエラーが{snap['count']}件発生しています"
+                    f"（閾値{threshold}件）。直近のエラー: {snap['latest'][:200]}"
+                ),
+            })
 
     return items
 

@@ -82,6 +82,15 @@ class TradingScheduler:
                 day_of_week="mon-fri",
                 hour=9, minute=5, id="morning_execution",
             )
+        if "heartbeat" in cb:
+            # 平日8:45（場前・トークン更新8:30の後）に「稼働中です」を通知する。
+            # 異常検知はプロセスが生きている前提なので、落ちていれば通知も来ない。
+            # 能動的な生存信号があると「通知が来ないこと自体」を異常として扱える
+            # （2026-08-26/27 は通知なしを正常と誤認し2営業日気づけなかった）。
+            self._scheduler.add_job(
+                cb["heartbeat"], "cron",
+                day_of_week="mon-fri", hour=8, minute=45, id="heartbeat",
+            )
         if "afternoon_execution" in cb:
             # 12:35（後場寄り直後）に、朝は資金不足・板薄等で見送った銘柄を拾い直す
             # （取引頻度向上のため2026-08-25追加。対象は未保有銘柄のみ。ライブモードのみ実行される）
