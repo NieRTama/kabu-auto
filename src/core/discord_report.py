@@ -37,18 +37,32 @@ def post_text(text: str) -> bool:
         return False
 
 
-def format_for_discord(mode: str, report: dict) -> str:
-    """Discord投稿用に整形する（上限2000文字。X(280字)より余裕があるため通常は切り詰め不要）。"""
-    text = format_report_text(mode, report)
+def format_for_discord(mode: str, report: dict, holdings: Optional[dict] = None) -> str:
+    """Discord投稿用に整形する（上限2000文字。X(280字)より余裕があるため通常は切り詰め不要）。
+
+    holdings を渡すと保有建玉の評価額・含み損益も併記する。Discordは文字数に
+    余裕があるため既定で付ける（Xは280字制限のため実現損益のみに留める）。
+    """
+    text = format_report_text(mode, report, holdings)
     if len(text) > DISCORD_MAX_CONTENT_LENGTH:
         text = text[: DISCORD_MAX_CONTENT_LENGTH - 1] + "…"
     return text
 
 
 def post_daily_report(mode: str, reference_capital: float) -> Optional[str]:
-    """日次レポートを集計・整形してDiscordへ投稿する。投稿したテキストを返す（失敗時も返す）。"""
-    from src.core.pnl_report import build_report
+    """日次レポートを集計・整形してDiscordへ投稿する。投稿したテキストを返す（失敗時も返す）。
+
+    確定した実現損益（当日/週次/月次/総合）に加え、現在の保有建玉の評価額と
+    含み損益も報告する（決済前のポジション状況が実現損益だけでは見えないため）。
+    """
+    from src.core.pnl_report import build_holdings, build_report
     report = build_report(reference_capital)
-    text = format_for_discord(mode, report)
+    try:
+        holdings = build_holdings(reference_capital)
+    except Exception as e:
+        # 保有状況の取得に失敗しても、確定損益のレポートは送る（部分的な失敗で全部を落とさない）
+        logger.warning(f"保有状況の集計に失敗しました（実現損益のみ投稿します）: {e}")
+        holdings = None
+    text = format_for_discord(mode, report, holdings)
     post_text(text)
     return text

@@ -33,6 +33,55 @@ class PeriodPnL:
         return round(self.win_count / decided, 3) if decided else None
 
 
+def build_holdings(reference_capital: float = 0.0) -> dict:
+    """現在の保有建玉の評価額・簿価・含み損益を返す。
+
+    実現損益（build_report）は「確定した成績」だが、それだけでは決済前の
+    含み損益が見えない。日次レポートで現在のポジション状況も併せて把握できるようにする。
+
+    最新終値が取得できない銘柄は評価額・含み損益の計算から除外し、`unpriced` に
+    銘柄コードを載せる（avg_costで代用すると含み損益が常に0になり「データが無い」
+    ことを隠してしまうため。RiskManager._unrealized_pnl_with_gaps と同じ方針）。
+
+    戻り値:
+      count        : 保有銘柄数
+      cost         : 取得原価の合計（円）
+      market_value : 時価評価額の合計（円。価格不明銘柄は含まない）
+      unrealized   : 含み損益（円。正=含み益）
+      pct          : 基準資金に対する含み損益の比率（基準資金が0ならNone）
+      unpriced     : 価格を取得できず計算から除外した銘柄コード
+    """
+    from src.data.database import Position
+    from src.data.market_data import latest_closes
+
+    with get_session() as session:
+        positions = list(session.scalars(
+            select(Position).where(Position.quantity > 0)
+        ).all())
+    closes = latest_closes([p.symbol for p in positions]) if positions else {}
+
+    cost = market_value = 0.0
+    unpriced: list[str] = []
+    for p in positions:
+        close = closes.get(p.symbol)
+        if close and p.avg_cost:
+            cost += p.avg_cost * p.quantity
+            market_value += close * p.quantity
+        elif p.avg_cost:
+            unpriced.append(p.symbol)
+
+    unrealized = market_value - cost
+    pct = (unrealized / reference_capital) if reference_capital else None
+    return {
+        "count": len(positions),
+        "cost": cost,
+        "market_value": market_value,
+        "unrealized": unrealized,
+        "pct": pct,
+        "unpriced": unpriced,
+    }
+
+
 def _week_start(d: date) -> date:
     """その週の月曜日を返す（ISO週開始）。"""
     return d - timedelta(days=d.weekday())
@@ -97,8 +146,32 @@ def _format_period(p: PeriodPnL) -> str:
     return f"{p.label}: {yen}{wr}"
 
 
-def format_report_text(mode: str, report: dict) -> str:
+def _format_holdings(h: dict) -> list[str]:
+    """保有建玉（評価額・含み損益）の表示行を組み立てる。"""
+    if not h or not h.get("count"):
+        return ["保有: なし"]
+    unrealized = h["unrealized"]
+    sign = "+" if unrealized >= 0 else ""
+    line = f"含み損益: {sign}{unrealized:,.0f}円"
+    if h.get("pct") is not None:
+        pct_sign = "+" if h["pct"] >= 0 else ""
+        line += f" ({pct_sign}{h['pct']:.1%})"
+    lines = [
+        f"保有: {h['count']}銘柄",
+        f"評価額: {h['market_value']:,.0f}円（取得 {h['cost']:,.0f}円）",
+        line,
+    ]
+    if h.get("unpriced"):
+        # 価格を取れなかった銘柄は評価額に含まれていない。黙って過小表示しない
+        lines.append(f"※価格取得不可のため未算入: {', '.join(h['unpriced'])}")
+    return lines
+
+
+def format_report_text(mode: str, report: dict, holdings: Optional[dict] = None) -> str:
     """日次レポートの投稿文を組み立てる（モード・当日/週次/月次/総合・勝率）。
+
+    holdings を渡すと、確定した実現損益に加えて「現在のポジション状況」
+    （保有銘柄数・評価額・含み損益）も併記する。省略時は従来どおり実現損益のみ。
 
     プラットフォーム非依存（文字数上限の切り詰めは行わない）。X/Discordそれぞれの
     投稿関数が、各プラットフォームの上限に合わせて切り詰めを行う。
@@ -112,4 +185,7 @@ def format_report_text(mode: str, report: dict) -> str:
         _format_period(report["monthly"]),
         _format_period(report["overall"]),
     ]
+    if holdings is not None:
+        lines.append("")
+        lines.extend(_format_holdings(holdings))
     return "\n".join(lines)
