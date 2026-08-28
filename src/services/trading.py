@@ -301,13 +301,34 @@ class TradingServices:
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
 
-    # ─── 朝の発注（ライブモードのみ）────────────────────
+    # ─── 前営業日シグナルの発注（朝・後場で共有）─────────────
     def morning_execution(self) -> None:
         """9:05 に前営業日のBUY/SELLシグナルを元に発注する。
 
         実行対象は paper 以外（live / dry_run / semi_live）。発注の実体は OrderManager が
         モードに応じて分岐する（live=実発注 / dry_run=実発注せず記録のみ / semi_live=承認キュー）。
         paper は signal_scan 内で当日終値で即時シミュレートするため morning は不要。
+        """
+        self._execute_pending_signals(source="morning_execution", skip_existing=False)
+
+    def afternoon_execution(self) -> None:
+        """12:35（後場寄り）に、朝に見送った銘柄を拾い直す取引頻度向上用スロット。
+
+        朝は資金不足・板薄・スプレッド超過等で見送られる銘柄が出る。同じ前営業日
+        シグナルセットを後場でも一度だけ再評価し、寄り付き直後より板が安定した
+        タイミングで拾えるようにする（2026-08-25 取引頻度向上のため追加）。
+
+        skip_existing=True で「既に保有中」の銘柄はBUY対象から除外する（＝後場は
+        朝に見送った未保有銘柄を拾い直す用途に限定し、保有銘柄への買い増しはしない）。
+        未約定注文がある銘柄は OrderManager._has_pending_order() が別途止める。
+        """
+        self._execute_pending_signals(source="afternoon_execution", skip_existing=True)
+
+    def _execute_pending_signals(self, *, source: str, skip_existing: bool) -> None:
+        """直近バッチのBUY/SELLシグナルを元に発注する（morning/afternoon共通本体）。
+
+        source はジョブ名（OrderIntent.source・ログ表記に使う）。
+        skip_existing=True のときは、BUY候補のうち既に保有中の銘柄を対象から除外する。
         """
         mode = self.trading_conf.get("mode", "paper")
         if not tm.uses_morning_execution(mode):
@@ -322,6 +343,7 @@ class TradingServices:
 
         buy_signals = [s for s in pending if s.action == "BUY"]
         sell_signals = [s for s in pending if s.action == "SELL"]
+        label = "後場" if skip_existing else "朝"
 
         # ── SELL シグナル: 保有ポジションがあれば売る ─────────────
         for sig in sell_signals:
@@ -335,18 +357,20 @@ class TradingServices:
                     continue
                 self.order_mgr.sell(sig.symbol, float(price), qty,
                                     rationale=_signal_rationale(sig),
-                                    source="morning_execution")
-                logger.info(f"朝売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
+                                    source=source)
+                logger.info(f"{label}売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
             except Exception as e:
-                logger.error(f"朝売り発注失敗: {sig.symbol} {e}")
+                logger.error(f"{label}売り発注失敗: {sig.symbol} {e}")
 
         # ── BUY シグナル: 余力を確認して買う ──────────────────────
+        if skip_existing:
+            buy_signals = [s for s in buy_signals if _get_position_qty(s.symbol) <= 0]
         if not buy_signals:
             return
         # 大引け間際の新規BUYは薄商い・不利約定を招きやすいので見送る（P0-6。0で無効）
         near_close_min = int(self.liquidity_conf.get("no_new_buy_minutes_before_close", 0) or 0)
         if TradingScheduler.is_near_close(near_close_min):
-            logger.info(f"朝買い見送り: 大引け{near_close_min}分前以降のため新規BUYを抑止")
+            logger.info(f"{label}買い見送り: 大引け{near_close_min}分前以降のため新規BUYを抑止")
             return
         try:
             wallet = self.client.get_wallet()
@@ -364,30 +388,30 @@ class TradingServices:
                 sector = sectors.get(sig.symbol, "")
                 ok, reason = self.risk.validate_buy(sig.symbol, float(price), cash, sector)
                 if not ok:
-                    logger.info(f"朝買い見送り: {sig.symbol} - {reason}")
+                    logger.info(f"{label}買い見送り: {sig.symbol} - {reason}")
                     continue
                 ok_liq, liq_reason = liquidity.check_liquidity(
                     sig.symbol, load_ohlcv(sig.symbol), self.liquidity_conf)
                 if not ok_liq:
-                    logger.info(f"朝買い見送り: {liq_reason}")
+                    logger.info(f"{label}買い見送り: {liq_reason}")
                     continue
                 ok_sp, sp_reason = liquidity.check_spread(board, self.liquidity_conf)
                 if not ok_sp:
-                    logger.info(f"朝買い見送り: {sig.symbol} - {sp_reason}")
+                    logger.info(f"{label}買い見送り: {sig.symbol} - {sp_reason}")
                     continue
                 qty = self.risk.calc_position_size(sig.symbol, float(price), cash)
                 if qty <= 0:
                     continue
                 order_id = self.order_mgr.buy(sig.symbol, float(price), qty, sector=sector,
                                               rationale=_signal_rationale(sig),
-                                              source="morning_execution")
+                                              source=source)
                 if order_id:
                     # 同一スキャン内の以降の銘柄が同じ余力を前提に判定しないよう、
                     # 発注成功分をその場で減算する（複数銘柄の資金二重計上を防ぐ。
                     # RiskManager の未約定引当と二重で守る）
                     cash -= float(price) * qty
-                    logger.info(f"朝買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
+                    logger.info(f"{label}買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
                 else:
-                    logger.warning(f"朝買い発注失敗（注文拒否）: {sig.symbol}")
+                    logger.warning(f"{label}買い発注失敗（注文拒否）: {sig.symbol}")
             except Exception as e:
-                logger.error(f"朝買い発注失敗: {sig.symbol} {e}")
+                logger.error(f"{label}買い発注失敗: {sig.symbol} {e}")

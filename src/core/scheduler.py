@@ -82,6 +82,14 @@ class TradingScheduler:
                 day_of_week="mon-fri",
                 hour=9, minute=5, id="morning_execution",
             )
+        if "afternoon_execution" in cb:
+            # 12:35（後場寄り直後）に、朝は資金不足・板薄等で見送った銘柄を拾い直す
+            # （取引頻度向上のため2026-08-25追加。対象は未保有銘柄のみ。ライブモードのみ実行される）
+            self._scheduler.add_job(
+                cb["afternoon_execution"], "cron",
+                day_of_week="mon-fri",
+                hour=12, minute=35, id="afternoon_execution",
+            )
         if "health_check" in cb:
             # 運用異常（未解決注文・損失上限接近・kill switch）の定期検知（平日 8:00-23:00 / 15分毎）。
             # 市場時間に限定しないのは、場が引けた後でも未解決注文は要対応のため。

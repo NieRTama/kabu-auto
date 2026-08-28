@@ -177,6 +177,7 @@ def main() -> None:
     scheduler.register("stop_loss_check", services.stop_loss_check)
     scheduler.register("signal_scan", services.signal_scan)
     scheduler.register("morning_execution", services.morning_execution)
+    scheduler.register("afternoon_execution", services.afternoon_execution)
     scheduler.register("reconcile_orders", services.reconcile_orders)
     scheduler.register("health_check", services.health_check)
     scheduler.register("x_daily_report", services.post_daily_summary_to_x)

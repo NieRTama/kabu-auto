@@ -199,19 +199,20 @@ class TestMorningExecutionMixed:
 
     def test_sell_happens_before_buy_in_code_order(self):
         """コードの実行順: SELL ループが BUY ループより先に来ること"""
-        # 取引ロジックは services/trading.py に切り出したため、そちらの
-        # morning_execution が SELL → BUY の順で実装されていることを検証する
+        # 取引ロジックは services/trading.py の _execute_pending_signals に集約されており
+        # （morning_execution / afternoon_execution はこれを呼ぶだけの薄いラッパー）、
+        # そちらが SELL → BUY の順で実装されていることを検証する
         import inspect
         from src.services.trading import TradingServices
 
-        src = inspect.getsource(TradingServices.morning_execution)
+        src = inspect.getsource(TradingServices._execute_pending_signals)
         # ループの開始位置で比較（変数定義ではなく実行順を確認）
         sell_loop_idx = src.find("for sig in sell_signals")
         buy_check_idx = src.find("if not buy_signals")
         assert sell_loop_idx != -1, "sell_signals ループが見つからない"
         assert buy_check_idx != -1, "buy_signals チェックが見つからない"
         assert sell_loop_idx < buy_check_idx, (
-            "morning_execution では SELL を BUY より先に処理すべき（余力確保のため）"
+            "_execute_pending_signals では SELL を BUY より先に処理すべき（余力確保のため）"
         )
 
     def test_only_sell_signal_does_not_call_buy(self):

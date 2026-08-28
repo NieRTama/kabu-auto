@@ -27,9 +27,9 @@ class TestRiskProfile:
     def test_set_high_risk_applies_to_config(self):
         rp.set_active("high_risk")
         assert rp.get_active() == "high_risk"
-        assert cfg.get_section("trading")["max_position_ratio"] == 0.35
+        assert cfg.get_section("trading")["max_position_ratio"] == 0.28
         assert cfg.get_section("trading")["stop_loss_pct"] == -0.10
-        assert cfg.get_section("trading")["max_positions"] == 4
+        assert cfg.get_section("trading")["max_positions"] == 8
         assert cfg.get_section("trading")["max_daily_loss"] == 60000
         assert cfg.get_section("strategy")["buy_threshold"] == 0.08
         assert cfg.get_section("strategy")["sell_threshold"] == -0.08
@@ -61,7 +61,7 @@ class TestRiskProfile:
         cfg.load("config.yaml")  # config を素の値に戻してから
         name = rp.load(path)
         assert name == "high_risk"
-        assert cfg.get_section("trading")["max_position_ratio"] == 0.35
+        assert cfg.get_section("trading")["max_position_ratio"] == 0.28
 
     def test_switch_changes_riskmanager_effective_values(self):
         """RiskManager は trading 辞書の参照を保持するため、切替が即反映される"""
@@ -69,7 +69,7 @@ class TestRiskProfile:
         risk = risk_mod.RiskManager()
         # low_risk: 12% → 100万の12% = 12万 → 1000円株なら 100株
         qty_low = risk.calc_position_size("7203", 1000.0, 1_000_000)
-        rp.set_active("high_risk")  # 35% → 35万 → 300株
+        rp.set_active("high_risk")  # 28% → 28万 → 280株 → 100株単位で200株
         qty_high = risk.calc_position_size("7203", 1000.0, 1_000_000)
         assert qty_low == 100
-        assert qty_high == 300
+        assert qty_high == 200
