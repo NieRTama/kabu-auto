@@ -19,6 +19,8 @@ from sqlalchemy import func, select
 from src.core import config as cfg
 from src.core import error_rate
 from src.core import halt
+from src.core import liveness
+from src.core.scheduler import TradingScheduler
 from src.core.alerts import alert
 from src.data.database import Trade, get_session
 from src.execution import order_status as st
@@ -118,6 +120,25 @@ def check_anomalies(risk) -> list[dict]:
                 "message": (
                     f"直近{window / 60:.0f}分でエラーが{snap['count']}件発生しています"
                     f"（閾値{threshold}件）。直近のエラー: {snap['latest'][:200]}"
+                ),
+            })
+
+    # 場中に「動いた形跡」が途絶えていないかを見る（サイレント故障の検知）。
+    # エラー率監視は「壊れたらエラーが増える」故障を捉えるが、例外を出さずに
+    # 静かに止まる故障（ジョブの死・無反応化）はすり抜けるため、正常系の動作
+    # （板取得の成功）が続いていることを別途確認する。
+    silence_limit = float(conf.get("liveness_silence_seconds", liveness.DEFAULT_SILENCE_SECONDS))
+    if TradingScheduler.is_market_open():
+        now_mono = time.monotonic()
+        if liveness.is_silent(now=now_mono, market_open=True,
+                              threshold_seconds=silence_limit):
+            elapsed = liveness.seconds_since_alive(now=now_mono) or 0
+            items.append({
+                "key": "liveness_silent", "level": CRITICAL,
+                "message": (
+                    f"場中にもかかわらず市場データの取得が{elapsed / 60:.0f}分間"
+                    f"成功していません（閾値{silence_limit / 60:.0f}分）。"
+                    "ジョブ停止・接続断などで監視が止まっている可能性があります"
                 ),
             })
 

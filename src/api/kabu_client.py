@@ -12,6 +12,7 @@ import websocket
 from loguru import logger
 
 from src.core import config as cfg
+from src.core import liveness
 
 
 class KabuClient:
@@ -58,7 +59,11 @@ class KabuClient:
         url = f"{self._base_url}/board/{symbol}@{exchange}"
         resp = requests.get(url, headers=self._headers, timeout=10)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        # 「動いている形跡」を記録する。場中にこれが途絶えたら health_check が
+        # サイレント故障として検知する（例外を出さずに止まる故障への防御）。
+        liveness.mark_alive(now=time.monotonic())
+        return data
 
     def get_symbol(self, symbol: str, exchange: int = 1) -> dict:
         """銘柄情報を取得"""
