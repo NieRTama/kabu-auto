@@ -21,6 +21,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
+    discord_bot,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -222,6 +223,52 @@ def main() -> None:
     set_ml_retrain_fn(services.ml_retrain)
     set_data_update_fn(services.data_update)
 
+    # ─── Discordリモコン（任意。未設定なら無効）──────────────
+    # 外出先からの状態確認・緊急停止用。秘密情報は運ばせない方針のため、
+    # .env の書き込みや認証情報の送受信、緊急全決済は実装しない
+    # （全決済は誤爆時の損害が大きいのでダッシュボードのトークン必須経路に限定）。
+    def _cmd_status(_args: str) -> str:
+        snap = order_mgr.status_snapshot()
+        auth = "有効" if not broker_auth.is_expired() else "切れ（要ログイン）"
+        order_state = "可" if snap["can_place_order"] else f"不可（{snap['block_reason']}）"
+        return (f"モード: {tm.description(mode)}\n"
+                f"発注: {order_state}\n"
+                f"kabuステーション認証: {auth}\n"
+                f"未解決注文: {snap['unresolved_orders']}件 / "
+                f"承認待ち: {snap['pending_approvals']}件")
+
+    def _cmd_positions(_args: str) -> str:
+        from src.data.database import Position
+        with db.get_session() as session:
+            rows = session.scalars(
+                db.select(Position).where(Position.quantity > 0)
+            ).all()
+            lines = [f"{p.symbol}: {p.quantity}株 @ {p.avg_cost:.0f}" for p in rows]
+        return "保有建玉:\n" + ("\n".join(lines) if lines else "（なし）")
+
+    def _cmd_halt(args: str) -> str:
+        halt_store.engage(args.strip() or "Discordから手動停止")
+        return "取引を停止しました（新規発注を抑止。損切り・緊急決済は引き続き動作します）"
+
+    def _cmd_resume(_args: str) -> str:
+        halt_store.release()
+        return "取引を再開しました"
+
+    discord_conf = cfg.get_section("alerts")
+    remote = discord_bot.build(
+        token=os.environ.get("DISCORD_BOT_TOKEN", "")
+        or discord_conf.get("discord_bot_token", ""),
+        channel_id=os.environ.get("DISCORD_BOT_CHANNEL_ID", "")
+        or str(discord_conf.get("discord_bot_channel_id", "")),
+        allowed_user_ids={os.environ.get("DISCORD_ALLOWED_USER_ID", "")},
+        handlers={
+            "status": _cmd_status,
+            "positions": _cmd_positions,
+            "halt": _cmd_halt,
+            "resume": _cmd_resume,
+        },
+    )
+
     # ─── スケジューラのコールバック登録 ──────────────────────
     scheduler.register("risk_reset", risk.reset_daily_counters)
     scheduler.register("token_refresh", token_refresh)
@@ -235,6 +282,8 @@ def main() -> None:
     scheduler.register("reconcile_orders", services.reconcile_orders)
     scheduler.register("health_check", services.health_check)
     scheduler.register("heartbeat", services.heartbeat)
+    if remote is not None:
+        scheduler.register("discord_poll", remote.poll_once)
     scheduler.register("x_daily_report", services.post_daily_summary_to_x)
     scheduler.register("discord_daily_report", services.post_daily_summary_to_discord)
 

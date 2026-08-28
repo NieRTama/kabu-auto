@@ -119,6 +119,13 @@ class TradingScheduler:
                 cb["discord_daily_report"], "cron",
                 day_of_week="mon-fri", hour=17, minute=30, id="discord_daily_report",
             )
+        if "discord_poll" in cb:
+            # Discordリモコンの新着コマンドを取りに行く（アウトバウンドのみ・ポート開放不要）。
+            # 30秒間隔は「状態確認・緊急停止」用途に十分で、API負荷も小さい。
+            self._scheduler.add_job(
+                cb["discord_poll"], "interval",
+                seconds=30, id="discord_poll",
+            )
         if "reconcile_orders" in cb:
             # WebSocketイベントの取り逃し・切断・再起動を跨いでDB↔ブローカーの
             # 注文状態ズレを定期的に検知・補正する（市場時間外はコールバック側でスキップ）
