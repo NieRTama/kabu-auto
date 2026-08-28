@@ -487,9 +487,16 @@ class OrderManager:
         is_exit = reason in ("stop_loss", "trailing_stop", "emergency")
         # OrderIntent.source へ記録する発注のきっかけ（4.2）。reasonを直接転記する。
         source = reason if is_exit else "manual"
-        # 退出系は理由が明確な根拠なので、明示指定が無ければ reason を根拠として記録する（7.6）
+        # 退出系は理由が明確な根拠なので、明示指定が無ければ reason を根拠として記録する（7.6）。
+        # .get()＋フォールバックにする（辞書リテラル+添字だと、is_exitの対象に新しいreason値を
+        # 追加した際にここへの追記漏れでKeyErrorになり退出処理そのものが落ちる。実際に
+        # trailing_stop追加時にこの追記が漏れ、利確が一切実行されない事故になった）。
         if rationale is None and is_exit:
-            rationale = {"stop_loss": "損切り（stop_loss）", "emergency": "緊急決済（emergency）"}[reason]
+            rationale = {
+                "stop_loss": "損切り（stop_loss）",
+                "trailing_stop": "利益確定（トレーリングストップ/ブレークイーブン）",
+                "emergency": "緊急決済（emergency）",
+            }.get(reason, f"退出（{reason}）")
 
         if not is_exit:
             ok, block_reason = self._risk.can_place_order()

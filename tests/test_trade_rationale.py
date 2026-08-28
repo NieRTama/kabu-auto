@@ -62,6 +62,20 @@ class TestRationaleRecording:
             om.sell_market("7203", 100, reason="stop_loss")
         assert "損切り" in added[0].rationale
 
+    def test_trailing_stop_market_autofills_rationale(self):
+        """reason="trailing_stop" でも例外を投げず退出できること（回帰防止）。
+
+        2026-08-25 実運用で発見: rationale自動補完の辞書に "trailing_stop" キーが
+        無く、ブレークイーブン/トレーリングストップ成立時に sell_market() が
+        KeyError を投げて決済処理が中断し、利確が一切実行されない事故になった
+        （src/services/trading.py の stop_loss_check → evaluate_exit が
+        reason="trailing_stop" を返すのに、order_manager 側が未対応だった）。
+        """
+        with _make_om("paper") as (om, added):
+            order_id = om.sell_market("7203", 100, reason="trailing_stop")
+        assert order_id is not None, "trailing_stop 退出が例外で失敗している"
+        assert "トレーリングストップ" in added[0].rationale or "ブレークイーブン" in added[0].rationale
+
     def test_emergency_market_autofills_rationale(self):
         with _make_om("paper") as (om, added):
             om.sell_market("7203", 100, reason="emergency")
