@@ -782,13 +782,15 @@ class OrderManager:
         発注可否(can_place_order)は kill switch・日次上限・損失上限・未解決ガードを
         すべて織り込んだ実効的な判定。
         """
-        from src.core import halt
+        from src.core import broker_auth, halt
         can_order, reason = self._risk.can_place_order()
         return {
             "mode": self._mode,
             "can_place_order": can_order,
             "block_reason": reason,
             "halt": halt.get_state(),
+            # kabuステーションのログイン認証切れ（毎朝失効する。切れている間は発注不可）
+            "broker_auth": broker_auth.get_state(),
             "unresolved_orders": self._count_unresolved(),
             "pending_approvals": self._count_pending_approvals(),
         }

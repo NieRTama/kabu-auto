@@ -20,7 +20,7 @@ from loguru import logger
 from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
-    process_lock, reference_capital as reference_capital_store, broker_wait,
+    process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -127,7 +127,12 @@ def main() -> None:
             f"{waited / 60:.1f}分の待機後に接続し、{tm.description(mode)}で稼働を開始します。",
         ),
     )
-    if not connected:
+    if connected:
+        broker_auth.mark_valid()
+    else:
+        # 接続できないまま続行する場合（paper/dry_run）も認証切れとして記録し、
+        # ダッシュボード・発注ゲートが実態を反映するようにする。
+        broker_auth.mark_expired("起動時にkabuステーションへ接続できませんでした")
         # 実発注モード（live / semi_live）でAPI接続できないまま起動を続けると、口座状態を
         # 把握できないまま発注ロジックだけが動く危険な状態になる（fail-closed）。
         if tm.places_real_orders(mode):
@@ -169,10 +174,44 @@ def main() -> None:
 
     # ─── インフラ系の小ジョブ（composition root に置く）──────
     def token_refresh():
+        """毎朝のトークン更新。失敗＝ログイン認証切れとみなし、再ログインを待って復帰する。
+
+        kabuステーションの認証はPCを起動したままでも日をまたぐと切れるため、
+        毎朝ここで401になるのが通常運転（2026-08-26/27 は失敗後リトライが無く、
+        終日401のまま「発注可」を表示し続ける抜け殻状態になっていた）。
+        失敗したら発注を止めたうえで通知し、ログインされ次第そのまま自動復帰する。
+        """
         try:
             client.refresh_token()
+            broker_auth.mark_valid()
+            return
         except Exception as e:
-            alert("APIトークン更新失敗", str(e))
+            broker_auth.mark_expired(str(e))
+            alert(
+                "kabuステーションの再ログインが必要です",
+                f"APIトークン更新に失敗しました（ログイン認証切れ）。kabuステーションに"
+                f"ログインしてください。ログインされ次第、自動で取引を再開します"
+                f"（最大{wait_minutes:.0f}分待機）。詳細: {e}",
+            )
+
+        # ログインされるまで待って復帰する（待機中は新規発注が止まっている）
+        recovered = broker_wait.wait_for_broker(
+            client.refresh_token,
+            timeout_seconds=wait_minutes * 60,
+            on_connected=lambda waited: alert(
+                "kabuステーションの認証が回復しました",
+                f"{waited / 60:.1f}分の待機後に再ログインを検知し、取引を再開します。",
+            ),
+        )
+        if recovered:
+            broker_auth.mark_valid()
+        else:
+            alert(
+                "kabuステーションの再ログインがされませんでした",
+                f"{wait_minutes:.0f}分待機しましたが認証が回復しませんでした。"
+                "新規発注は停止したままです。ログイン後、次回のトークン更新まで待つか"
+                "kabu-autoを再起動してください。",
+            )
 
     def db_backup():
         try:

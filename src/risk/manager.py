@@ -12,6 +12,7 @@ from typing import Optional
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import broker_auth
 from src.core import clock
 from src.core import config as cfg
 from src.core import halt
@@ -197,6 +198,12 @@ class RiskManager:
         if halt.is_halted():
             state = halt.get_state()
             return False, f"取引停止中（kill switch ON）: {state.get('reason') or '手動停止'}"
+        # kabuステーションのログイン認証が切れている間は新規発注を抑止する。
+        # 認証切れのままでは板・余力・建玉を取得できず、口座状態を誤認したまま
+        # 発注することになるため（実際 2026-08-26/27 に終日401のまま稼働していた）。
+        # 退出系(sell_market reason=...)はこのゲート自体をバイパスするため止まらない。
+        if broker_auth.is_expired():
+            return False, "kabuステーションのログイン認証切れ（再ログインが必要です）"
         limit = self._conf.get("daily_order_limit", 100)
         if self._daily_order_count >= limit:
             return False, f"1日の注文上限({limit})に達しました"

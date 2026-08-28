@@ -59,10 +59,12 @@ class TestLiveModeGuardSource:
         assert "broker_wait.wait_for_broker(" in src, (
             "初回トークン取得が broker_wait.wait_for_broker() を経由していない"
         )
+        # 接続できたか否かの分岐（`if connected: ... else: ...`）のうち、
+        # 失敗側（else以降）に fail-closed があることを検証する。
         match = re.search(
-            r"if not connected:(.*?)(?=\n    #|\Z)", src, re.DOTALL,
+            r"\n    if connected:.*?\n    else:(.*?)(?=\n    # ─── |\Z)", src, re.DOTALL,
         )
-        assert match, "接続失敗時の `if not connected:` ブロックが見つからない"
+        assert match, "接続可否の分岐（if connected / else）が見つからない"
         fail_block = match.group(1)
         assert "places_real_orders(mode)" in fail_block, (
             "接続失敗時に実発注モード（live/semi_live）かどうかの分岐が無い"
