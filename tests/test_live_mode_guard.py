@@ -52,17 +52,21 @@ class TestLiveModeGuardSource:
         with open("main.py", encoding="utf-8") as f:
             src = f.read()
         import re
-        # refresh_token() の except ブロック内で mode=="live" 判定とsys.exit(1)が
-        # 行われていることを検証する
+        # 接続は broker_wait.wait_for_broker() に委譲している（kabuステーションの
+        # ログイン待ちに対応するため。2026-08-28）。接続できなかった場合の
+        # `if not connected:` ブロック内で、実発注モード判定と sys.exit(1) が
+        # 行われていること（fail-closedであること）を検証する。
+        assert "broker_wait.wait_for_broker(" in src, (
+            "初回トークン取得が broker_wait.wait_for_broker() を経由していない"
+        )
         match = re.search(
-            r"client\.refresh_token\(\).*?except Exception as e:(.*?)(?=\n    #|\Z)",
-            src, re.DOTALL,
+            r"if not connected:(.*?)(?=\n    #|\Z)", src, re.DOTALL,
         )
-        assert match, "client.refresh_token() の except ブロックが見つからない"
-        except_block = match.group(1)
-        assert 'mode' in except_block and 'live' in except_block, (
-            "トークン取得失敗時にliveモードかどうかの分岐が無い"
+        assert match, "接続失敗時の `if not connected:` ブロックが見つからない"
+        fail_block = match.group(1)
+        assert "places_real_orders(mode)" in fail_block, (
+            "接続失敗時に実発注モード（live/semi_live）かどうかの分岐が無い"
         )
-        assert "sys.exit(1)" in except_block, (
-            "ライブモードでのトークン取得失敗時に sys.exit(1) していない（fail-closedでない）"
+        assert "sys.exit(1)" in fail_block, (
+            "ライブモードでの接続失敗時に sys.exit(1) していない（fail-closedでない）"
         )

@@ -15,6 +15,11 @@ from src.core import config as cfg
 
 
 class KabuClient:
+    # 再接続ループのログ間引き設定（_ws_log 参照）。
+    # 最初の N 回は毎回記録し、それ以降は INTERVAL 秒に1回へ落とす。
+    _WS_LOG_FIRST_N = 3
+    _WS_LOG_INTERVAL_SEC = 300
+
     def __init__(self):
         conf = cfg.get_section("kabu_station")
         self._base_url = conf.get("base_url", "http://localhost:18080/kabusapi")
@@ -26,6 +31,9 @@ class KabuClient:
         self._on_order_event: Optional[Callable] = None
         self._ws_reconnect = True
         self._ws_reconnect_delay = 2
+        # 再接続ループのログ間引き用（_ws_log 参照）
+        self._ws_attempts = 0
+        self._ws_last_log_at = 0.0
 
     # ─── 認証 ───────────────────────────────────────────
 
@@ -140,7 +148,7 @@ class KabuClient:
         ws_url = ws_url.replace("/kabusapi", "") + "/kabusapi/websocket"
         while self._ws_reconnect:
             try:
-                logger.info("WebSocket接続中...")
+                self._ws_log("WebSocket接続中...")
                 self._ws = websocket.WebSocketApp(
                     ws_url,
                     on_message=self._on_ws_message,
@@ -152,13 +160,30 @@ class KabuClient:
             except Exception as e:
                 logger.error(f"WebSocketエラー: {e}")
             if self._ws_reconnect:
-                logger.info(f"WebSocket再接続まで {self._ws_reconnect_delay}秒待機...")
+                self._ws_log(f"WebSocket再接続まで {self._ws_reconnect_delay}秒待機...")
                 time.sleep(self._ws_reconnect_delay)
                 self._ws_reconnect_delay = min(self._ws_reconnect_delay * 2, 60)
+
+    def _ws_log(self, message: str) -> None:
+        """再接続ループのINFOログを間引いて出力する。
+
+        kabuステーション未起動・場外時間帯は接続と切断を延々繰り返すため、毎回記録すると
+        ログが埋まり本物の異常が埋もれる。連続失敗中は最初の数回だけ出し、以後は
+        5分に1回へ落とす（接続が確立すると _on_ws_open がカウンタを戻す）。
+        """
+        self._ws_attempts += 1
+        now = time.monotonic()
+        if self._ws_attempts <= self._WS_LOG_FIRST_N or \
+                now - self._ws_last_log_at >= self._WS_LOG_INTERVAL_SEC:
+            self._ws_last_log_at = now
+            logger.info(message)
 
     def _on_ws_open(self, ws) -> None:
         logger.info("WebSocket接続確立")
         self._ws_reconnect_delay = 2
+        # 接続できたらログ間引きのカウンタを戻す（次に切れたときは再び数回は記録する）
+        self._ws_attempts = 0
+        self._ws_last_log_at = 0.0
 
     def _on_ws_message(self, ws, message: str) -> None:
         try:

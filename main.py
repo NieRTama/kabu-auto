@@ -20,7 +20,7 @@ from loguru import logger
 from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
-    process_lock, reference_capital as reference_capital_store,
+    process_lock, reference_capital as reference_capital_store, broker_wait,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -109,18 +109,33 @@ def main() -> None:
 
     set_order_manager(order_mgr)
 
-    # ─── 初回トークン取得 ─────────────────────────────────
-    try:
-        client.refresh_token()
-    except Exception as e:
+    # ─── 初回トークン取得（kabuステーションのログイン待ちを含む）──────
+    # OS起動時に自動実行すると kabuステーションがまだ起動・ログインされておらず
+    # 必ず接続に失敗する。ログイン自体は2段階認証があり人手が要るため、
+    # 「ログインされるまで静かに待つ」ことで自動起動を成立させる（0で従来動作）。
+    wait_minutes = float(cfg.get_section("runtime").get("wait_for_broker_minutes", 0) or 0)
+    connected = broker_wait.wait_for_broker(
+        client.refresh_token,
+        timeout_seconds=wait_minutes * 60,
+        on_wait_start=lambda: alert(
+            "kabuステーションのログイン待ち",
+            f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
+            f"kabuステーションを起動してログインしてください（最大{wait_minutes:.0f}分待機します）。",
+        ),
+        on_connected=lambda waited: alert(
+            "kabuステーションへ接続しました",
+            f"{waited / 60:.1f}分の待機後に接続し、{tm.description(mode)}で稼働を開始します。",
+        ),
+    )
+    if not connected:
         # 実発注モード（live / semi_live）でAPI接続できないまま起動を続けると、口座状態を
         # 把握できないまま発注ロジックだけが動く危険な状態になる（fail-closed）。
         if tm.places_real_orders(mode):
             logger.critical(
-                f"{tm.description(mode)}でkabuステーション接続に失敗。起動を中断します: {e}"
+                f"{tm.description(mode)}でkabuステーション接続に失敗。起動を中断します。"
             )
             sys.exit(1)
-        logger.warning(f"kabuステーション接続失敗（{tm.description(mode)}で継続）: {e}")
+        logger.warning(f"kabuステーション接続失敗（{tm.description(mode)}で継続）")
 
     # ─── 起動時注文同期（ライブモードのみ）────────────────
     order_mgr.sync_on_startup()
