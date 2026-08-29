@@ -21,7 +21,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot,
+    discord_bot, auth_recovery,
 )
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
@@ -185,34 +185,30 @@ def main() -> None:
         try:
             client.refresh_token()
             broker_auth.mark_valid()
-            return
         except Exception as e:
             broker_auth.mark_expired(str(e))
             alert(
                 "kabuステーションの再ログインが必要です",
-                f"APIトークン更新に失敗しました（ログイン認証切れ）。kabuステーションに"
-                f"ログインしてください。ログインされ次第、自動で取引を再開します"
-                f"（最大{wait_minutes:.0f}分待機）。詳細: {e}",
+                "APIトークン更新に失敗しました（ログイン認証切れ）。kabuステーションに"
+                "ログインしてください。ログインが済み次第、自動で取引を再開します"
+                f"（時間制限なく待ち続けます）。詳細: {e}",
             )
 
-        # ログインされるまで待って復帰する（待機中は新規発注が止まっている）
-        recovered = broker_wait.wait_for_broker(
+    def auth_recovery_check():
+        """認証切れの間、定期的に再接続を試みて自動復帰する。
+
+        以前は token_refresh 内で30分だけブロッキング待機していたが、
+        タイムアウトすると翌朝まで復帰しない穴があった（2026-08-29 に発生。
+        朝寝坊や通知の見落としで丸一日の取引機会を失う）。時間制限を撤廃し、
+        認証が戻るまで何度でも試し続ける方式に変えた。
+        """
+        auth_recovery.attempt_recovery(
             client.refresh_token,
-            timeout_seconds=wait_minutes * 60,
-            on_connected=lambda waited: alert(
+            on_recovered=lambda: alert(
                 "kabuステーションの認証が回復しました",
-                f"{waited / 60:.1f}分の待機後に再ログインを検知し、取引を再開します。",
+                "再ログインを検知しました。取引を再開します。",
             ),
         )
-        if recovered:
-            broker_auth.mark_valid()
-        else:
-            alert(
-                "kabuステーションの再ログインがされませんでした",
-                f"{wait_minutes:.0f}分待機しましたが認証が回復しませんでした。"
-                "新規発注は停止したままです。ログイン後、次回のトークン更新まで待つか"
-                "kabu-autoを再起動してください。",
-            )
 
     def db_backup():
         try:
@@ -246,6 +242,21 @@ def main() -> None:
             lines = [f"{p.symbol}: {p.quantity}株 @ {p.avg_cost:.0f}" for p in rows]
         return "保有建玉:\n" + ("\n".join(lines) if lines else "（なし）")
 
+    def _cmd_reconnect(_args: str) -> str:
+        """ログイン直後に「今すぐ繋いで」と指示するためのコマンド。
+
+        定期チェック（5分間隔）でも復帰するが、外出先からログインした直後に
+        待たずに反映させたい場合に使う。
+        """
+        if not broker_auth.is_expired():
+            return "認証は有効です（再接続は不要）"
+        try:
+            client.refresh_token()
+        except Exception as e:
+            return f"再接続に失敗しました。kabuステーションにログインしてから再度お試しください: {e}"
+        broker_auth.mark_valid()
+        return "再接続しました。取引を再開します"
+
     def _cmd_halt(args: str) -> str:
         halt_store.engage(args.strip() or "Discordから手動停止")
         return "取引を停止しました（新規発注を抑止。損切り・緊急決済は引き続き動作します）"
@@ -264,6 +275,7 @@ def main() -> None:
         handlers={
             "status": _cmd_status,
             "positions": _cmd_positions,
+            "reconnect": _cmd_reconnect,
             "halt": _cmd_halt,
             "resume": _cmd_resume,
         },
@@ -282,6 +294,8 @@ def main() -> None:
     scheduler.register("reconcile_orders", services.reconcile_orders)
     scheduler.register("health_check", services.health_check)
     scheduler.register("heartbeat", services.heartbeat)
+    scheduler.register("auth_recovery_check", auth_recovery_check)
+    scheduler.register("discord_weekly_report", services.post_weekly_summary_to_discord)
     if remote is not None:
         scheduler.register("discord_poll", remote.poll_once)
     scheduler.register("x_daily_report", services.post_daily_summary_to_x)

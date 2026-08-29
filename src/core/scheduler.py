@@ -119,6 +119,21 @@ class TradingScheduler:
                 cb["discord_daily_report"], "cron",
                 day_of_week="mon-fri", hour=17, minute=30, id="discord_daily_report",
             )
+        if "discord_weekly_report" in cb:
+            # 土曜9:00に1週間の成績をまとめて投稿する（週末に落ち着いて振り返るため）。
+            # 日次レポートは「その日」しか分からず、戦略の効き具合は週単位の方が判断しやすい。
+            self._scheduler.add_job(
+                cb["discord_weekly_report"], "cron",
+                day_of_week="sat", hour=9, minute=0, id="discord_weekly_report",
+            )
+        if "auth_recovery_check" in cb:
+            # 認証切れの間だけ再接続を試す（有効なときは何もしないので負荷は無い）。
+            # 5分間隔・時間制限なし。以前は30分でタイムアウトして翌朝まで復帰しない
+            # 穴があった（2026-08-29 に発生）ため、ログインすれば何時でも復帰できるようにする。
+            self._scheduler.add_job(
+                cb["auth_recovery_check"], "interval",
+                minutes=5, id="auth_recovery_check",
+            )
         if "discord_poll" in cb:
             # Discordリモコンの新着コマンドを取りに行く（アウトバウンドのみ・ポート開放不要）。
             # 30秒間隔は「状態確認・緊急停止」用途に十分で、API負荷も小さい。

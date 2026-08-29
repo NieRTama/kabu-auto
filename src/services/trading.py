@@ -240,6 +240,22 @@ class TradingServices:
         except Exception as e:
             logger.error(f"Discord日次レポート投稿エラー: {e}")
 
+    def post_weekly_summary_to_discord(self) -> None:
+        """1週間の成績（決済件数・週次/月次/総合損益・現在の保有）をDiscordへ投稿する。
+
+        日次レポートは「その日」しか分からないため、週単位で戦略の効き具合を
+        振り返れるようにする（discord_report.enabled=true のときのみ）。
+        """
+        try:
+            from src.core import discord_report
+            from src.core import reference_capital as ref_capital_store
+            mode = self.trading_conf.get("mode", "paper")
+            paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
+            basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+            discord_report.post_weekly_report(mode, basis)
+        except Exception as e:
+            logger.error(f"Discord週次サマリ投稿エラー: {e}")
+
     # ─── 損切り監視 ─────────────────────────────────────
     def stop_loss_check(self) -> None:
         if not TradingScheduler.is_market_open():

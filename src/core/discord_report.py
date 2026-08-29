@@ -11,6 +11,7 @@ from typing import Optional
 from loguru import logger
 
 from src.core import config as cfg
+from src.core import trading_mode as tm
 from src.core.alerts import DISCORD_MAX_CONTENT_LENGTH, DiscordWebhookProvider
 from src.core.pnl_report import format_report_text
 
@@ -46,6 +47,47 @@ def format_for_discord(mode: str, report: dict, holdings: Optional[dict] = None)
     text = format_report_text(mode, report, holdings)
     if len(text) > DISCORD_MAX_CONTENT_LENGTH:
         text = text[: DISCORD_MAX_CONTENT_LENGTH - 1] + "…"
+    return text
+
+
+def format_weekly_summary(mode: str, report: dict, holdings: Optional[dict] = None) -> str:
+    """週次サマリの投稿文を組み立てる。
+
+    日次レポートは「その日」しか分からないため、週単位の成績（取引回数・勝率・損益）と
+    現在のポジションをまとめて振り返れるようにする。集計自体は日次と同じ build_report を
+    使い、週次・月次・総合を中心に表示する。
+    """
+    from src.core.pnl_report import _format_holdings, _format_period
+    w = report["weekly"]
+    trades = w.win_count + w.loss_count
+    lines = [
+        "【kabu-auto 週次サマリ】",
+        f"モード: {tm.description(mode)}",
+        "",
+        f"今週の決済: {trades}件",
+        _format_period(w),
+        _format_period(report["monthly"]),
+        _format_period(report["overall"]),
+    ]
+    if holdings is not None:
+        lines.append("")
+        lines.extend(_format_holdings(holdings))
+    return "\n".join(lines)
+
+
+def post_weekly_report(mode: str, reference_capital: float) -> Optional[str]:
+    """週次サマリを集計・整形してDiscordへ投稿する。投稿したテキストを返す。"""
+    from src.core.pnl_report import build_holdings, build_report
+    report = build_report(reference_capital)
+    try:
+        holdings = build_holdings(reference_capital)
+    except Exception as e:
+        logger.warning(f"保有状況の集計に失敗しました（損益のみ投稿します）: {e}")
+        holdings = None
+    text = format_weekly_summary(mode, report, holdings)
+    if len(text) > DISCORD_MAX_CONTENT_LENGTH:
+        text = text[: DISCORD_MAX_CONTENT_LENGTH - 1] + "…"
+    post_text(text)
     return text
 
 
