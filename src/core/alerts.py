@@ -79,11 +79,30 @@ def _send_one(provider: AlertProvider, message: str) -> None:
         logger.error(f"通知送信失敗（{provider.name}）: {e}")
 
 
-def alert(title: str, message: str) -> None:
+# 通知の重要度。スマホの通知一覧で「対応が要るか」を記号だけで判断できるようにする。
+# 段階を増やすと結局読み分けなくなるため、行動が変わる4段階に絞る
+# （アラート疲れ対策の定石: すべてのアラートは行動を要求すべき／要求しないものは目印で下げる）。
+LEVEL_CRITICAL = "critical"   # 要対応: 再ログイン・未解決注文・整合性違反
+LEVEL_WARNING = "warning"     # 注意: 損失上限接近・取引停止中
+LEVEL_INFO = "info"           # 実行報告: 約定・接続回復
+LEVEL_ROUTINE = "routine"     # 定期: ハートビート・日次/週次レポート
+
+_LEVEL_MARKS = {
+    LEVEL_CRITICAL: "🔴",
+    LEVEL_WARNING: "🟡",
+    LEVEL_INFO: "🟢",
+    LEVEL_ROUTINE: "⚪",
+}
+
+
+def alert(title: str, message: str, level: str = LEVEL_CRITICAL) -> None:
     """異常・重要イベントを通知する（公開インターフェース。呼び出し側はこれだけ使う）。
 
     必ずログへ記録した上で、設定済みの全プロバイダへ送信を試みる。
     1つのプロバイダが失敗しても他のプロバイダへの送信は継続する。
+
+    level は本文先頭に付ける記号を決めるだけで、送信先や可否は変えない
+    （既定は critical。従来の呼び出しは引数なしでそのまま動く）。
     """
     logger.warning(f"[ALERT] {title}: {message}")
 
@@ -91,6 +110,7 @@ def alert(title: str, message: str) -> None:
     if not providers:
         return
 
-    text = f"【kabu-auto】{title}\n{message}"
+    mark = _LEVEL_MARKS.get(level, _LEVEL_MARKS[LEVEL_CRITICAL])
+    text = f"{mark}【kabu-auto】{title}\n{message}"
     for provider in providers:
         _send_one(provider, text)

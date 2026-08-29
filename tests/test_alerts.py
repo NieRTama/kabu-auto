@@ -82,7 +82,10 @@ class TestAlert:
         provider.name = "discord"
         with patch.object(alerts_mod, "build_providers", return_value=[provider]):
             alert("タイトル", "本文")
-        provider.send.assert_called_once_with("【kabu-auto】タイトル\n本文")
+        # 先頭に重要度の記号が付く（引数を省略した従来の呼び出しは critical = 🔴）。
+        # 記号は通知一覧で対応要否を見分けるためのもので、送信先や送信可否は変えない
+        # （詳細は tests/test_alert_levels.py）。
+        provider.send.assert_called_once_with("🔴【kabu-auto】タイトル\n本文")
 
     def test_one_provider_failure_does_not_block_others(self):
         failing = MagicMock()

@@ -15,7 +15,7 @@ from loguru import logger
 
 from src.core import broker_auth
 from src.core import trading_mode as tm
-from src.core.alerts import alert
+from src.core.alerts import LEVEL_ROUTINE, alert
 
 
 def build_message(mode: str, snapshot: dict, position_count: int) -> str:
@@ -36,6 +36,7 @@ def build_message(mode: str, snapshot: dict, position_count: int) -> str:
 def send(mode: str, snapshot: dict, position_count: int) -> None:
     """稼働中であることを通知する。失敗しても運用は止めない。"""
     try:
-        alert("稼働中です（定期報告）", build_message(mode, snapshot, position_count))
+        alert("稼働中です（定期報告）", build_message(mode, snapshot, position_count),
+              level=LEVEL_ROUTINE)
     except Exception as e:
         logger.error(f"ハートビート送信に失敗しました: {e}")

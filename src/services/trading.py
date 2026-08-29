@@ -19,7 +19,7 @@ from src.core import clock
 from src.core import config as cfg
 from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
-from src.core.alerts import alert
+from src.core.alerts import LEVEL_INFO, alert
 from src.core.scheduler import TradingScheduler
 from src.data.database import Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
@@ -283,7 +283,7 @@ class TradingServices:
                     # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
                     self.order_mgr.sell_market(sym, qty, reason=exit_reason)
                     title = "利益確定（トレーリングストップ）実行" if exit_reason == "trailing_stop" else "損切り実行"
-                    alert(title, f"{sym} @{price:.0f}円")
+                    alert(title, f"{sym} @{price:.0f}円", level=LEVEL_INFO)
             except Exception as e:
                 logger.error(f"損切りチェックエラー: {sym} {e}")
 
@@ -395,6 +395,9 @@ class TradingServices:
                                     rationale=_signal_rationale(sig),
                                     source=source)
                 logger.info(f"{label}売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
+                alert(f"{label}売り発注",
+                      f"{sig.symbol} {qty}株 @{price:,.0f}円（売りシグナルによる手仕舞い）",
+                      level=LEVEL_INFO)
             except Exception as e:
                 logger.error(f"{label}売り発注失敗: {sig.symbol} {e}")
 
@@ -447,6 +450,13 @@ class TradingServices:
                     # RiskManager の未約定引当と二重で守る）
                     cash -= float(price) * qty
                     logger.info(f"{label}買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
+                    # 実弾が動いたことは即座に知らせる（退出だけ通知して
+                    # エントリーを通知しないのは非対称で、口座で今いくら使われたかが
+                    # 日次レポートまで分からない状態になっていた）
+                    alert(f"{label}買い発注",
+                          f"{sig.symbol} {qty}株 @{price:,.0f}円"
+                          f"（約定額 {float(price) * qty:,.0f}円）",
+                          level=LEVEL_INFO)
                 else:
                     logger.warning(f"{label}買い発注失敗（注文拒否）: {sig.symbol}")
             except Exception as e:
