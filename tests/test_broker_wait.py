@@ -145,3 +145,36 @@ class TestNotificationFailureIsolation:
                              on_connected=boom,
                              sleep=clock.sleep, monotonic=clock.monotonic)
         assert ok is True
+
+
+class TestUnlimitedWait:
+    """起動時は時間制限なく待つ（2026-08-29 の欠陥と同種の穴を起動時に残さない）。
+
+    時間制限を設けると「その時間内にログインしないと起動しない」ことになり、
+    朝寝坊や通知の見落としで丸一日動かなくなる。
+    """
+
+    def test_waits_beyond_timeout_when_unlimited(self):
+        clock = _Clock()
+        connect = _connect_failing_n_times(50)  # 30分（30秒/60秒間隔）を大きく超える回数
+        ok = wait_for_broker(connect, timeout_seconds=60, unlimited=True,
+                             initial_interval=30, max_interval=60,
+                             sleep=clock.sleep, monotonic=clock.monotonic)
+        assert ok is True, "時間制限を超えても待ち続けて復帰する"
+        assert clock.now > 60, "timeout_seconds を超えて待っている"
+
+    def test_unlimited_ignores_zero_timeout(self):
+        """timeout_seconds=0（＝設定上の「無制限」）でも1回で諦めない"""
+        clock = _Clock()
+        connect = _connect_failing_n_times(3)
+        ok = wait_for_broker(connect, timeout_seconds=0, unlimited=True,
+                             sleep=clock.sleep, monotonic=clock.monotonic)
+        assert ok is True
+        assert connect.state["calls"] == 4
+
+    def test_limited_still_times_out(self):
+        """unlimited=False なら従来どおり時間切れで諦める（後方互換）"""
+        clock = _Clock()
+        ok = wait_for_broker(_connect_failing_n_times(10_000), timeout_seconds=300,
+                             unlimited=False, sleep=clock.sleep, monotonic=clock.monotonic)
+        assert ok is False

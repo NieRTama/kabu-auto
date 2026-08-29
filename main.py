@@ -114,14 +114,19 @@ def main() -> None:
     # OS起動時に自動実行すると kabuステーションがまだ起動・ログインされておらず
     # 必ず接続に失敗する。ログイン自体は2段階認証があり人手が要るため、
     # 「ログインされるまで静かに待つ」ことで自動起動を成立させる（0で従来動作）。
+    # 0 = 無制限に待つ（既定）。時間制限を設けると「その時間内にログインしないと
+    # 起動しない」ことになり、朝寝坊や通知の見落としで丸一日動かなくなる。
     wait_minutes = float(cfg.get_section("runtime").get("wait_for_broker_minutes", 0) or 0)
+    wait_unlimited = wait_minutes <= 0
+    limit_text = "接続できるまで待機します" if wait_unlimited else f"最大{wait_minutes:.0f}分待機します"
     connected = broker_wait.wait_for_broker(
         client.refresh_token,
         timeout_seconds=wait_minutes * 60,
+        unlimited=wait_unlimited,
         on_wait_start=lambda: alert(
             "kabuステーションのログイン待ち",
             f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
-            f"kabuステーションを起動してログインしてください（最大{wait_minutes:.0f}分待機します）。",
+            f"kabuステーションを起動してログインしてください（{limit_text}）。",
         ),
         on_connected=lambda waited: alert(
             "kabuステーションへ接続しました",

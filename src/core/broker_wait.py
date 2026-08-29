@@ -22,6 +22,7 @@ def wait_for_broker(
     connect: Callable[[], object],
     *,
     timeout_seconds: float,
+    unlimited: bool = False,
     initial_interval: float = 30.0,
     max_interval: float = 60.0,
     on_wait_start: Optional[Callable[[], None]] = None,
@@ -33,6 +34,10 @@ def wait_for_broker(
 
     connect: 接続を試みる呼び出し（例: client.refresh_token）。例外を投げたら失敗とみなす。
     timeout_seconds: 待機を諦めるまでの秒数。0以下なら1回だけ試して結果を返す（従来動作）。
+    unlimited: True なら timeout_seconds を無視して接続できるまで待ち続ける。
+        起動時にこれを使う。時間制限を設けると「30分以内にログインしないと
+        起動しない」ことになり、朝寝坊や通知の見落としで丸一日動かない
+        （2026-08-29 に稼働中の復帰で同じ穴を踏んだ）。
     on_wait_start: 1回目の失敗直後に一度だけ呼ぶ（Discord通知などの副作用用）。
     on_connected: 待機の末に接続できたとき、待機秒数を引数に呼ぶ。
 
@@ -45,14 +50,14 @@ def wait_for_broker(
     except Exception as e:
         first_error = e
 
-    if timeout_seconds <= 0:
+    if timeout_seconds <= 0 and not unlimited:
         logger.error(f"kabuステーション接続に失敗しました: {first_error}")
         return False
 
     started = monotonic()
+    limit_text = "接続できるまで待機します" if unlimited else f"最大{timeout_seconds / 60:.0f}分待機します"
     logger.warning(
-        f"kabuステーションに接続できません（未起動またはログイン前）。"
-        f"最大{timeout_seconds / 60:.0f}分待機します: {first_error}"
+        f"kabuステーションに接続できません（未起動またはログイン前）。{limit_text}: {first_error}"
     )
     if on_wait_start is not None:
         try:
@@ -64,14 +69,15 @@ def wait_for_broker(
     last_log = started
     while True:
         elapsed = monotonic() - started
-        if elapsed >= timeout_seconds:
+        if not unlimited and elapsed >= timeout_seconds:
             logger.critical(
                 f"kabuステーションへ接続できないまま{timeout_seconds / 60:.0f}分が経過しました。"
                 "kabuステーションを起動してログインしてから、再度実行してください"
             )
             return False
 
-        sleep(min(interval, max(0.0, timeout_seconds - elapsed)))
+        remaining = interval if unlimited else min(interval, max(0.0, timeout_seconds - elapsed))
+        sleep(remaining)
         interval = min(interval * 2, max_interval)
 
         try:
