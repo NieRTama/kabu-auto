@@ -122,3 +122,63 @@ class TestHealthIntegration:
 
     def test_no_flag_when_recently_alive(self):
         assert "liveness_silent" not in self._run(market_open=True, stale_seconds=100.0)
+
+
+class TestLunchBreakFalsePositive:
+    """昼休みを「途絶」と数えない（2026-08-31 に実際に発生した誤検知の回帰防止）。
+
+    前場最終取得(11:25) → 昼休み(11:30-12:30) → 後場開始(12:30) の時点で
+    「65分間データ取得なし」と通知された。65分 = 昼休み60分 + ジョブ間隔5分 で、
+    実際にはシステムは正常に動いていた。
+    """
+
+    def test_closed_period_does_not_accumulate(self):
+        liveness.mark_alive(now=0.0)          # 11:25 前場の最終取得
+        liveness.mark_closed(now=300.0)       # 11:30 昼休み入り（health_checkが呼ぶ）
+        liveness.mark_closed(now=3600.0)      # 12:00 昼休み中
+        liveness.mark_closed(now=3900.0)      # 12:29 昼休み中
+        # 12:30 後場開始。閉場中は基準が進んでいるので途絶とみなさない
+        assert liveness.is_silent(now=3901.0, market_open=True, threshold_seconds=900) is False
+
+    def test_real_silence_after_reopen_is_still_detected(self):
+        """昼休み明けに本当に止まっていれば従来どおり検知する（検知力を落とさない）"""
+        liveness.mark_alive(now=0.0)
+        liveness.mark_closed(now=3600.0)      # 昼休み中に基準が進む
+        # 後場開始後、閾値を超えて取得できていない
+        assert liveness.is_silent(now=3600.0 + 1000, market_open=True,
+                                  threshold_seconds=900) is True
+
+    def test_mark_closed_before_first_success_is_noop(self):
+        """1度も成功していない状態で mark_closed しても「生存扱い」にしない"""
+        liveness.mark_closed(now=100.0)
+        assert liveness.seconds_since_alive(now=200.0) is None
+        assert liveness.is_silent(now=99999.0, market_open=True, threshold_seconds=900) is False
+
+
+class TestHealthCallsMarkClosed:
+    def test_market_closed_advances_baseline(self):
+        """health.check_anomalies が閉場中に mark_closed を呼ぶこと（結線の検証）"""
+        from unittest.mock import MagicMock, patch
+        from src.core import health
+        risk = MagicMock()
+        risk.daily_loss_limit.return_value = 0
+        risk.current_total_drawdown.return_value = 0
+        risk.unrealized_pnl.return_value = 0
+        risk.unpriced_symbols.return_value = []
+
+        liveness.mark_alive(now=0.0)
+        with patch.object(health, "cfg") as cfg_mock, \
+             patch.object(health, "get_session") as sess_mock, \
+             patch.object(health.time, "monotonic", return_value=5000.0), \
+             patch.object(health.halt, "is_halted", return_value=False), \
+             patch.object(health.TradingScheduler, "is_market_open", return_value=False):
+            cfg_mock.get_section.side_effect = lambda s: {
+                "trading": {}, "runtime": {"error_rate_threshold": 0,
+                                           "liveness_silence_seconds": 900},
+            }.get(s, {})
+            ctx = MagicMock()
+            ctx.__enter__.return_value.scalar.return_value = 0
+            sess_mock.return_value = ctx
+            health.check_anomalies(risk)
+        # 閉場中の呼び出しで基準が 5000 まで進んでいる
+        assert liveness.seconds_since_alive(now=5000.0) == 0.0

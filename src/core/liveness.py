@@ -39,6 +39,24 @@ def seconds_since_alive(*, now: float) -> Optional[float]:
         return now - _last_success
 
 
+def mark_closed(*, now: float) -> None:
+    """市場が閉じている間、基準時刻を進める（休止を「途絶」と数えないため）。
+
+    2026-08-31 に誤検知が発生: 前場最終取得(11:25) → 昼休み(11:30-12:30) →
+    後場開始(12:30)の時点で「65分間データ取得なし」と判定された。
+    65分 = 昼休み60分 + ジョブ間隔5分 で、実際にはシステムは正常だった。
+
+    is_silent() は「場が閉じていれば False」を返すので検知自体はしないが、
+    経過時間は素通しで積み上がるため、再開直後に閾値超過が残ってしまう。
+    閉じている間は基準を進めておくことで、昼休み・夜間・休日を跨いでも
+    「再開後に実際に途絶えた時間」だけを見られるようにする。
+    """
+    global _last_success
+    with _lock:
+        if _last_success is not None:
+            _last_success = now
+
+
 def is_silent(*, now: float, market_open: bool,
               threshold_seconds: float = DEFAULT_SILENCE_SECONDS) -> bool:
     """場中に動作が途絶えているか。

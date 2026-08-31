@@ -128,8 +128,13 @@ def check_anomalies(risk) -> list[dict]:
     # 静かに止まる故障（ジョブの死・無反応化）はすり抜けるため、正常系の動作
     # （板取得の成功）が続いていることを別途確認する。
     silence_limit = float(conf.get("liveness_silence_seconds", liveness.DEFAULT_SILENCE_SECONDS))
-    if TradingScheduler.is_market_open():
-        now_mono = time.monotonic()
+    now_mono = time.monotonic()
+    if not TradingScheduler.is_market_open():
+        # 場が閉じている間は基準時刻を進め、休止時間を「途絶」として数えない。
+        # health_check は平日8:00-23:00の15分毎に走るので、昼休み(11:30-12:30)や
+        # 引け後もここを通り、再開時には「閉場中の経過」が積み上がらない。
+        liveness.mark_closed(now=now_mono)
+    else:
         if liveness.is_silent(now=now_mono, market_open=True,
                               threshold_seconds=silence_limit):
             elapsed = liveness.seconds_since_alive(now=now_mono) or 0
