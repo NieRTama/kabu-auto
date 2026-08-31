@@ -360,6 +360,33 @@ class TradingServices:
         """
         self._execute_pending_signals(source="afternoon_execution", skip_existing=True)
 
+    def catchup_execution(self) -> None:
+        """認証切れからの復帰時に、逃した発注機会を場中なら即座に取り返す。
+
+        朝のログインが遅れると 9:05 の morning_execution が401で失敗し、
+        その日は 12:35 の後場スロットまで発注機会が無い（2026-08-31 は
+        10:58 復帰で朝の発注を逃し、当日の約定が0件だった）。
+        復帰した時点が場中なら、その場で未保有銘柄への発注を試みる。
+
+        締切（既定14:00）を過ぎていたら何もしない。朝の発注は「寄り付き直後の
+        値動きが落ち着いた時間」を狙う設計であり、引けに近い時間帯の約定は
+        想定と異なるため（no_new_buy_minutes_before_close と同じ思想）。
+
+        skip_existing=True で未保有銘柄のみを対象にし、既存の二重発注ガード
+        （_has_pending_order）と合わせて重複発注を防ぐ。
+        """
+        if not TradingScheduler.is_market_open():
+            logger.info("認証復帰: 場外のため発注のキャッチアップは行いません")
+            return
+        deadline = self.trading_conf.get("catchup_deadline_hour", 14)
+        if deadline and not TradingScheduler.is_before(int(deadline)):
+            logger.info(
+                f"認証復帰: 締切({deadline}:00)を過ぎているため発注のキャッチアップを見送ります"
+            )
+            return
+        logger.info("認証復帰: 逃した発注機会のキャッチアップを実行します")
+        self._execute_pending_signals(source="catchup_execution", skip_existing=True)
+
     def _execute_pending_signals(self, *, source: str, skip_existing: bool) -> None:
         """直近バッチのBUY/SELLシグナルを元に発注する（morning/afternoon共通本体）。
 

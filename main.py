@@ -23,6 +23,7 @@ from src.core import (
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
     discord_bot, auth_recovery,
 )
+from src.core import alerts as alerts_mod
 from src.core.alerts import alert
 from src.core.netutil import is_port_available
 from src.core.scheduler import TradingScheduler
@@ -207,12 +208,20 @@ def main() -> None:
         朝寝坊や通知の見落としで丸一日の取引機会を失う）。時間制限を撤廃し、
         認証が戻るまで何度でも試し続ける方式に変えた。
         """
-        auth_recovery.attempt_recovery(
-            client.refresh_token,
-            on_recovered=lambda: alert(
+        def _on_recovered():
+            alert(
                 "kabuステーションの認証が回復しました",
                 "再ログインを検知しました。取引を再開します。",
-            ),
+                level=alerts_mod.LEVEL_INFO,
+            )
+            # 朝のログインが遅れて 9:05 の発注を逃した場合に備え、
+            # 場中かつ締切前なら逃した分をその場で取り返す
+            # （2026-08-31 は10:58復帰で朝の発注機会を失い当日の約定が0件だった）。
+            services.catchup_execution()
+
+        auth_recovery.attempt_recovery(
+            client.refresh_token,
+            on_recovered=_on_recovered,
         )
 
     def db_backup():

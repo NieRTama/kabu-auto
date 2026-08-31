@@ -174,6 +174,18 @@ class TradingScheduler:
         return now.weekday() == 5 and 1 <= now.hour <= 5
 
     @staticmethod
+    def is_before(hour: int, minute: int = 0, now: Optional[datetime] = None) -> bool:
+        """現在が指定時刻より前か（キャッチアップ実行の締切判定用）。
+
+        認証切れからの復帰が遅れた場合、朝の発注機会を取り返すために場中なら
+        即座に発注する。ただし朝の発注は「寄り付き直後の値動きが落ち着いた9:05」を
+        狙う設計であり、引けに近い時間帯に実行すると想定と異なる約定になるため、
+        締切を設けて打ち切る（no_new_buy_minutes_before_close と同じ思想）。
+        """
+        now = now or datetime.now(TZ)
+        return (now.hour, now.minute) < (hour, minute)
+
+    @staticmethod
     def is_near_close(minutes: int, now: Optional[datetime] = None) -> bool:
         """大引け(15:30)まで minutes 分以内かを返す（新規BUY見送り判定用。P0-6）。
 
