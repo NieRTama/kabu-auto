@@ -129,6 +129,14 @@ runtime:
   # 例外を出さずに静かに止まる故障（ジョブの死・無反応化）はエラー率監視では
   # 捉えられないため、正常系の動作が続いていることを別途確認する。0で無効。
   liveness_silence_seconds: 900    # 15分（stop_loss_checkの5分間隔×3回分）
+  # kabuステーション(KabuS.exe)が落ちているとき、自動で起動するか。
+  # kabu-auto はデスクトップセッション内で動くため、起動すれば画面が出て
+  # 認証アプリでの承認ができる。認証自体は自動化しない（承認は人が行う）。
+  auto_launch_broker: true
+  broker_exe_path: ""              # 空なら %LOCALAPPDATA%\kabuStation\KabuS.exe
+  # 1日の起動試行上限。証券会社側の障害時は起動しても認証できないため、
+  # 無意味な起動を繰り返さないよう上限を設ける（0で無制限）。
+  max_launch_attempts_per_day: 3
 
 backtest:
   # 理想約定を仮定したバックテストは実運用と乖離する。約定価格へ不利方向に加える

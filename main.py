@@ -21,7 +21,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, auth_recovery,
+    discord_bot, auth_recovery, broker_launcher,
 )
 from src.core import alerts as alerts_mod
 from src.core.alerts import alert
@@ -180,6 +180,17 @@ def main() -> None:
     services = TradingServices(client, risk, order_mgr, model)
 
     # ─── インフラ系の小ジョブ（composition root に置く）──────
+    def _launch_broker() -> tuple[bool, str]:
+        """kabuステーションを起動する（設定を読んで launcher へ委譲）。"""
+        rt = cfg.get_section("runtime")
+        return broker_launcher.launch(
+            rt.get("broker_exe_path", "") or "",
+            max_attempts_per_day=int(
+                rt.get("max_launch_attempts_per_day",
+                       broker_launcher.DEFAULT_MAX_ATTEMPTS_PER_DAY)
+            ),
+        )
+
     def token_refresh():
         """毎朝のトークン更新。失敗＝ログイン認証切れとみなし、再ログインを待って復帰する。
 
@@ -219,10 +230,30 @@ def main() -> None:
             # （2026-08-31 は10:58復帰で朝の発注機会を失い当日の約定が0件だった）。
             services.catchup_execution()
 
-        auth_recovery.attempt_recovery(
+        recovered = auth_recovery.attempt_recovery(
             client.refresh_token,
             on_recovered=_on_recovered,
         )
+        if recovered or not broker_auth.is_expired():
+            return
+
+        # 認証切れが続いている。kabuステーションのプロセス自体が落ちていれば
+        # 起動する（2026-08-31 にアプリがクラッシュし、翌朝まで待機のままだった）。
+        # 認証（2段階認証）は自動化せず、承認は認証アプリで人が行う。
+        rt = cfg.get_section("runtime")
+        if not rt.get("auto_launch_broker", True):
+            return
+        if broker_launcher.is_running():
+            return
+        ok, detail = _launch_broker()
+        if ok:
+            alert(
+                "kabuステーションを起動しました",
+                f"{detail}\n認証アプリで承認してください。承認後は自動で取引を再開します。",
+                level=alerts_mod.LEVEL_INFO,
+            )
+        else:
+            logger.info(f"kabuステーションの自動起動は行いませんでした: {detail}")
 
     def db_backup():
         try:
@@ -255,6 +286,13 @@ def main() -> None:
             ).all()
             lines = [f"{p.symbol}: {p.quantity}株 @ {p.avg_cost:.0f}" for p in rows]
         return "保有建玉:\n" + ("\n".join(lines) if lines else "（なし）")
+
+    def _cmd_launch(_args: str) -> str:
+        """kabuステーションを起動する（認証は認証アプリで人が行う）。"""
+        ok, detail = _launch_broker()
+        if ok:
+            return f"{detail}\n認証アプリで承認してください。承認後は自動で取引を再開します"
+        return detail
 
     def _cmd_reconnect(_args: str) -> str:
         """ログイン直後に「今すぐ繋いで」と指示するためのコマンド。
@@ -290,6 +328,7 @@ def main() -> None:
             "status": _cmd_status,
             "positions": _cmd_positions,
             "reconnect": _cmd_reconnect,
+            "launch": _cmd_launch,
             "halt": _cmd_halt,
             "resume": _cmd_resume,
         },
