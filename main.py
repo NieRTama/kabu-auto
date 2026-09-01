@@ -21,7 +21,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, auth_recovery, broker_launcher,
+    discord_bot, auth_recovery, broker_launcher, discord_queries,
 )
 from src.core import alerts as alerts_mod
 from src.core.alerts import alert
@@ -327,6 +327,9 @@ def main() -> None:
         handlers={
             "status": _cmd_status,
             "positions": _cmd_positions,
+            "today": _cmd_today,
+            "pnl": _cmd_pnl,
+            "orders": _cmd_orders,
             "reconnect": _cmd_reconnect,
             "launch": _cmd_launch,
             "halt": _cmd_halt,
