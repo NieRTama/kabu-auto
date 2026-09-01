@@ -129,11 +129,16 @@ def check_anomalies(risk) -> list[dict]:
     # （板取得の成功）が続いていることを別途確認する。
     silence_limit = float(conf.get("liveness_silence_seconds", liveness.DEFAULT_SILENCE_SECONDS))
     now_mono = time.monotonic()
-    if not TradingScheduler.is_market_open():
+    market_open = TradingScheduler.is_market_open()
+    if not market_open:
         # 場が閉じている間は基準時刻を進め、休止時間を「途絶」として数えない。
         # health_check は平日8:00-23:00の15分毎に走るので、昼休み(11:30-12:30)や
-        # 引け後もここを通り、再開時には「閉場中の経過」が積み上がらない。
+        # 引け後もここを通る。ただし23:00〜翌8:00は走らないため、これだけでは
+        # 夜間分が積み上がる（2026-09-01 に「1050分間取得なし」と誤検知）。
+        # そこで is_silent() にも閉場を伝え、再開場を跨いだ分を除いて判定させる。
         liveness.mark_closed(now=now_mono)
+        liveness.is_silent(now=now_mono, market_open=False,
+                           threshold_seconds=silence_limit)
     else:
         if liveness.is_silent(now=now_mono, market_open=True,
                               threshold_seconds=silence_limit):

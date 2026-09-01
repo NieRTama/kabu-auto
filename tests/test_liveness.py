@@ -182,3 +182,95 @@ class TestHealthCallsMarkClosed:
             health.check_anomalies(risk)
         # 閉場中の呼び出しで基準が 5000 まで進んでいる
         assert liveness.seconds_since_alive(now=5000.0) == 0.0
+
+
+class TestOvernightFalsePositive:
+    """夜間をまたいだ誤検知の防止（2026-09-01 に「1050分間取得なし」で発報）。
+
+    mark_closed() は health_check（平日8:00-23:00）からしか呼ばれないため、
+    23:00〜翌8:00の9時間は基準が進まず、翌朝の開場時に積み上がった経過時間で
+    誤検知していた。呼び出し側に依存しきらないよう、開場直後は判定を猶予する。
+    """
+
+    def _overnight(self):
+        """15:30引け → 23:00までhealth_check → 夜間は呼ばれない、を再現。
+
+        health_check は閉場中も is_silent(market_open=False) を通るため、
+        そこで閉場が観測される（実運用と同じ順序で再現する）。
+        """
+        liveness.mark_alive(now=0)
+        liveness.is_silent(now=100, market_open=True, threshold_seconds=900)
+        for t in range(3600, 27000, 900):
+            liveness.is_silent(now=t, market_open=False, threshold_seconds=900)
+            liveness.mark_closed(now=t)
+
+    def test_no_alert_right_after_market_opens(self):
+        self._overnight()
+        assert liveness.is_silent(now=63000, market_open=True,
+                                  threshold_seconds=900) is False
+
+    def test_no_alert_during_grace_period(self):
+        self._overnight()
+        liveness.is_silent(now=63000, market_open=True, threshold_seconds=900)
+        # 開場から8分（グレース15分の途中）
+        assert liveness.is_silent(now=63480, market_open=True,
+                                  threshold_seconds=900) is False
+
+    def test_detects_real_silence_after_grace(self):
+        """グレース明け後に本当に取得できていなければ検知する（検知力を落とさない）"""
+        self._overnight()
+        liveness.is_silent(now=63000, market_open=True, threshold_seconds=900)
+        assert liveness.is_silent(now=64000, market_open=True,
+                                  threshold_seconds=900) is True
+
+    def test_grace_resets_after_market_closes(self):
+        """閉場を挟むとグレースが張り直される（昼休み明けにも効く）"""
+        liveness.mark_alive(now=0)
+        liveness.is_silent(now=100, market_open=True, threshold_seconds=900)   # 開場
+        liveness.is_silent(now=200, market_open=False, threshold_seconds=900)  # 閉場
+        # 再開場の直後は、前回成功から長時間空いていても検知しない
+        assert liveness.is_silent(now=100000, market_open=True,
+                                  threshold_seconds=900) is False
+
+    def test_normal_intraday_detection_still_works(self):
+        """通常の場中（開場から十分経過後）は従来どおり検知する"""
+        liveness.mark_alive(now=0)
+        liveness.is_silent(now=0, market_open=True, threshold_seconds=900)  # 開場記録
+        liveness.mark_alive(now=1000)      # 途中で取得成功
+        assert liveness.is_silent(now=1500, market_open=True,
+                                  threshold_seconds=900) is False
+        assert liveness.is_silent(now=2000, market_open=True,
+                                  threshold_seconds=900) is True
+
+    def test_health_notifies_close_transition_to_is_silent(self):
+        """health_check が閉場を is_silent にも伝えること（結線の回帰防止）。
+
+        mark_closed() だけでは health_check の稼働時間帯(8:00-23:00)しか
+        カバーできず、夜間分が積み上がる。閉場の遷移を is_silent() にも
+        渡しておかないと、翌朝の開場でグレースが張られない。
+        """
+        from unittest.mock import MagicMock, patch
+        from src.core import health
+        risk = MagicMock()
+        risk.daily_loss_limit.return_value = 0
+        risk.current_total_drawdown.return_value = 0
+        risk.unrealized_pnl.return_value = 0
+        risk.unpriced_symbols.return_value = []
+
+        liveness.mark_alive(now=0.0)
+        with patch.object(health, "cfg") as cfg_mock, \
+             patch.object(health, "get_session") as sess_mock, \
+             patch.object(health.time, "monotonic", return_value=1000.0), \
+             patch.object(health.halt, "is_halted", return_value=False), \
+             patch.object(health.TradingScheduler, "is_market_open", return_value=False), \
+             patch.object(health.liveness, "is_silent", wraps=liveness.is_silent) as spy:
+            cfg_mock.get_section.side_effect = lambda s: {
+                "trading": {}, "runtime": {"error_rate_threshold": 0,
+                                           "liveness_silence_seconds": 900},
+            }.get(s, {})
+            ctx = MagicMock()
+            ctx.__enter__.return_value.scalar.return_value = 0
+            sess_mock.return_value = ctx
+            health.check_anomalies(risk)
+        assert spy.called, "閉場中に is_silent が呼ばれていない（グレースが張られない）"
+        assert spy.call_args.kwargs["market_open"] is False

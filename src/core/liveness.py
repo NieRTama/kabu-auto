@@ -18,6 +18,8 @@ from typing import Optional
 
 _lock = threading.Lock()
 _last_success: Optional[float] = None
+_opened_at: Optional[float] = None
+_closed_seen: bool = False
 
 # 場中にこの秒数以上、板取得の成功が無ければ異常とみなす（既定15分）。
 # stop_loss_check は5分毎に走るため、3回連続で成果が無い状態に相当する。
@@ -48,13 +50,41 @@ def mark_closed(*, now: float) -> None:
 
     is_silent() は「場が閉じていれば False」を返すので検知自体はしないが、
     経過時間は素通しで積み上がるため、再開直後に閾値超過が残ってしまう。
-    閉じている間は基準を進めておくことで、昼休み・夜間・休日を跨いでも
-    「再開後に実際に途絶えた時間」だけを見られるようにする。
+
+    注意: これは health_check（平日8:00-23:00）から呼ばれるため、
+    **23:00〜翌8:00は呼ばれない**。夜間分の積み上がりは is_silent() 側の
+    グレース期間で吸収する（呼び出し側に依存しきらない二重の守り）。
     """
     global _last_success
     with _lock:
         if _last_success is not None:
             _last_success = now
+
+
+def note_market_open(*, now: float) -> None:
+    """「閉場→開場」の遷移を観測したとき、その時刻を記録する。
+
+    閉場をまたいだ経過時間を「途絶」と数えないための、mark_closed() に依存しない
+    二重の守り。mark_closed() は health_check(平日8:00-23:00)からしか呼ばれず、
+    夜間9時間分は積み上がってしまうため（2026-09-01 に「1050分間取得なし」と
+    誤検知した実例）、開場を跨いだ分を除いて判定できるようにする。
+
+    注意: 記録するのは note_market_closed() を経た「再開」のときだけ。
+    起動直後の初回呼び出しでは開場時刻が不明なため記録せず、グレースも効かせない
+    （再起動直後に本当に途絶していても15分見逃す、という穴を作らないため）。
+    """
+    global _opened_at
+    with _lock:
+        if _closed_seen and _opened_at is None:
+            _opened_at = now
+
+
+def note_market_closed() -> None:
+    """場が閉じたことを記録する（次の開場で起点を張り直す）。"""
+    global _opened_at, _closed_seen
+    with _lock:
+        _opened_at = None
+        _closed_seen = True
 
 
 def is_silent(*, now: float, market_open: bool,
@@ -64,17 +94,32 @@ def is_silent(*, now: float, market_open: bool,
     場が閉じているときは常に False（場外に動きが無いのは正常）。
     1度も成功していない場合も False とする（起動直後の誤検知を避けるため。
     起動時の接続失敗は preflight と broker_auth が別途カバーしている）。
+
+    開場直後は、閉場をまたいだ経過時間で誤検知しないよう、
+    開場から threshold_seconds が経つまでは判定しない（グレース期間）。
     """
-    if not market_open or threshold_seconds <= 0:
+    if not market_open:
+        note_market_closed()
         return False
+    if threshold_seconds <= 0:
+        return False
+    note_market_open(now=now)
     elapsed = seconds_since_alive(now=now)
     if elapsed is None:
         return False
+    with _lock:
+        opened_at = _opened_at
+    if opened_at is not None:
+        # 閉場をまたいだ分は数えない。開場後に経過した時間だけで判定する
+        # （mark_closed が呼ばれない夜間帯を挟んでも誤検知しないようにする）。
+        elapsed = min(elapsed, now - opened_at)
     return elapsed >= threshold_seconds
 
 
 def reset() -> None:
     """テスト用に状態を初期化する。"""
-    global _last_success
+    global _last_success, _opened_at, _closed_seen
     with _lock:
         _last_success = None
+        _opened_at = None
+        _closed_seen = False
