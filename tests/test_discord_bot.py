@@ -208,3 +208,67 @@ class TestHelpWithDescriptions:
     def test_falls_back_to_names_when_no_descriptions(self):
         h = mod.CommandHandler({"a": lambda x: "", "b": lambda x: ""})
         assert h.help_text() == "利用できるコマンド: a  b"
+
+
+class TestRoleMention:
+    """ロールメンションにも反応すること（2026-09-01 に実際に踏んだ）。
+
+    Discordの入力補完は「Botユーザー」ではなく「Botに紐づくロール」を選ぶことがあり、
+    その場合 <@&ロールID> になる。ユーザーメンションだけを見ていたため、
+    Intentを有効にしても一切反応しなかった。利用者に選び分けを強いるのは
+    非現実的なので、実装側で両方を受け付ける。
+    """
+
+    ROLE = "555"
+
+    def _msg_role(self, text):
+        return {
+            "id": "1", "content": f"<@&{self.ROLE}> {text}",
+            "author": {"id": OWNER, "bot": False},
+            "mentions": [], "mention_roles": [self.ROLE],
+        }
+
+    def test_detects_role_mention(self):
+        assert mod.is_mentioned(self._msg_role("help"), BOT_ID, {self.ROLE}) is True
+
+    def test_ignores_role_mention_without_role_ids(self):
+        """ロールIDを知らなければ従来どおり無視（他ロールへの言及に反応しない）"""
+        assert mod.is_mentioned(self._msg_role("help"), BOT_ID, set()) is False
+
+    def test_strips_role_mention(self):
+        assert mod.strip_mention(f"<@&{self.ROLE}> status", BOT_ID, {self.ROLE}) == "status"
+
+    def test_strips_user_mention_still_works(self):
+        assert mod.strip_mention(f"<@{BOT_ID}> status", BOT_ID, {self.ROLE}) == "status"
+        assert mod.strip_mention(f"<@!{BOT_ID}> status", BOT_ID, {self.ROLE}) == "status"
+
+    def test_rejects_other_role(self):
+        """別のロールへのメンションは自分宛ではない"""
+        assert mod.strip_mention("<@&999> status", BOT_ID, {self.ROLE}) == ""
+
+    def test_rejects_other_user(self):
+        assert mod.strip_mention("<@777> status", BOT_ID, {self.ROLE}) == ""
+
+    def test_executes_command_via_role_mention(self):
+        """ロールメンション経由でも実際にコマンドが動くこと（結線の検証）"""
+        client = MagicMock()
+        client.fetch_messages.return_value = [self._msg_role("status")]
+        rc = mod.RemoteControl(
+            client, mod.CommandHandler({"status": lambda a: "OK"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER}, role_ids={self.ROLE},
+        )
+        assert rc.poll_once() == 1
+        client.send.assert_called_once_with("OK")
+
+    def test_authorization_still_applies_to_role_mention(self):
+        """ロール経由でも送信者IDの認可は効く（誰でも操作できてはいけない）"""
+        msg = self._msg_role("status")
+        msg["author"]["id"] = STRANGER
+        client = MagicMock()
+        client.fetch_messages.return_value = [msg]
+        rc = mod.RemoteControl(
+            client, mod.CommandHandler({"status": lambda a: "OK"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER}, role_ids={self.ROLE},
+        )
+        assert rc.poll_once() == 0
+        client.send.assert_not_called()

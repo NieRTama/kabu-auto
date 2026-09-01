@@ -24,6 +24,7 @@
 
 REST API のみを使い、新規依存は無い（既存の requests を使う）。
 """
+import re
 from typing import Callable, Optional
 
 import requests
@@ -63,6 +64,28 @@ class DiscordBotClient:
         # Discord は新しい順で返すため、処理しやすいよう古い順に直す
         return list(reversed(resp.json()))
 
+    def fetch_bot_role_ids(self, bot_id: str) -> set:
+        """このBotに紐づくロールIDを取得する。
+
+        Discordの入力補完は「Botユーザー」ではなく「Botに紐づくロール」を選ぶことが
+        あり、その場合メッセージは <@&ロールID> になる。宛先として認識するために
+        自分のロールIDを控えておく（取得できなければ空集合＝従来どおり動く）。
+        """
+        try:
+            ch = requests.get(f"{API_BASE}/channels/{self._channel_id}",
+                              headers=self._headers, timeout=self._timeout)
+            ch.raise_for_status()
+            guild_id = ch.json().get("guild_id")
+            if not guild_id:
+                return set()
+            me = requests.get(f"{API_BASE}/guilds/{guild_id}/members/{bot_id}",
+                              headers=self._headers, timeout=self._timeout)
+            me.raise_for_status()
+            return {str(r) for r in me.json().get("roles", [])}
+        except Exception as e:
+            logger.warning(f"Botのロール取得に失敗しました（ロールメンションは無効）: {e}")
+            return set()
+
     def send(self, content: str) -> None:
         if len(content) > MAX_REPLY_LENGTH:
             content = content[:MAX_REPLY_LENGTH] + "…(略)"
@@ -73,20 +96,44 @@ class DiscordBotClient:
         resp.raise_for_status()
 
 
-def strip_mention(content: str, bot_id: str) -> str:
-    """メッセージ先頭のBotメンションを取り除いてコマンド部分を返す。
+# メンション記法。Discordの入力補完は「Botユーザー」ではなく「Botに紐づくロール」を
+# 選ぶことがあり、その場合 <@&ロールID> になる（2026-09-01 に実際に発生し、
+# ユーザーメンションだけを見ていたため一切反応しなかった）。
+# 利用者に選び分けを強いるのは非現実的なので、両方を受け付ける。
+_MENTION_RE = re.compile(r"^<@(?P<role>&)?!?(?P<id>\d+)>")
 
-    Discord のメンションは `<@123>` または `<@!123>`（ニックネーム時）の形式。
+
+def strip_mention(content: str, bot_id: str, role_ids: Optional[set] = None) -> str:
+    """メッセージ先頭のメンションを取り除いてコマンド部分を返す。
+
+    受け付ける形式:
+      <@123>   ユーザー（Bot本体）
+      <@!123>  ニックネーム付きユーザー
+      <@&456>  ロール（Botに紐づくロールを補完で選んだ場合）
+
+    role_ids を渡すとロールメンションも許可する。宛先が一致しなければ空文字。
     """
-    for prefix in (f"<@{bot_id}>", f"<@!{bot_id}>"):
-        if content.startswith(prefix):
-            return content[len(prefix):].strip()
-    return ""
+    m = _MENTION_RE.match(content or "")
+    if not m:
+        return ""
+    target = m.group("id")
+    # ロール記法(<@&ID>)とユーザー記法(<@ID>)は別物として突き合わせる。
+    # 混同すると「たまたま同じ数値の別ロール」に反応してしまう。
+    if m.group("role"):
+        allowed = target in {str(r) for r in (role_ids or set())}
+    else:
+        allowed = target == str(bot_id)
+    return content[m.end():].strip() if allowed else ""
 
 
-def is_mentioned(message: dict, bot_id: str) -> bool:
-    """このメッセージがBot宛のメンションか。"""
-    return any(u.get("id") == bot_id for u in message.get("mentions", []))
+def is_mentioned(message: dict, bot_id: str, role_ids: Optional[set] = None) -> bool:
+    """このメッセージがBot宛（ユーザー or Botのロール）のメンションか。"""
+    if any(u.get("id") == str(bot_id) for u in message.get("mentions", [])):
+        return True
+    if not role_ids:
+        return False
+    mentioned_roles = {str(r) for r in message.get("mention_roles", [])}
+    return bool(mentioned_roles & {str(r) for r in role_ids})
 
 
 class CommandHandler:
@@ -151,10 +198,13 @@ class RemoteControl:
     """
 
     def __init__(self, client: DiscordBotClient, handler: CommandHandler,
-                 *, bot_id: str, allowed_user_ids: set):
+                 *, bot_id: str, allowed_user_ids: set,
+                 role_ids: Optional[set] = None):
         self._client = client
         self._handler = handler
         self._bot_id = bot_id
+        # Discordの補完で「Botのロール」を選ばれることがあるため、そちらも宛先として扱う
+        self._role_ids = {str(r) for r in (role_ids or set())}
         self._allowed = {str(u) for u in allowed_user_ids if str(u).strip()}
         self._last_id: Optional[str] = None
 
@@ -181,7 +231,7 @@ class RemoteControl:
             author = msg.get("author", {}) or {}
             if author.get("bot"):
                 continue  # 自分やほかのBotの発言は無視（無限ループ防止）
-            if not is_mentioned(msg, self._bot_id):
+            if not is_mentioned(msg, self._bot_id, self._role_ids):
                 continue
             if self._allowed and str(author.get("id")) not in self._allowed:
                 logger.warning(
@@ -189,7 +239,7 @@ class RemoteControl:
                     f"user_id={author.get('id')}"
                 )
                 continue
-            command = strip_mention(msg.get("content", ""), self._bot_id)
+            command = strip_mention(msg.get("content", ""), self._bot_id, self._role_ids)
             reply = self._handler.execute(command)
             if reply is None:
                 continue
@@ -215,8 +265,10 @@ def build(token: str, channel_id: str, allowed_user_ids: set,
     bot_id = str(me.get("id", ""))
     if not bot_id:
         return None
+    role_ids = client.fetch_bot_role_ids(bot_id)
     rc = RemoteControl(client, CommandHandler(handlers),
-                       bot_id=bot_id, allowed_user_ids=allowed_user_ids)
+                       bot_id=bot_id, allowed_user_ids=allowed_user_ids,
+                       role_ids=role_ids)
     rc.prime()
     logger.info(f"Discordリモコンを有効化しました（bot={me.get('username')}）")
     return rc
