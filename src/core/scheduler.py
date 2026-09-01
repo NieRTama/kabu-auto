@@ -17,6 +17,8 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 
+from src.core import market_calendar
+
 TZ = pytz.timezone("Asia/Tokyo")
 
 
@@ -157,10 +159,14 @@ class TradingScheduler:
         logger.info("スケジューラ停止")
 
     @staticmethod
-    def is_market_open() -> bool:
-        """現在が東証の取引時間内かチェック（土日・メンテ除外）"""
-        now = datetime.now(TZ)
-        if now.weekday() >= 5:  # 土日
+    def is_market_open(now: Optional[datetime] = None) -> bool:
+        """現在が東証の取引時間内かチェック（土日・祝日・年末年始・メンテ除外）。
+
+        祝日を除外しないと、休場日に板取得が全て失敗して
+        エラー率監視・サイレント故障検知が誤発報する（2026-09 に判明）。
+        """
+        now = now or datetime.now(TZ)
+        if market_calendar.is_holiday(now.date()):
             return False
         now_hm = (now.hour, now.minute)
         morning = (9, 0) <= now_hm < (11, 30)
@@ -195,7 +201,7 @@ class TradingScheduler:
         if minutes <= 0:
             return False
         now = now or datetime.now(TZ)
-        if now.weekday() >= 5:
+        if market_calendar.is_holiday(now.date()):
             return False
         close_min = 15 * 60 + 30  # 15:30
         now_min = now.hour * 60 + now.minute

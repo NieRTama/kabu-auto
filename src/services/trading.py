@@ -16,6 +16,7 @@ from loguru import logger
 from sqlalchemy import func, select
 
 from src.core import clock
+from src.core import market_calendar
 from src.core import config as cfg
 from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
@@ -198,6 +199,9 @@ class TradingServices:
         """
         try:
             from src.core import heartbeat as hb
+            if market_calendar.is_holiday(clock.today()):
+                logger.info("ハートビート省略: 本日は休場です")
+                return
             mode = self.trading_conf.get("mode", "paper")
             snapshot = self.order_mgr.status_snapshot()
             with get_session() as session:
@@ -233,6 +237,9 @@ class TradingServices:
         try:
             from src.core import discord_report
             from src.core import reference_capital as ref_capital_store
+            if market_calendar.is_holiday(clock.today()):
+                logger.info("日次レポート省略: 本日は休場です")
+                return
             mode = self.trading_conf.get("mode", "paper")
             paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
             basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
@@ -292,6 +299,13 @@ class TradingServices:
         """16:20（data_update完了後）に翌営業日の売買候補をスキャン。
         ペーパーモードは終値で即時シミュレート"""
         if TradingScheduler.is_maintenance_window():
+            return
+        if market_calendar.is_holiday(clock.today()):
+            # 休場日は前営業日と同じ終値になり、無意味なシグナルがDBに溜まる。
+            # 翌営業日の morning_execution が拾う「最新バッチ」を汚さないよう止める。
+            logger.info(
+                f"シグナルスキャン省略: 本日は休場です（{market_calendar.holiday_name(clock.today())}）"
+            )
             return
         logger.info("シグナルスキャン開始...")
         is_paper = self.trading_conf.get("mode", "paper") == "paper"
