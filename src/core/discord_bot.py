@@ -92,15 +92,36 @@ def is_mentioned(message: dict, bot_id: str) -> bool:
 class CommandHandler:
     """コマンド文字列を解釈して実行する。Discord API を知らない（テスト容易性）。
 
-    handlers は {コマンド名: 関数(args:str)->str} 。関数は返信文字列を返す。
+    handlers は {コマンド名: 関数} または {コマンド名: (関数, 説明)}。
+    説明を添えると help が「何ができるか」まで案内する（名前の羅列だけでは
+    外出先で思い出せないため）。関数は返信文字列を返す。
     """
 
     def __init__(self, handlers: dict):
-        self._handlers = handlers
+        self._handlers: dict = {}
+        self._descriptions: dict = {}
+        for name, spec in handlers.items():
+            if isinstance(spec, tuple):
+                fn, desc = spec
+            else:
+                fn, desc = spec, ""
+            self._handlers[name] = fn
+            self._descriptions[name] = desc
 
     def help_text(self) -> str:
-        names = "  ".join(sorted(self._handlers))
-        return f"利用できるコマンド: {names}"
+        """コマンド一覧を説明つきで返す。
+
+        説明が1つも無い場合は名前だけを並べる（説明を持たない使い方との互換）。
+        """
+        names = sorted(self._handlers)
+        if not any(self._descriptions.get(n) for n in names):
+            return "利用できるコマンド: " + "  ".join(names)
+        width = max(len(n) for n in names)
+        lines = ["kabu-auto コマンド一覧（先頭に @kabu-auto を付けて実行）", ""]
+        for n in names:
+            desc = self._descriptions.get(n, "")
+            lines.append(f"  {n.ljust(width)}  {desc}" if desc else f"  {n}")
+        return "\n".join(lines)
 
     def execute(self, command_line: str) -> Optional[str]:
         """コマンドを実行して返信文を返す。空・未知のコマンドは案内を返す。"""

@@ -121,7 +121,11 @@ class TestWiring:
             return f.read()
 
     def test_discord_launch_command_registered(self):
-        assert '"launch": _cmd_launch' in self._main_src()
+        # 登録は {name: 関数} と {name: (関数, 説明)} の両形式を許す
+        import re
+        assert re.search(r'"launch":\s*\(?_cmd_launch', self._main_src()), (
+            "launch コマンドが登録されていない"
+        )
 
     def test_auto_launch_on_auth_recovery(self):
         """認証切れが続くとき自動起動を試みること"""

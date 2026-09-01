@@ -162,3 +162,49 @@ class TestNoSecretCommands:
             assert forbidden not in src, (
                 f"Discord経由で秘密情報や.envを扱う実装が入っている: {forbidden}"
             )
+
+
+class TestHelpWithDescriptions:
+    """help が「何ができるか」まで案内すること。
+
+    名前の羅列だけでは外出先で思い出せない（コマンドが9個に増えた）。
+    """
+
+    def _handler(self):
+        return mod.CommandHandler({
+            "status": (lambda a: "", "稼働状況を表示"),
+            "halt": (lambda a: "", "取引を停止する"),
+        })
+
+    def test_lists_names_and_descriptions(self):
+        out = self._handler().help_text()
+        assert "status" in out and "稼働状況を表示" in out
+        assert "halt" in out and "取引を停止する" in out
+
+    def test_shows_how_to_invoke(self):
+        """メンションを付けて実行することを案内する（打ち方が分からないと使えない）"""
+        assert "@kabu-auto" in self._handler().help_text()
+
+    def test_help_command_returns_the_list(self):
+        assert "稼働状況を表示" in self._handler().execute("help")
+
+    def test_question_mark_is_alias(self):
+        assert "稼働状況を表示" in self._handler().execute("?")
+
+    def test_unknown_command_shows_help(self):
+        out = self._handler().execute("bogus")
+        assert "不明なコマンド" in out and "稼働状況を表示" in out
+
+    def test_tuple_and_plain_handlers_both_work(self):
+        """説明なし（関数のみ）の登録とも混在できる（後方互換）"""
+        h = mod.CommandHandler({
+            "a": (lambda x: "A", "説明あり"),
+            "b": lambda x: "B",
+        })
+        assert h.execute("a") == "A"
+        assert h.execute("b") == "B"
+        assert "説明あり" in h.help_text()
+
+    def test_falls_back_to_names_when_no_descriptions(self):
+        h = mod.CommandHandler({"a": lambda x: "", "b": lambda x: ""})
+        assert h.help_text() == "利用できるコマンド: a  b"

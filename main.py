@@ -333,16 +333,18 @@ def main() -> None:
         channel_id=os.environ.get("DISCORD_BOT_CHANNEL_ID", "")
         or str(discord_conf.get("discord_bot_channel_id", "")),
         allowed_user_ids={os.environ.get("DISCORD_ALLOWED_USER_ID", "")},
+        # (関数, help に出す説明)。説明を書いておくと外出先で
+        # 「何ができたか」を思い出せる（名前の羅列だけでは足りない）。
         handlers={
-            "status": _cmd_status,
-            "positions": _cmd_positions,
-            "today": _cmd_today,
-            "pnl": _cmd_pnl,
-            "orders": _cmd_orders,
-            "reconnect": _cmd_reconnect,
-            "launch": _cmd_launch,
-            "halt": _cmd_halt,
-            "resume": _cmd_resume,
+            "status": (_cmd_status, "稼働状況（モード・発注可否・認証・未解決注文）"),
+            "positions": (_cmd_positions, "保有建玉（取得単価・現在値・含み損益）"),
+            "today": (_cmd_today, "本日の約定履歴と確定損益"),
+            "pnl": (_cmd_pnl, "損益サマリ（当日/週次/月次/総合）"),
+            "orders": (_cmd_orders, "未約定注文の一覧"),
+            "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),
+            "launch": (_cmd_launch, "kabuステーションを起動する（認証は手動）"),
+            "halt": (_cmd_halt, "取引を停止する（例: halt 様子見。退出は継続）"),
+            "resume": (_cmd_resume, "取引を再開する"),
         },
     )
 

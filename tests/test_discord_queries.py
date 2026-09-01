@@ -141,8 +141,11 @@ class TestWiring:
     def test_commands_registered(self):
         with open("main.py", encoding="utf-8") as f:
             src = f.read()
-        for cmd in ('"positions"', '"today"', '"pnl"', '"orders"'):
-            assert f"{cmd}: _cmd_" in src, f"{cmd} コマンドが登録されていない"
+        # 登録は {name: 関数} と {name: (関数, 説明)} の両形式を許す
+        import re
+        registered = set(re.findall(r'"(\w+)":\s*\(?_cmd_\w+', src))
+        for cmd in ("positions", "today", "pnl", "orders"):
+            assert cmd in registered, f"{cmd} コマンドが登録されていない"
 
     def test_queries_are_read_only(self):
         """照会コマンドが発注・状態変更をしないこと（誤操作の余地を作らない）"""
@@ -161,7 +164,7 @@ class TestWiring:
         import re
         with open("main.py", encoding="utf-8") as f:
             src = f.read()
-        registered = set(re.findall(r'"\w+":\s*(_cmd_\w+)', src))
+        registered = set(re.findall(r'"\w+":\s*\(?(_cmd_\w+)', src))
         defined = set(re.findall(r'def (_cmd_\w+)\(', src))
         missing = registered - defined
         assert not missing, f"登録済みだが未定義のコマンド関数: {missing}"
