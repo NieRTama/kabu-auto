@@ -150,3 +150,18 @@ class TestWiring:
         src = inspect.getsource(dq)
         for forbidden in ("order_mgr", "buy(", "sell(", "halt.engage", "session.commit"):
             assert forbidden not in src, f"照会モジュールに変更操作が入っている: {forbidden}"
+
+    def test_all_registered_commands_are_defined(self):
+        """登録したコマンド名に対応する関数が実在すること（NameError の再発防止）。
+
+        2026-09-01、置換ミスで _cmd_today 等の定義が欠けたまま登録だけが残り、
+        起動時に NameError で落ちた。構文チェックでは検出できず、
+        「起動せずにコミットした」ことが原因だった。
+        """
+        import re
+        with open("main.py", encoding="utf-8") as f:
+            src = f.read()
+        registered = set(re.findall(r'"\w+":\s*(_cmd_\w+)', src))
+        defined = set(re.findall(r'def (_cmd_\w+)\(', src))
+        missing = registered - defined
+        assert not missing, f"登録済みだが未定義のコマンド関数: {missing}"

@@ -278,14 +278,23 @@ def main() -> None:
                 f"未解決注文: {snap['unresolved_orders']}件 / "
                 f"承認待ち: {snap['pending_approvals']}件")
 
+    def _reference_capital() -> float:
+        """損益率の算出基準（日次レポートと同じ基準を使い、数字を食い違わせない）。"""
+        from src.core import reference_capital as ref_capital_store
+        paper_base = float(trading_conf.get("paper_initial_capital", 500_000))
+        return ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+
     def _cmd_positions(_args: str) -> str:
-        from src.data.database import Position
-        with db.get_session() as session:
-            rows = session.scalars(
-                db.select(Position).where(Position.quantity > 0)
-            ).all()
-            lines = [f"{p.symbol}: {p.quantity}株 @ {p.avg_cost:.0f}" for p in rows]
-        return "保有建玉:\n" + ("\n".join(lines) if lines else "（なし）")
+        return discord_queries.format_positions(_reference_capital())
+
+    def _cmd_today(_args: str) -> str:
+        return discord_queries.format_today_trades()
+
+    def _cmd_pnl(_args: str) -> str:
+        return discord_queries.format_pnl(_reference_capital())
+
+    def _cmd_orders(_args: str) -> str:
+        return discord_queries.format_open_orders()
 
     def _cmd_launch(_args: str) -> str:
         """kabuステーションを起動する（認証は認証アプリで人が行う）。"""
