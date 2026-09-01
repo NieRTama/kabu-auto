@@ -23,3 +23,6 @@ tzdata==2026.2  # Windowsで zoneinfo(Asia/Tokyo) を使うために必要。tz�
 tweepy==4.14.0  # X（旧Twitter）への日次レポート投稿用（任意機能。x.enabled=falseなら未使用）
 # 東証の休場日判定（国民の祝日）。法改正に追随するためライブラリで持つ
 jpholiday==1.0.3
+# Discordスラッシュコマンド（任意）。未導入でもメンション方式のリモコンは動作する。
+# Gateway経由で受信するためポート開放は不要。
+discord.py==2.7.1

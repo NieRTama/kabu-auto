@@ -21,7 +21,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, auth_recovery, broker_launcher, discord_queries,
+    discord_bot, auth_recovery, broker_launcher, discord_queries, discord_slash,
 )
 from src.core import alerts as alerts_mod
 from src.core.alerts import alert
@@ -327,26 +327,36 @@ def main() -> None:
         return "取引を再開しました"
 
     discord_conf = cfg.get_section("alerts")
+    _bot_token = (os.environ.get("DISCORD_BOT_TOKEN", "")
+                  or discord_conf.get("discord_bot_token", ""))
+    _bot_channel = (os.environ.get("DISCORD_BOT_CHANNEL_ID", "")
+                    or str(discord_conf.get("discord_bot_channel_id", "")))
+    _bot_users = {os.environ.get("DISCORD_ALLOWED_USER_ID", "")}
+    # (関数, 説明)。説明は help とスラッシュコマンドの候補表示に使う。
+    # メンション方式とスラッシュ方式で**同じ定義を共有**する（実装を二重に持たない）。
+    _discord_handlers = {
+        "status": (_cmd_status, "稼働状況（モード・発注可否・認証・未解決注文）"),
+        "positions": (_cmd_positions, "保有建玉（取得単価・現在値・含み損益）"),
+        "today": (_cmd_today, "本日の約定履歴と確定損益"),
+        "pnl": (_cmd_pnl, "損益サマリ（当日/週次/月次/総合）"),
+        "orders": (_cmd_orders, "未約定注文の一覧"),
+        "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),
+        "launch": (_cmd_launch, "kabuステーションを起動する（認証は手動）"),
+        "halt": (_cmd_halt, "取引を停止する（例: halt 様子見。退出は継続）"),
+        "resume": (_cmd_resume, "取引を再開する"),
+    }
+    # メンション方式（30秒ポーリング）。Gateway が切れていても操作できる経路として残す。
     remote = discord_bot.build(
-        token=os.environ.get("DISCORD_BOT_TOKEN", "")
-        or discord_conf.get("discord_bot_token", ""),
-        channel_id=os.environ.get("DISCORD_BOT_CHANNEL_ID", "")
-        or str(discord_conf.get("discord_bot_channel_id", "")),
-        allowed_user_ids={os.environ.get("DISCORD_ALLOWED_USER_ID", "")},
-        # (関数, help に出す説明)。説明を書いておくと外出先で
-        # 「何ができたか」を思い出せる（名前の羅列だけでは足りない）。
-        handlers={
-            "status": (_cmd_status, "稼働状況（モード・発注可否・認証・未解決注文）"),
-            "positions": (_cmd_positions, "保有建玉（取得単価・現在値・含み損益）"),
-            "today": (_cmd_today, "本日の約定履歴と確定損益"),
-            "pnl": (_cmd_pnl, "損益サマリ（当日/週次/月次/総合）"),
-            "orders": (_cmd_orders, "未約定注文の一覧"),
-            "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),
-            "launch": (_cmd_launch, "kabuステーションを起動する（認証は手動）"),
-            "halt": (_cmd_halt, "取引を停止する（例: halt 様子見。退出は継続）"),
-            "resume": (_cmd_resume, "取引を再開する"),
-        },
+        token=_bot_token, channel_id=_bot_channel,
+        allowed_user_ids=_bot_users, handlers=_discord_handlers,
     )
+    # スラッシュコマンド（Gateway 常時接続・即時応答）。discord.py 未導入なら無効。
+    slash = discord_slash.build(
+        token=_bot_token, channel_id=_bot_channel,
+        allowed_user_ids=_bot_users, handlers=_discord_handlers,
+    )
+    if slash is not None:
+        atexit.register(slash.stop)
 
     # ─── スケジューラのコールバック登録 ──────────────────────
     scheduler.register("risk_reset", risk.reset_daily_counters)
