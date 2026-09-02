@@ -12,10 +12,16 @@ import src.core.health as health
 @pytest.fixture(autouse=True)
 def _reset(tmp_path):
     health.reset()
+    # エラー率・生存記録はモジュール全域で共有されるため、他テストが残した状態を
+    # 引き継ぐと本ファイルの検証（異常なし＝空）が壊れる。毎回空にして隔離する。
+    from src.core import error_rate, liveness
+    error_rate.reset()
+    liveness.reset()
     from src.core import halt
     halt.load(str(tmp_path / "halt.json"))  # 非停止
     yield
     health.reset()
+    error_rate.reset()
     halt.load(str(tmp_path / "halt.json"))
 
 

@@ -12,7 +12,8 @@ from loguru import logger
 
 from src.core import config as cfg
 from src.core import trading_mode as tm
-from src.core.alerts import DISCORD_MAX_CONTENT_LENGTH, DiscordWebhookProvider
+from src.core.alerts import (DISCORD_MAX_CONTENT_LENGTH, DiscordWebhookProvider,
+                             _send_one)
 from src.core.pnl_report import format_report_text
 
 
@@ -29,13 +30,12 @@ def post_text(text: str) -> bool:
             "（docs/日次レポート投稿ガイド.md参照）"
         )
         return False
-    try:
-        DiscordWebhookProvider(webhook_url).send(text)
+    # アラートと同じ再送経路を通す（一時的なDNS障害・Discord側の5xxで
+    # レポートが黙って消えないようにする。2026-09-02 のハートビート消失と同じ穴）。
+    if _send_one(DiscordWebhookProvider(webhook_url), text):
         logger.info("Discordへ日次レポートを投稿しました")
         return True
-    except Exception as e:
-        logger.error(f"Discord日次レポート投稿失敗: {e}")
-        return False
+    return False
 
 
 def format_for_discord(mode: str, report: dict, holdings: Optional[dict] = None) -> str:

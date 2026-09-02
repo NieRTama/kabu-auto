@@ -57,16 +57,33 @@ class TestErrorRateWindow:
 
 
 class TestErrorRateSink:
+    @staticmethod
+    def _message(text: str, level: str = "ERROR"):
+        msg = MagicMock()
+        level_obj = MagicMock()
+        level_obj.name = level
+        msg.record = {"message": text, "level": level_obj}
+        return msg
+
     def test_sink_records_message(self):
         """loguru のシンクとして呼ばれたらカウントされる"""
         clock = {"t": 50.0}
         sink = error_rate.make_sink(clock=lambda: clock["t"])
-        msg = MagicMock()
-        msg.record = {"message": "決済チェックエラー: 6753 'trailing_stop'"}
-        sink(msg)
+        sink(self._message("決済チェックエラー: 6753 'trailing_stop'"))
         snap = error_rate.snapshot(now=50.0)
         assert snap["count"] == 1
         assert "trailing_stop" in snap["latest"]
+
+    def test_sink_separates_warning_from_error(self):
+        """WARNING は別枠で数える（閾値が違うため混ぜない）"""
+        sink = error_rate.make_sink(clock=lambda: 50.0)
+        sink(self._message("建玉照合失敗（次回再試行）: 401", level="WARNING"))
+        sink(self._message("損切りチェックエラー: 9432 401"))
+        snap = error_rate.snapshot(now=50.0)
+        assert snap["count"] == 1
+        assert snap["warning_count"] == 1
+        assert "建玉照合失敗" in snap["latest_warning"]
+        assert "損切りチェック" in snap["latest"]
 
 
 class TestHealthIntegration:
@@ -82,10 +99,13 @@ class TestHealthIntegration:
         r.unpriced_symbols.return_value = []
         return r
 
-    def _run(self, threshold=10, count=0):
+    def _run(self, threshold=10, count=0, warn_threshold=50, warn_count=0):
         from src.core import health
         for i in range(count):
             error_rate.record(f"401 Unauthorized #{i}", now=1000.0)
+        for i in range(warn_count):
+            error_rate.record(f"建玉照合失敗（次回再試行）: 401 #{i}",
+                              now=1000.0, level="WARNING")
         with patch.object(health, "cfg") as cfg_mock, \
              patch.object(health, "get_session") as sess_mock, \
              patch.object(health.time, "monotonic", return_value=1000.0), \
@@ -93,6 +113,7 @@ class TestHealthIntegration:
             cfg_mock.get_section.side_effect = lambda s: {
                 "trading": {"max_daily_loss": 0},
                 "runtime": {"error_rate_threshold": threshold,
+                            "error_rate_warning_threshold": warn_threshold,
                             "error_rate_window_seconds": 900},
             }.get(s, {})
             ctx = MagicMock()
@@ -104,6 +125,34 @@ class TestHealthIntegration:
         items = self._run(threshold=10, count=12)
         keys = {i["key"] for i in items}
         assert "error_rate_high" in keys
+
+    def test_warning_flood_is_detected(self):
+        """2026-09-02 の実測比率の再現。
+
+        認証断のあいだ15秒毎の建玉照合が WARNING を出し続け、15分あたり約60件に
+        達していた。一方 ERROR は約3.5件で閾値10に届かず、**497回失敗しているのに
+        「エラーは少ない」と判定**されていた。WARNING を別枠で数えて検知する。
+        """
+        items = self._run(threshold=10, count=3, warn_threshold=50, warn_count=60)
+        keys = {i["key"] for i in items}
+        assert "error_rate_high" not in keys, "ERRORは閾値未満のまま（実測どおり）"
+        assert "warning_rate_high" in keys
+
+    def test_normal_warning_volume_is_ignored(self):
+        """通常運転で出る程度の警告では発報しない（誤検知させない）"""
+        items = self._run(threshold=10, count=1, warn_threshold=50, warn_count=10)
+        assert "warning_rate_high" not in {i["key"] for i in items}
+
+    def test_warning_check_disabled_when_zero(self):
+        items = self._run(threshold=10, count=0, warn_threshold=0, warn_count=200)
+        assert "warning_rate_high" not in {i["key"] for i in items}
+
+    def test_error_alert_takes_precedence(self):
+        """ERROR多発時は警告の重複通知を出さない（同じ障害を2通で騒がない）"""
+        items = self._run(threshold=10, count=12, warn_threshold=50, warn_count=60)
+        keys = {i["key"] for i in items}
+        assert "error_rate_high" in keys
+        assert "warning_rate_high" not in keys
 
     def test_silent_when_under_threshold(self):
         items = self._run(threshold=10, count=3)

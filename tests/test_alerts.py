@@ -93,17 +93,82 @@ class TestAlert:
         failing.send.side_effect = RuntimeError("boom")
         succeeding = MagicMock()
         succeeding.name = "other"
-        with patch.object(alerts_mod, "build_providers", return_value=[failing, succeeding]):
+        with patch.object(alerts_mod, "build_providers", return_value=[failing, succeeding]), \
+             patch.object(alerts_mod.time, "sleep"):
             alert("タイトル", "本文")  # 例外を外に投げない
-        failing.send.assert_called_once()
+        # 失敗側は再送を尽くしたうえで諦める
+        assert failing.send.call_count == alerts_mod.ALERT_SEND_ATTEMPTS
         succeeding.send.assert_called_once()
 
     def test_all_providers_failing_does_not_raise(self):
         failing = MagicMock()
         failing.name = "discord"
         failing.send.side_effect = RuntimeError("boom")
-        with patch.object(alerts_mod, "build_providers", return_value=[failing]):
+        with patch.object(alerts_mod, "build_providers", return_value=[failing]), \
+             patch.object(alerts_mod.time, "sleep"):
             alert("タイトル", "本文")  # 取引処理を壊さないため例外を外に投げない
+
+
+class TestSendRetry:
+    """通知の再送（2026-09-02 の 8:45 ハートビート消失が起点）。
+
+    DNS解決失敗 (getaddrinfo failed) で送信できず、再送も無くそのまま消えた。
+    「⚪が来ないこと自体が異常」という運用前提は、送信失敗を握り潰すと崩れる。
+    """
+
+    def _provider(self, side_effect=None):
+        p = MagicMock()
+        p.name = "discord"
+        p.send.side_effect = side_effect
+        return p
+
+    def test_transient_failure_then_success(self):
+        """一時的な失敗は再送で回復し、失敗として記録しない"""
+        p = self._provider(side_effect=[requests.ConnectionError("getaddrinfo failed"), None])
+        with patch.object(alerts_mod.time, "sleep") as slept:
+            assert alerts_mod._send_one(p, "本文") is True
+        assert p.send.call_count == 2
+        slept.assert_called_once_with(alerts_mod.ALERT_RETRY_BASE_DELAY)
+
+    def test_gives_up_after_attempts(self):
+        p = self._provider(side_effect=requests.ConnectionError("getaddrinfo failed"))
+        with patch.object(alerts_mod.time, "sleep"):
+            assert alerts_mod._send_one(p, "本文") is False
+        assert p.send.call_count == alerts_mod.ALERT_SEND_ATTEMPTS
+
+    def test_backoff_is_exponential(self):
+        p = self._provider(side_effect=requests.ConnectionError("x"))
+        with patch.object(alerts_mod.time, "sleep") as slept:
+            alerts_mod._send_one(p, "本文", attempts=3)
+        assert [c.args[0] for c in slept.call_args_list] == [
+            alerts_mod.ALERT_RETRY_BASE_DELAY, alerts_mod.ALERT_RETRY_BASE_DELAY * 2,
+        ]
+
+    def _http_error(self, status: int) -> requests.HTTPError:
+        resp = MagicMock()
+        resp.status_code = status
+        return requests.HTTPError(f"{status}", response=resp)
+
+    def test_invalid_webhook_is_not_retried(self):
+        """404（Webhook削除・URL誤り）は何度送っても直らないので即あきらめる"""
+        p = self._provider(side_effect=self._http_error(404))
+        with patch.object(alerts_mod.time, "sleep") as slept:
+            assert alerts_mod._send_one(p, "本文") is False
+        p.send.assert_called_once()
+        slept.assert_not_called()
+
+    def test_server_error_is_retried(self):
+        """Discord側の一時障害は再送する"""
+        p = self._provider(side_effect=[self._http_error(503), None])
+        with patch.object(alerts_mod.time, "sleep"):
+            assert alerts_mod._send_one(p, "本文") is True
+        assert p.send.call_count == 2
+
+    def test_rate_limit_is_retried(self):
+        p = self._provider(side_effect=[self._http_error(429), None])
+        with patch.object(alerts_mod.time, "sleep"):
+            assert alerts_mod._send_one(p, "本文") is True
+        assert p.send.call_count == 2
 
 
 class TestEnvOverride:

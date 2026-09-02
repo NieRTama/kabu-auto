@@ -50,9 +50,19 @@ class TestIsSilent:
         liveness.mark_alive(now=0.0)
         assert liveness.is_silent(now=99999.0, market_open=False, threshold_seconds=900) is False
 
-    def test_not_silent_before_first_success(self):
-        """起動直後の未取得状態では検知しない（別途preflightが担保）"""
+    def test_not_silent_at_first_observation_before_any_success(self):
+        """未取得のまま開場を初観測した時点では検知しない（起動直後の即発報を避ける）"""
         assert liveness.is_silent(now=99999.0, market_open=True, threshold_seconds=900) is False
+
+    def test_silent_after_threshold_even_without_any_success(self):
+        """一度も成功していなくても、開場から閾値を超えたら検知する。
+
+        以前は `_last_success is None` で無条件に False を返しており、
+        **板取得が最初から最後まで失敗するプロセスでは監視が永久に無効**だった。
+        """
+        liveness.is_silent(now=0.0, market_open=True, threshold_seconds=900)  # 開場観測
+        assert liveness.is_silent(now=899.0, market_open=True, threshold_seconds=900) is False
+        assert liveness.is_silent(now=900.0, market_open=True, threshold_seconds=900) is True
 
     def test_disabled_when_threshold_zero(self):
         liveness.mark_alive(now=0.0)
@@ -69,7 +79,7 @@ class TestClientMarksOnSuccess:
             client = mod.KabuClient()
         resp = MagicMock()
         resp.json.return_value = {"CurrentPrice": 100}
-        with patch.object(mod.requests, "get", return_value=resp), \
+        with patch.object(mod.requests, "request", return_value=resp), \
              patch.object(mod.time, "monotonic", return_value=777.0):
             client.get_board("7203")
         assert liveness.seconds_since_alive(now=777.0) == 0.0
@@ -82,10 +92,83 @@ class TestClientMarksOnSuccess:
             client = mod.KabuClient()
         resp = MagicMock()
         resp.raise_for_status.side_effect = RuntimeError("401")
-        with patch.object(mod.requests, "get", return_value=resp):
+        with patch.object(mod.requests, "request", return_value=resp):
             with pytest.raises(RuntimeError):
                 client.get_board("7203")
         assert liveness.seconds_since_alive(now=100.0) is None
+
+
+class TestNeverConnectedProcess:
+    """引け後に起動し、翌日一度も取得に成功しないプロセス（2026-09-02 の事故の再現）。
+
+    9/1 19:07（引け後）に起動 → 翌9/2 8:30のトークン更新は成功 → 9:00にセッション断
+    → 以後 get_board が全て401。板取得の成功が1度も無いため `_last_success` は None のまま
+    で、`is_silent()` は終日 False を返し続けた。497回の401が出ても無言だった。
+    """
+
+    def _evening_start_then_next_morning(self):
+        """引け後の起動 → 夜間 → 翌朝の開場、までを再現する（成功は一度も無い）。"""
+        # 19:07 起動。health_check は23:00まで15分毎に走り、閉場を観測する
+        for t in range(0, 14000, 900):
+            liveness.is_silent(now=t, market_open=False, threshold_seconds=900)
+            liveness.mark_closed(now=t)
+        # 23:00〜翌8:00 は health_check が走らない（実運用と同じ）
+
+    def test_silence_is_detected_next_morning(self):
+        self._evening_start_then_next_morning()
+        open_at = 50000.0
+        # 9:00 開場を初観測。この時点ではまだ発報しない
+        assert liveness.is_silent(now=open_at, market_open=True,
+                                 threshold_seconds=900) is False
+        # 9:15 閾値超過。ここで気づけていれば当日中に手当てできた
+        assert liveness.is_silent(now=open_at + 900, market_open=True,
+                                 threshold_seconds=900) is True
+
+    def test_alert_says_never_succeeded_not_zero_minutes(self):
+        """通知文が「0分間成功していません」にならないこと。
+
+        health は `seconds_since_alive() or 0` としていたため、未成功のまま
+        発報すると「0分間取得が成功していません」という意味の通らない文面になり、
+        深刻さが伝わらなかった。未成功は未成功として書く。
+        """
+        from src.core import health
+        risk = MagicMock()
+        risk.daily_loss_limit.return_value = 0
+        risk.current_total_drawdown.return_value = 0
+        risk.unrealized_pnl.return_value = 0
+        risk.unpriced_symbols.return_value = []
+
+        self._evening_start_then_next_morning()
+        open_at = 50000.0
+        liveness.is_silent(now=open_at, market_open=True, threshold_seconds=900)
+        with patch.object(health, "cfg") as cfg_mock, \
+             patch.object(health, "get_session") as sess_mock, \
+             patch.object(health.time, "monotonic", return_value=open_at + 900), \
+             patch.object(health.halt, "is_halted", return_value=False), \
+             patch.object(health.TradingScheduler, "is_market_open", return_value=True):
+            cfg_mock.get_section.side_effect = lambda s: {
+                "trading": {},
+                "runtime": {"error_rate_threshold": 0, "error_rate_warning_threshold": 0,
+                            "liveness_silence_seconds": 900},
+            }.get(s, {})
+            ctx = MagicMock()
+            ctx.__enter__.return_value.scalar.return_value = 0
+            sess_mock.return_value = ctx
+            items = health.check_anomalies(risk)
+        msg = next(i["message"] for i in items if i["key"] == "liveness_silent")
+        assert "一度も" in msg
+        assert "0分間" not in msg
+
+    def test_recovery_clears_the_alert(self):
+        """認証が戻って取得に成功したら発報は止まる"""
+        self._evening_start_then_next_morning()
+        open_at = 50000.0
+        liveness.is_silent(now=open_at, market_open=True, threshold_seconds=900)
+        assert liveness.is_silent(now=open_at + 900, market_open=True,
+                                 threshold_seconds=900) is True
+        liveness.mark_alive(now=open_at + 1000)
+        assert liveness.is_silent(now=open_at + 1100, market_open=True,
+                                 threshold_seconds=900) is False
 
 
 class TestHealthIntegration:

@@ -11,6 +11,7 @@ import requests
 import websocket
 from loguru import logger
 
+from src.core import broker_auth
 from src.core import config as cfg
 from src.core import liveness
 
@@ -52,14 +53,30 @@ class KabuClient:
     def _headers(self) -> dict:
         return {"X-API-KEY": self._token or ""}
 
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """認証付きREST呼び出しの共通経路。401を「ログイン認証切れ」として記録する。
+
+        トークン更新（毎朝8:30）が成功しても、その後に kabuステーション側の
+        セッションが切れることがある。ここで401を拾わないと broker_auth の状態が
+        「有効」に固定され、**自動復帰・reconnect・🔴通知のすべてが無効化**される。
+
+        2026-09-02 に実際に発生: 8:30のトークン更新は成功 → 9:00にセッション断 →
+        以後497回の401を出しながら誰も認証切れと認識せず、9:05の売り注文が失敗した。
+        ログインしても復帰せず、プロセス再起動でしか直せない状態だった。
+        """
+        resp = requests.request(
+            method, f"{self._base_url}{path}", headers=self._headers, timeout=10, **kwargs
+        )
+        if resp.status_code == 401:
+            broker_auth.mark_expired(f"{method} {path} が401を返しました")
+        resp.raise_for_status()
+        return resp
+
     # ─── REST API ────────────────────────────────────────
 
     def get_board(self, symbol: str, exchange: int = 1) -> dict:
         """銘柄の板情報・現在値を取得"""
-        url = f"{self._base_url}/board/{symbol}@{exchange}"
-        resp = requests.get(url, headers=self._headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._request("GET", f"/board/{symbol}@{exchange}").json()
         # 「動いている形跡」を記録する。場中にこれが途絶えたら health_check が
         # サイレント故障として検知する（例外を出さずに止まる故障への防御）。
         liveness.mark_alive(now=time.monotonic())
@@ -67,67 +84,44 @@ class KabuClient:
 
     def get_symbol(self, symbol: str, exchange: int = 1) -> dict:
         """銘柄情報を取得"""
-        url = f"{self._base_url}/symbol/{symbol}@{exchange}"
-        resp = requests.get(url, headers=self._headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("GET", f"/symbol/{symbol}@{exchange}").json()
 
     def get_positions(self) -> list:
         """現在の保有ポジションを取得"""
-        url = f"{self._base_url}/positions"
-        resp = requests.get(url, headers=self._headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("GET", "/positions").json()
 
     def get_orders(self, query: Optional[dict] = None) -> list:
         """注文一覧を取得"""
-        url = f"{self._base_url}/orders"
-        resp = requests.get(url, headers=self._headers, params=query, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("GET", "/orders", params=query).json()
 
     def get_wallet(self) -> dict:
         """余力（現金残高）を取得"""
-        url = f"{self._base_url}/wallet/cash"
-        resp = requests.get(url, headers=self._headers, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request("GET", "/wallet/cash").json()
 
     def send_order(self, order: dict) -> dict:
         """注文を発注する"""
-        url = f"{self._base_url}/sendorder"
-        resp = requests.post(url, headers=self._headers, json=order, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()
+        result = self._request("POST", "/sendorder", json=order).json()
         logger.info(f"注文送信: {order.get('Symbol')} 結果={result}")
         return result
 
     def cancel_order(self, order_id: str) -> dict:
         """注文をキャンセルする"""
-        url = f"{self._base_url}/cancelorder"
         payload = {"OrderID": order_id, "Password": self._password}
-        resp = requests.put(url, headers=self._headers, json=payload, timeout=10)
-        resp.raise_for_status()
+        resp = self._request("PUT", "/cancelorder", json=payload)
         logger.info(f"注文キャンセル: OrderID={order_id}")
         return resp.json()
 
     def register_push(self, symbols: list) -> None:
         """WebSocketプッシュ配信に銘柄を登録する"""
-        url = f"{self._base_url}/register"
         payload = {"Symbols": [{"Symbol": s, "Exchange": 1} for s in symbols]}
-        resp = requests.put(url, headers=self._headers, json=payload, timeout=10)
-        resp.raise_for_status()
+        self._request("PUT", "/register", json=payload)
 
     def unregister_push(self, symbols: list) -> None:
-        url = f"{self._base_url}/unregister"
         payload = {"Symbols": [{"Symbol": s, "Exchange": 1} for s in symbols]}
-        resp = requests.put(url, headers=self._headers, json=payload, timeout=10)
-        resp.raise_for_status()
+        self._request("PUT", "/unregister", json=payload)
 
     def unregister_all(self) -> None:
-        url = f"{self._base_url}/unregister/all"
-        resp = requests.put(url, headers=self._headers, timeout=10)
-        resp.raise_for_status()
+        self._request("PUT", "/unregister/all")
 
     # ─── WebSocket ───────────────────────────────────────
 

@@ -53,11 +53,15 @@ def setup() -> None:
         encoding="utf-8",
     )
 
-    # ERROR以上を時間窓で数えるシンク（health_check がこの件数を見て異常を通知する）。
+    # WARNING以上を時間窓で数えるシンク（health_check がこの件数を見て異常を通知する）。
     # 個々のバグは予測できないが「壊れたらエラーが増える」のは普遍的に成り立つため、
     # 未知の障害に対する防御になる（2026-08 の認証切れ・KeyError はどちらも
     # 既存の異常検知をすり抜けたが、エラー数では捉えられていた）。
+    #
+    # ERROR だけでなく WARNING も数えるのは、リトライ前提の失敗が WARNING で
+    # 記録されるため（2026-09-02: 401が499件出たが ERROR は28件しかなく、
+    # 15分あたり3.5件で閾値10に届かず検知できなかった）。閾値はレベル別に持つ。
     from src.core import error_rate
-    logger.add(error_rate.make_sink(), level="ERROR")
+    logger.add(error_rate.make_sink(), level=_WARN_LEVEL)
 
     logger.info("Logger initialized")

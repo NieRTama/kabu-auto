@@ -10,13 +10,22 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.log
-data/backups/*.db
+data/*.lock
+# バックアップは丸ごと除外する。`data/backups/*.db` は1階層しか効かず、
+# 実際に data/backups/pre_paper_reset_.../kabu_auto.db（実取引履歴を含む）が
+# 追跡対象のまま残っていた。公開リポジトリなので階層を問わず落とす。
+data/backups/
 models/*.pkl
 log/
 
 # 環境変数
+# .env の派生（.env.bak / .env.live / .env.20260902 等）を全て除外する。
+# 名前を列挙する方式だと、手で取ったバックアップが素通りして公開リポジトリに
+# 混入する（実際 .env.bak がAPIパスワード平文のまま未追跡で残っていた）。
+# 追跡したいのは雛形の .env.example だけなので、それだけ除外を打ち消す。
 .env
-.env.local
+.env.*
+!.env.example
 
 # 認証情報（ログインのユーザーID・パスワードハッシュ）
 data/auth.json

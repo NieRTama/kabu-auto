@@ -58,10 +58,14 @@ class TestPostText:
         section = {"enabled": True, "webhook_url": "https://discord.example/x"}
         mock_provider = MagicMock()
         mock_provider.send.side_effect = RuntimeError("boom")
+        import src.core.alerts as alerts_mod
         with patch.object(discord_report.cfg, "get_section", return_value=section), \
-             patch.object(discord_report, "DiscordWebhookProvider", return_value=mock_provider):
+             patch.object(discord_report, "DiscordWebhookProvider", return_value=mock_provider), \
+             patch.object(alerts_mod.time, "sleep"):
             result = discord_report.post_text("hello")
         assert result is False
+        # アラートと同じ再送経路を通ること（一時障害でレポートを黙って落とさない）
+        assert mock_provider.send.call_count == alerts_mod.ALERT_SEND_ATTEMPTS
 
 
 class TestPostDailyReport:

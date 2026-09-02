@@ -18,8 +18,13 @@ from typing import Optional
 
 _lock = threading.Lock()
 _last_success: Optional[float] = None
+# 「閉場→開場」の遷移を観測した時刻。開場時刻が確かなときだけ入るため、
+# 経過時間から閉場分を差し引くグレースの基準に使える。
 _opened_at: Optional[float] = None
 _closed_seen: bool = False
+# このプロセスで最初に開場を観測した時刻。1度も取得に成功していないときの
+# 判定基準にだけ使う（開場時刻とは限らないためグレースには使わない）。
+_first_open_at: Optional[float] = None
 
 # 場中にこの秒数以上、板取得の成功が無ければ異常とみなす（既定15分）。
 # stop_loss_check は5分毎に走るため、3回連続で成果が無い状態に相当する。
@@ -62,21 +67,29 @@ def mark_closed(*, now: float) -> None:
 
 
 def note_market_open(*, now: float) -> None:
-    """「閉場→開場」の遷移を観測したとき、その時刻を記録する。
+    """開場を観測した時刻を記録する（未記録なら現在時刻で張る）。
 
-    閉場をまたいだ経過時間を「途絶」と数えないための、mark_closed() に依存しない
-    二重の守り。mark_closed() は health_check(平日8:00-23:00)からしか呼ばれず、
-    夜間9時間分は積み上がってしまうため（2026-09-01 に「1050分間取得なし」と
-    誤検知した実例）、開場を跨いだ分を除いて判定できるようにする。
+    2つの役割を持つ:
 
-    注意: 記録するのは note_market_closed() を経た「再開」のときだけ。
-    起動直後の初回呼び出しでは開場時刻が不明なため記録せず、グレースも効かせない
-    （再起動直後に本当に途絶していても15分見逃す、という穴を作らないため）。
+    1. 閉場をまたいだ経過時間を「途絶」と数えないための基準
+       （mark_closed() は health_check(平日8:00-23:00)からしか呼ばれず夜間9時間分が
+       積み上がるため。2026-09-01 に「1050分間取得なし」と誤検知した実例）
+    2. **一度も取得に成功していないときの判定基準**（is_silent 参照）
+
+    1 の基準（_opened_at）は note_market_closed() を経た「再開」のときだけ記録する。
+    起動直後の初回観測では開場時刻が不明で、そこを起点にすると**既に途絶している
+    状態にグレースを与えて隠してしまう**ため。
+
+    2 の基準（_first_open_at）は初回観測でも記録する。こちらはグレースではなく
+    「未成功のまま何秒経ったか」を数えるためのもので、記録しないと基準が無く
+    永久に判定できない（2026-09-02 の事故）。
     """
-    global _opened_at
+    global _opened_at, _first_open_at
     with _lock:
         if _closed_seen and _opened_at is None:
             _opened_at = now
+        if _first_open_at is None:
+            _first_open_at = now
 
 
 def note_market_closed() -> None:
@@ -92,11 +105,15 @@ def is_silent(*, now: float, market_open: bool,
     """場中に動作が途絶えているか。
 
     場が閉じているときは常に False（場外に動きが無いのは正常）。
-    1度も成功していない場合も False とする（起動直後の誤検知を避けるため。
-    起動時の接続失敗は preflight と broker_auth が別途カバーしている）。
 
     開場直後は、閉場をまたいだ経過時間で誤検知しないよう、
     開場から threshold_seconds が経つまでは判定しない（グレース期間）。
+
+    **1度も成功していない場合も開場からの経過で判定する。**
+    以前は無条件に False を返していたため、板取得が最初から最後まで失敗し続ける
+    プロセスでは監視が永久に無効化されていた（2026-09-02 の事故: 前日の引け後
+    19:07に起動 → 翌朝の認証断で一度も成功しないまま、497回の401を出しても
+    サイレント故障として検知されなかった）。
     """
     if not market_open:
         note_market_closed()
@@ -105,10 +122,14 @@ def is_silent(*, now: float, market_open: bool,
         return False
     note_market_open(now=now)
     elapsed = seconds_since_alive(now=now)
-    if elapsed is None:
-        return False
     with _lock:
         opened_at = _opened_at
+        first_open_at = _first_open_at
+    if elapsed is None:
+        # 1度も成功していない。開場からの経過だけで判定する
+        # （起動直後に即発報しないよう、基準は開場観測時刻に張ってある）。
+        baseline = opened_at if opened_at is not None else first_open_at
+        return (now - baseline) >= threshold_seconds if baseline is not None else False
     if opened_at is not None:
         # 閉場をまたいだ分は数えない。開場後に経過した時間だけで判定する
         # （mark_closed が呼ばれない夜間帯を挟んでも誤検知しないようにする）。
@@ -118,8 +139,9 @@ def is_silent(*, now: float, market_open: bool,
 
 def reset() -> None:
     """テスト用に状態を初期化する。"""
-    global _last_success, _opened_at, _closed_seen
+    global _last_success, _opened_at, _closed_seen, _first_open_at
     with _lock:
         _last_success = None
         _opened_at = None
         _closed_seen = False
+        _first_open_at = None

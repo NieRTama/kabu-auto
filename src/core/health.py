@@ -112,14 +112,28 @@ def check_anomalies(risk) -> list[dict]:
     conf = cfg.get_section("runtime")
     window = float(conf.get("error_rate_window_seconds", error_rate.DEFAULT_WINDOW_SECONDS))
     threshold = int(conf.get("error_rate_threshold", error_rate.DEFAULT_THRESHOLD))
-    if threshold > 0:
+    warn_threshold = int(conf.get("error_rate_warning_threshold",
+                                  error_rate.DEFAULT_WARNING_THRESHOLD))
+    if threshold > 0 or warn_threshold > 0:
         snap = error_rate.snapshot(now=time.monotonic(), window_seconds=window)
-        if snap["count"] >= threshold:
+        if threshold > 0 and snap["count"] >= threshold:
             items.append({
                 "key": "error_rate_high", "level": CRITICAL,
                 "message": (
                     f"直近{window / 60:.0f}分でエラーが{snap['count']}件発生しています"
                     f"（閾値{threshold}件）。直近のエラー: {snap['latest'][:200]}"
+                ),
+            })
+        # リトライ前提の失敗（「次回再試行」等）は WARNING で記録されるため件数が
+        # 桁違いに多く、ERROR の閾値では捉えられない。2026-09-02 の認証断では
+        # 15秒毎の建玉照合が WARNING を出し続けたが ERROR は閾値未満だった。
+        elif warn_threshold > 0 and snap["warning_count"] >= warn_threshold:
+            items.append({
+                "key": "warning_rate_high", "level": CRITICAL,
+                "message": (
+                    f"直近{window / 60:.0f}分で警告が{snap['warning_count']}件発生しています"
+                    f"（閾値{warn_threshold}件）。リトライが延々と失敗し続けている可能性が"
+                    f"あります。直近の警告: {snap['latest_warning'][:200]}"
                 ),
             })
 
@@ -142,12 +156,20 @@ def check_anomalies(risk) -> list[dict]:
     else:
         if liveness.is_silent(now=now_mono, market_open=True,
                               threshold_seconds=silence_limit):
-            elapsed = liveness.seconds_since_alive(now=now_mono) or 0
+            elapsed = liveness.seconds_since_alive(now=now_mono)
+            # 一度も成功していない場合と、途中で途絶えた場合を区別する。
+            # 一律に「{elapsed}分間」と書くと前者が「0分間成功していません」という
+            # 意味の通らない通知になり、深刻さが伝わらない。
+            if elapsed is None:
+                detail = ("起動以来一度も市場データを取得できていません"
+                          "（認証切れのままか、接続先が誤っている可能性があります）")
+            else:
+                detail = (f"市場データの取得が{elapsed / 60:.0f}分間成功していません"
+                          f"（閾値{silence_limit / 60:.0f}分）")
             items.append({
                 "key": "liveness_silent", "level": CRITICAL,
                 "message": (
-                    f"場中にもかかわらず市場データの取得が{elapsed / 60:.0f}分間"
-                    f"成功していません（閾値{silence_limit / 60:.0f}分）。"
+                    f"場中にもかかわらず{detail}。"
                     "ジョブ停止・接続断などで監視が止まっている可能性があります"
                 ),
             })
