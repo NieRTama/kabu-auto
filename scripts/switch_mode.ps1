@@ -115,6 +115,12 @@ function Invoke-Switch([string]$m) {
     return $t
 }
 
+# 呼び出し元(switch-mode.bat)へ返す終了コード。
+#   0 = アプリを起動し正常終了した → 窓を閉じてよい
+#   1 = アプリが異常終了した        → 原因を読めるよう窓を残す
+#   2 = アプリを起動していない      → 切替結果を読めるよう窓を残す
+$script:AppExitCode = 2
+
 function Start-App([string]$m) {
     Push-Location $RepoRoot
     try {
@@ -126,6 +132,9 @@ function Start-App([string]$m) {
         Write-Host 'python main.py を起動します...'
         Write-Host ''
         python main.py
+        # Ctrl+C での正常終了は 0。起動拒否（CONFIRM_LIVE_TRADING 未設定・多重起動など）は
+        # 非0 になるため、呼び出し元が「閉じてよいか」を判断できる。
+        $script:AppExitCode = $LASTEXITCODE
     } finally {
         Pop-Location
     }
@@ -141,7 +150,7 @@ if ($Mode) {
             Start-App $Mode
         }
     }
-    return
+    exit $script:AppExitCode
 }
 
 # ─── 対話メニュー ───────────────────────────────────────────────────
@@ -184,6 +193,6 @@ while ($true) {
     $l = Read-Host '今すぐ python main.py を起動しますか？ (y/N)'
     if ($null -ne $l -and $l.Trim().ToLower() -eq 'y') {
         Start-App $m
-        return
+        exit $script:AppExitCode
     }
 }

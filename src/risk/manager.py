@@ -20,6 +20,10 @@ from src.data.database import Position, Trade, get_session
 from src.data.market_data import latest_closes
 from src.execution import order_status as st
 
+# 東証の売買単位。単元未満は発注できないため、1銘柄あたりの投資上限が
+# 「株価 × 100」に満たない銘柄は買えない（買える株数が0になる）。
+LOT_SIZE = 100
+
 
 @dataclass
 class RiskSnapshot:
@@ -269,21 +273,51 @@ class RiskManager:
     def increment_order_count(self) -> None:
         self._daily_order_count += 1
 
-    def calc_position_size(self, symbol: str, price: float,
-                           cash_balance: float,
-                           snapshot: Optional[RiskSnapshot] = None) -> int:
-        """購入株数を計算する（最大投資額を超えない範囲）"""
+    def _explain_zero_size(self, symbol: str, price: float, cash_balance: float,
+                           snapshot: Optional[RiskSnapshot] = None) -> str:
+        """買える株数が0になった理由を数字つきで説明する。
+
+        従来は一律「余力不足」と記録していたが、実際の原因はほぼ
+        「**単元の必要額が1銘柄あたりの上限を超えている**」であり、口座の現金が
+        足りないわけではない。2026-09-03 に余力484,005円がありながら候補8銘柄が
+        すべてこの理由で見送られ、ログを見ても資金不足としか読めなかった。
+        原因が枠なのか現金なのかで打つ手（比率の見直し／入金）が変わるため書き分ける。
+        """
+        if price <= 0:
+            return f"価格を取得できません: {symbol}"
+        budget = self.position_budget(cash_balance, snapshot)
+        lot_cost = price * LOT_SIZE
+        ratio = self._conf.get("max_position_ratio", 0.20)
+        if budget >= lot_cost:      # 論理上ここには来ないが、取り違えを防ぐ保険
+            return f"必要株数を算出できません: {symbol}"
+        return (
+            f"単元({LOT_SIZE}株)の必要額 {lot_cost:,.0f}円 が1銘柄上限 {budget:,.0f}円 を超過"
+            f"（株価{price:,.0f}円・上限比率{ratio:.0%}・実効余力{cash_balance:,.0f}円）"
+        )
+
+    def position_budget(self, cash_balance: float,
+                        snapshot: Optional[RiskSnapshot] = None) -> float:
+        """1銘柄に投じられる上限額（実効余力 × max_position_ratio）。
+
+        「残余力に対する比率」であることに注意。呼び出し側は購入のたびに
+        cash_balance を減らすため、2件目以降の枠は自動的に小さくなる。
+        """
         max_ratio = self._conf.get("max_position_ratio", 0.20)
         # 未約定BUYの引当を差し引いた実効余力で上限を計算する
         # （未約定中の多重発注で余力を二重に使う事故を防ぐ。main側の逐次減算と二重で守る）
         reserved, _ = self._reserved_buy_by_sector(snapshot)
         available = max(0.0, cash_balance - reserved)
-        max_amount = available * max_ratio
+        return available * max_ratio
+
+    def calc_position_size(self, symbol: str, price: float,
+                           cash_balance: float,
+                           snapshot: Optional[RiskSnapshot] = None) -> int:
+        """購入株数を計算する（最大投資額を超えない範囲）"""
         if price <= 0:
             return 0
-        lot = 100  # 東証は通常100株単位
-        units = int(max_amount / (price * lot))
-        quantity = units * lot
+        max_amount = self.position_budget(cash_balance, snapshot)
+        units = int(max_amount / (price * LOT_SIZE))
+        quantity = units * LOT_SIZE
         logger.debug(f"{symbol}: 購入可能数={quantity}株 (価格={price:.0f}, 上限={max_amount:.0f}円)")
         return quantity
 
@@ -428,7 +462,7 @@ class RiskManager:
             return False, reason
         quantity = self.calc_position_size(symbol, price, cash_balance, snapshot=snap)
         if quantity <= 0:
-            return False, f"余力不足: {symbol}"
+            return False, self._explain_zero_size(symbol, price, cash_balance, snap)
         if sector:
             # この注文自体の金額もセクター集中度に加味する（発注前に超過を弾く。再レビュー P1-2）
             ok, reason = self.check_sector_concentration(
