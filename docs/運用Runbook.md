@@ -163,6 +163,45 @@ curl -X POST http://localhost:8080/api/stop_loss \
 
 ---
 
+## 8. 端末故障・DB破損からの復旧
+
+### 8.1 DBが壊れた（同じPCが生きている場合）
+
+```powershell
+# 1) まず止める（§0）
+# 2) 壊れたDBを退避してから、日次バックアップの最新を戻す
+Move-Item data\kabu_auto.db data\kabu_auto.db.broken
+Copy-Item data\backups\kabu_auto_YYYY-MM-DD.db data\kabu_auto.db
+```
+
+- `data/kabu_auto.db-wal` / `-shm` も一緒に退避すること（古いWALが残ると整合が壊れる）。
+- 戻したのは**最後のバックアップ時点**なので、それ以降の約定・シグナルは入っていない。
+  必ず §4（建玉ドリフト）を実施してから再開する。
+
+### 8.2 PCごと壊れた（別PCで復元する）
+
+コードはGitHub、状態は `scripts/backup_state.ps1` が作ったZIP（既定 `OneDrive\kabu-auto\`）にある。
+
+1. ZIP内の **`RESTORE.md`** を開く。バックアップ時点のコミットハッシュ入りの手順が書いてある。
+2. GitHubからclone → そのコミットへ合わせる → `pip install -r requirements.txt`
+3. ZIPの中身をリポジトリ直下へ上書き展開（`MANIFEST.txt` のSHA256で照合できる）
+4. `.env` を含めずに取っていた場合は `.env.example` から再設定する
+5. **必ず paper で起動して健全性を確認**してから live へ戻す
+6. **§4（建玉ドリフト）を実施する。** 復元直後はDBと実口座が食い違いやすく、
+   そのまま live にすると kill switch で発注停止になる。
+
+### 8.3 バックアップの取り方（平常時）
+
+```powershell
+powershell -File scripts\backup_state.ps1              # 既定: OneDrive へ7世代
+powershell -File scripts\backup_state.ps1 -NoSecrets   # .env / auth.json を含めない
+```
+
+本体を止めずに実行してよい（DBはオンラインバックアップAPIで読む）。
+詳細は [README.md](../README.md) の「バックアップと復元」を参照。
+
+---
+
 ## 通知の見分け方（記号で緊急度が分かる）
 
 | 記号 | 意味 | 対応 |

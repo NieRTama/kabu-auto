@@ -21,7 +21,8 @@
 | リスク管理 | 損切り・ブレークイーブン・トレーリングストップ・最大保有銘柄数・セクター集中制限・1日注文数上限・当日損失上限（プロセス再起動後もDBから復元） |
 | 緊急決済 | ダッシュボードのボタン1つで全ポジション成行決済 |
 | アラート通知 | 大損失・API切断などを Discord Webhook で通知（任意・既定オフ。将来複数プロバイダ対応） |
-| 自動バックアップ | SQLite DBを日次で `data/backups/` へ自動コピー |
+| 自動バックアップ | SQLite DBを日次で `data/backups/` へ退避（オンラインバックアップAPIで稼働中も整合） |
+| 状態バックアップ | `scripts/backup_state.ps1` でDB・モデル・設定・運用状態をZIP化し、OneDrive等**PCの外**へ退避（端末故障への備え） |
 
 ---
 
@@ -48,6 +49,7 @@ kabu-auto/
 ├── data/              # SQLite DB・バックアップ
 ├── log/               # ログ（日付別・INFO以下/WARNING以上で別ファイル・既定15日保持。自動生成）
 ├── docs/              # 概要設計書・詳細設計書
+├── scripts/           # 運用スクリプト（モード切替・状態バックアップ）
 ├── config.yaml        # 設定ファイル
 ├── LICENSE            # 使用許諾契約
 ├── SETUP-CHECKLIST.md # 購入者向けセットアップ・チェックリスト
@@ -610,6 +612,72 @@ strategy:
 
 ---
 
+## バックアップと復元
+
+バックアップは2層ある。目的が違うので、両方使う。
+
+| 種類 | 対象 | 退避先 | 実行 |
+|------|------|--------|------|
+| 日次DBバックアップ | `data/kabu_auto.db` のみ | `data/backups/`（**同一ディスク**・30日分） | 毎日17:00に自動 |
+| 状態バックアップ | DB＋モデル＋設定＋運用状態＋機密 | OneDrive等（**PCの外**） | `scripts\backup_state.ps1` を手動実行 |
+
+> 日次DBバックアップは同じディスク上にあるため、**ディスク故障・PC故障には無力**。
+> 端末が壊れたときに備えるなら状態バックアップを併用すること。
+> 「コードはGitHub、状態はZIP」の2点があれば別のPCで復元できる。
+
+### 状態バックアップの使い方
+
+```powershell
+# 既定（OneDrive\kabu-auto へ、機密を含めて、7世代保持）
+powershell -File scripts\backup_state.ps1
+
+# 機密（.env / data/auth.json）を除いたZIPを作る
+powershell -File scripts\backup_state.ps1 -NoSecrets
+
+# 退避先と保持世代数を変える
+powershell -File scripts\backup_state.ps1 -Dest "G:\マイドライブ\kabu-auto" -Keep 14
+```
+
+| オプション | 既定値 | 説明 |
+|-----------|--------|------|
+| `-Dest` | `%USERPROFILE%\OneDrive\kabu-auto` | ZIPの退避先 |
+| `-Keep` | `7` | 退避先に残す世代数（古いものから削除） |
+| `-NoSecrets` | （指定なし） | `.env` と `data/auth.json` を含めない |
+
+**稼働中のまま実行してよい。** 本体（`python main.py`）を止める必要はない。DBはSQLiteの
+オンラインバックアップAPIで読むため、書き込み中でも整合したスナップショットが取れる。
+実行後は作成したZIPを開き直し、DBが同梱されているか・サイズが一致するかを検証してから
+退避先へ置く（検証に失敗したら退避しない）。
+
+収録されるもの / されないもの:
+
+- **収録する**: `data/kabu_auto.db`（スナップショット）・`models/`・`config.yaml`・
+  `watchlists.json`・`watchlist.json`（旧形式）・`risk_profile.json`・`reference_capital.json`・
+  `data/trading_halt.json`・`requirements.txt`・`.env.example`・直近14日分のログ・
+  `MANIFEST.txt`（git commit と全ファイルのSHA256）・`RESTORE.md`（復元手順）
+- **既定では収録する**（`-NoSecrets` で除外）: `.env`・`data/auth.json`
+- **収録しない**: コード（GitHubにあるため）・`data/backups/`（同一ディスク上の冗長コピー）・
+  巨大ログ・`.venv`/`__pycache__`（再作成できる）
+
+> ⚠ 既定のZIPには `KABU_API_PASSWORD` などが**平文で**入る。共有リンクを作らないこと。
+> クラウドに機密を置きたくない場合は `-NoSecrets` を使い、`.env` は手元で別管理する。
+
+### 復元
+
+ZIP内の `RESTORE.md` に、そのバックアップを取った時点の**コミットハッシュ入りの手順**が入っている。概略:
+
+1. GitHubからコードを取得し、`RESTORE.md` に書かれたコミットに合わせる
+2. `pip install -r requirements.txt`
+3. ZIPの中身をリポジトリ直下に上書き展開（`MANIFEST.txt` のSHA256で照合できる）
+4. `-NoSecrets` で取った場合は `.env.example` を写して再設定
+5. **必ず paper モードで起動して健全性を確認**してから live に戻す
+
+> ⚠ **復元直後は建玉ドリフトが起きやすい。** DBの建玉と実口座の建玉（数量・平均取得単価）が
+> 食い違うと kill switch が入り発注停止になる。live に切り替える前に必ず実口座と突き合わせること
+> （[docs/運用Runbook.md](docs/運用Runbook.md) §4・§8）。
+
+---
+
 ## APIエンドポイント一覧
 
 > 認証が有効な場合（`api_token` 設定時、または `host` が localhost 以外）、ブラウザは
@@ -700,7 +768,7 @@ GitHub Actions により、プッシュ・プルリクエスト時に自動で�
 - kabuステーションAPIには**1日の注文数制限**があります（`daily_order_limit` で管理）。
 - スイングトレードでは翌朝の**窓開けリスク**（ストップ高/安）により、損切りラインを大幅に超えて約定する場合があります。
 - 本番移行前に必ずペーパーモードで**数週間以上**の動作確認を行ってください。
-- データベースバックアップは `data/backups/` に日次保存されます。定期的に外部メディアへコピーしてください。
+- データベースバックアップは `data/backups/` に日次保存されますが、**同一ディスク上のため端末故障には無力**です。`scripts\backup_state.ps1` でPCの外へ退避してください（「[バックアップと復元](#バックアップと復元)」参照）。
 - ログは `log/` フォルダに格納され、1日単位で区切られ、ファイル名末尾に日付が付きます。**INFO以下**（`log/kabu_auto_2026-06-18.log`）と**WARNING以上**（`log/kabu_auto_warning_2026-06-18.log`）が別ファイルに分かれます（異常系だけを素早く確認できる）。既定では15日周期で古いログが自動削除されます（`logging.retention` で変更可）。
 - 毎週土曜深夜の kabuステーション**システムメンテナンス時間帯**は自動的に稼働を停止します。
 - `config.yaml` と `.env` は起動時に一度だけ読み込まれます。編集後は **`main.py` の再起動**が必要です。
