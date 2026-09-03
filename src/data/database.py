@@ -1,5 +1,5 @@
 """SQLiteデータベース管理（WALモード有効）"""
-import shutil
+import sqlite3
 from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
@@ -426,13 +426,30 @@ def get_session() -> Iterator[Session]:
 
 
 def backup() -> None:
-    """日次バックアップ"""
+    """日次バックアップ
+
+    SQLite のオンラインバックアップAPIを使う。shutil.copy2 では .db 本体しか
+    コピーされず、-wal に残る「コミット済みだが未チェックポイント」のデータが
+    丸ごと欠ける（本番DBでの実測: signals 43件 / ohlcv 5件が欠落していた）。
+    本体プロセスはDB接続を開いたまま動き続けるので、この状態が平常運転であり、
+    「バックアップ完了」とログに出しながら中身が欠けることになる。
+    """
     conf = cfg.get_section("data")
     db_path = Path(conf.get("db_path", "data/kabu_auto.db"))
     backup_dir = Path(conf.get("backup_dir", "data/backups"))
     backup_dir.mkdir(parents=True, exist_ok=True)
     dst = backup_dir / f"kabu_auto_{date.today().isoformat()}.db"
-    shutil.copy2(db_path, dst)
+    # 読み取り専用(mode=ro)では開かない。異常終了で -wal だけが残り -shm が無い
+    # 状態のとき、-shm を作れず開けなくなる（最もバックアップが要る場面で失敗する）。
+    src_con = sqlite3.connect(str(db_path))
+    try:
+        dst_con = sqlite3.connect(str(dst))
+        try:
+            src_con.backup(dst_con)
+        finally:
+            dst_con.close()
+    finally:
+        src_con.close()
     logger.info(f"DB バックアップ完了: {dst}")
     _cleanup_old_backups(backup_dir, keep_days=30)
 

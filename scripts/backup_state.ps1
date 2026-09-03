@@ -58,7 +58,9 @@ $dbDst = Join-Path $dbDir 'kabu_auto.db'
 $pySnapshot = @'
 import sqlite3, sys, os
 src, dst = sys.argv[1], sys.argv[2]
-con = sqlite3.connect("file:" + src.replace("\\", "/") + "?mode=ro", uri=True)
+# mode=ro では開かない。異常終了で -wal だけが残り -shm が無い状態のとき
+# -shm を作れず開けなくなる（最もバックアップが要る場面で失敗する）。
+con = sqlite3.connect(src)
 out = sqlite3.connect(dst)
 con.backup(out)          # online backup API: WAL の未チェックポイント分も反映された整合スナップショット
 out.close(); con.close()
