@@ -154,6 +154,34 @@ class TestHealthIntegration:
         assert "error_rate_high" in keys
         assert "warning_rate_high" not in keys
 
+    def test_no_warning_alert_while_auth_expired(self):
+        """認証切れ中は鳴らさない（2026-09-04 に同じ障害で2通鳴った回帰防止）。
+
+        8:30に「再ログインが必要です」を出した48分後の9:15に「警告が74件」を出した。
+        建玉照合は15秒毎に失敗するため、認証断が15分続けば閾値50件は**構造的に必ず**
+        超える。原因が判明して既に🔴を出している障害で二重に鳴らすのは邪魔なだけ。
+        """
+        from src.core import broker_auth
+        broker_auth.reset()
+        broker_auth.mark_expired("401")
+        try:
+            items = self._run(threshold=10, count=0, warn_threshold=50, warn_count=200)
+            assert "warning_rate_high" not in {i["key"] for i in items}
+        finally:
+            broker_auth.reset()
+
+    def test_warning_alert_resumes_after_auth_recovers(self):
+        """認証が戻れば通常どおり検知する（抑止を残したまま盲目にしない）"""
+        from src.core import broker_auth
+        broker_auth.reset()
+        broker_auth.mark_expired("401")
+        broker_auth.mark_valid()
+        try:
+            items = self._run(threshold=10, count=0, warn_threshold=50, warn_count=60)
+            assert "warning_rate_high" in {i["key"] for i in items}
+        finally:
+            broker_auth.reset()
+
     def test_silent_when_under_threshold(self):
         items = self._run(threshold=10, count=3)
         assert "error_rate_high" not in {i["key"] for i in items}

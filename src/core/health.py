@@ -16,6 +16,7 @@ import time
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import broker_auth
 from src.core import config as cfg
 from src.core import error_rate
 from src.core import halt
@@ -127,7 +128,14 @@ def check_anomalies(risk) -> list[dict]:
         # リトライ前提の失敗（「次回再試行」等）は WARNING で記録されるため件数が
         # 桁違いに多く、ERROR の閾値では捉えられない。2026-09-02 の認証断では
         # 15秒毎の建玉照合が WARNING を出し続けたが ERROR は閾値未満だった。
-        elif warn_threshold > 0 and snap["warning_count"] >= warn_threshold:
+        #
+        # ただし**認証切れ中は鳴らさない**。この監視の目的は「未知の障害を捉える」ことで、
+        # 原因が判明して既に🔴を出している障害の症状で二重に鳴らすのは邪魔なだけ。
+        # 2026-09-04、8:30に「再ログインが必要です」を出した48分後の9:15に
+        # 「警告が74件」を出し、同じ認証断で2通鳴った（建玉照合が15秒毎に失敗するため、
+        # 認証断が15分続けば閾値50件は構造的に必ず超える）。
+        elif (warn_threshold > 0 and snap["warning_count"] >= warn_threshold
+              and not broker_auth.is_expired()):
             items.append({
                 "key": "warning_rate_high", "level": CRITICAL,
                 "message": (

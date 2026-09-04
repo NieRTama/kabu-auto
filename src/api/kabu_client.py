@@ -33,9 +33,8 @@ class KabuClient:
         self._on_order_event: Optional[Callable] = None
         self._ws_reconnect = True
         self._ws_reconnect_delay = 2
-        # 再接続ループのログ間引き用（_ws_log 参照）
-        self._ws_attempts = 0
-        self._ws_last_log_at = 0.0
+        # 再接続ループのログ間引き用。kind → (連続回数, 最後に出力した時刻)（_ws_log 参照）
+        self._ws_log_state: dict = {}
 
     # ─── 認証 ───────────────────────────────────────────
 
@@ -163,26 +162,35 @@ class KabuClient:
                 time.sleep(self._ws_reconnect_delay)
                 self._ws_reconnect_delay = min(self._ws_reconnect_delay * 2, 60)
 
-    def _ws_log(self, message: str) -> None:
-        """再接続ループのINFOログを間引いて出力する。
+    def _ws_log(self, message: str, *, level: str = "info",
+                kind: str = "connect") -> None:
+        """再接続ループのログを間引いて出力する。
 
         kabuステーション未起動・場外時間帯は接続と切断を延々繰り返すため、毎回記録すると
         ログが埋まり本物の異常が埋もれる。連続失敗中は最初の数回だけ出し、以後は
         5分に1回へ落とす（接続が確立すると _on_ws_open がカウンタを戻す）。
+
+        `kind` ごとに独立して数える。接続試行・エラー・切断は1回の失敗で
+        すべて発生するため、状態を共有すると「最初の数回」が種類の数だけ目減りする。
+
+        **WARNING も間引く。** 2026-09-04、kabuステーションが47分間停止した際に
+        `_on_ws_error` が間引き無しで WARNING を **522件** 出し、当日の警告614件の
+        大半を占めた。昨日入れた警告率監視（15分50件）を単独で振り切る量で、
+        「未知の障害を捉える」はずの監視が既知の接続断で埋まってしまう。
         """
-        self._ws_attempts += 1
+        count, last_at = self._ws_log_state.get(kind, (0, 0.0))
+        count += 1
         now = time.monotonic()
-        if self._ws_attempts <= self._WS_LOG_FIRST_N or \
-                now - self._ws_last_log_at >= self._WS_LOG_INTERVAL_SEC:
-            self._ws_last_log_at = now
-            logger.info(message)
+        if count <= self._WS_LOG_FIRST_N or now - last_at >= self._WS_LOG_INTERVAL_SEC:
+            last_at = now
+            getattr(logger, level)(message)
+        self._ws_log_state[kind] = (count, last_at)
 
     def _on_ws_open(self, ws) -> None:
         logger.info("WebSocket接続確立")
         self._ws_reconnect_delay = 2
         # 接続できたらログ間引きのカウンタを戻す（次に切れたときは再び数回は記録する）
-        self._ws_attempts = 0
-        self._ws_last_log_at = 0.0
+        self._ws_log_state.clear()
 
     def _on_ws_message(self, ws, message: str) -> None:
         try:
@@ -195,7 +203,7 @@ class KabuClient:
             logger.error(f"WebSocketメッセージ処理エラー: {e}")
 
     def _on_ws_error(self, ws, error) -> None:
-        logger.warning(f"WebSocketエラー: {error}")
+        self._ws_log(f"WebSocketエラー: {error}", level="warning", kind="error")
 
     def _on_ws_close(self, ws, close_status_code, close_msg) -> None:
-        logger.info(f"WebSocket切断: {close_status_code} {close_msg}")
+        self._ws_log(f"WebSocket切断: {close_status_code} {close_msg}", kind="close")
