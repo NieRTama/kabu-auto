@@ -359,7 +359,8 @@ class RiskManager:
 
     def check_sector_concentration(self, sector: str,
                                    candidate_notional: float = 0.0,
-                                   snapshot: Optional[RiskSnapshot] = None) -> tuple[bool, str]:
+                                   snapshot: Optional[RiskSnapshot] = None,
+                                   cash_balance: float = 0.0) -> tuple[bool, str]:
         """同一セクターの集中投資チェック（建玉の時価評価額ベース）。
 
         銘柄数の比率ではなく、quantity × 最新終値 のエクスポージャー金額で判定する
@@ -368,6 +369,20 @@ class RiskManager:
         `candidate_notional` には**これから出す注文自体の金額**を渡す（再レビュー P1-2）。
         既存保有・未約定BUYの引当だけでは「この注文を加えたら超過する」ケースを
         発注前に弾けないため、判定対象の候補金額も合算してから比較する。
+
+        分母は**総資金（買付余力＋建玉評価額）**。この上限の意図は「資金のN%以上を
+        1セクターに集中させない」ことであり、投資済み額を分母にすると意図と食い違う。
+
+        2026-09-04 に判明した実害: 保有が9432の17,260円だけの状態で147,500円の銘柄を
+        買おうとすると `147,500 ÷ (17,260 + 147,500) = 89.5%` となり上限55%を超えて
+        却下された。**買った瞬間にそのセクターが大半を占めるのは当然**で、保有が
+        少ないほど必ず超過する。保有ゼロなら比率は常に100%となり、
+        **システムは最初の1銘柄を永久に買えなかった**（上限比率を上げても解決しない）。
+
+        買付余力は建玉に変わるだけで総資金は増減しないため、分母には
+        `candidate_notional` も未約定引当も足さない（足すと二重計上になる）。
+        `cash_balance` が渡されない/0 のときは従来どおり投資済み額を分母にする
+        （余力を取得できなかった場合に、より厳しい側で判定するフォールバック）。
         """
         max_ratio = self._conf.get("max_sector_ratio", 0.40)
         if snapshot is not None:
@@ -380,19 +395,26 @@ class RiskManager:
         if not all_pos and reserved_total <= 0 and candidate_notional <= 0:
             return True, ""
         closes = snapshot.closes if snapshot is not None else latest_closes([p.symbol for p in all_pos])
-        total_value = reserved_total + candidate_notional
+        positions_value = 0.0
         same_sector_value = reserved_by_sector.get(sector, 0.0) + candidate_notional
         for p in all_pos:
             price = closes.get(p.symbol) or p.avg_cost
             value = p.quantity * price
-            total_value += value
+            positions_value += value
             if p.sector == sector:
                 same_sector_value += value
+        if cash_balance > 0:
+            total_value = cash_balance + positions_value
+        else:
+            total_value = positions_value + reserved_total + candidate_notional
         if total_value <= 0:
             return True, ""
         ratio = same_sector_value / total_value
         if ratio >= max_ratio:
-            return False, f"セクター集中率が上限({max_ratio:.0%})超: {sector}"
+            return False, (
+                f"セクター集中率が上限({max_ratio:.0%})超: {sector} "
+                f"（{same_sector_value:,.0f}円 / 総資金{total_value:,.0f}円 = {ratio:.0%}）"
+            )
         return True, ""
 
     def evaluate_exit(self, symbol: str, current_price: float) -> tuple[bool, str]:
@@ -466,7 +488,8 @@ class RiskManager:
         if sector:
             # この注文自体の金額もセクター集中度に加味する（発注前に超過を弾く。再レビュー P1-2）
             ok, reason = self.check_sector_concentration(
-                sector, candidate_notional=price * quantity, snapshot=snap)
+                sector, candidate_notional=price * quantity, snapshot=snap,
+                cash_balance=cash_balance)
             if not ok:
                 return False, reason
         return True, ""
