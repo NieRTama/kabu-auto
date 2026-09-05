@@ -124,13 +124,26 @@ def _check_halt() -> dict:
 
 
 def run_preflight(client, mode: str, *, base_url: str,
-                  dash_host: str, dash_port: int) -> dict:
+                  dash_host: str, dash_port: int,
+                  skip_api: bool = False) -> dict:
     """プリフライトチェックを実行し {"ok": bool, "checks": [...]} を返す。
 
     ok は level==CRITICAL の失敗が1つも無ければ True。
+
+    skip_api: API疎通チェックを省略する（休場日用）。土日祝は kabuステーションに
+        ログインしていないのが通常で、疎通できないことは異常ではない。ここを
+        CRITICAL のままにすると休場日は live モードで一切起動できなくなる
+        （2026-09-05 に実際に発生）。**省略するのは疎通だけ**で、ポート競合や
+        モード↔エンドポイント不整合といった設定ミスは休場日でも起動を止める。
     """
     checks: list[dict] = []
-    checks.extend(_check_api_connectivity(client))
+    if skip_api:
+        checks.append(_check(
+            "API疎通（休場日のため省略）", True, WARNING,
+            "休場日はkabuステーション未ログインが通常のため疎通を確認しません",
+        ))
+    else:
+        checks.extend(_check_api_connectivity(client))
     checks.append(_check_unresolved_orders())
     checks.append(_check_port(dash_host, dash_port))
     checks.append(_check_endpoint_mode_consistency(mode, base_url))

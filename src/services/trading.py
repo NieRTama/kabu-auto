@@ -222,6 +222,11 @@ class TradingServices:
         try:
             from src.core import reference_capital as ref_capital_store
             from src.core import x_poster
+            # 休場日は取引が無く、投稿しても中身が無い（Discord側と同じ扱いに揃える。
+            # 対になる処理の片方だけガードが漏れていた）。
+            if market_calendar.is_holiday(clock.today()):
+                logger.info("X日次レポート省略: 本日は休場です")
+                return
             mode = self.trading_conf.get("mode", "paper")
             paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
             basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)

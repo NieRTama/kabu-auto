@@ -22,6 +22,7 @@ from src.core import (
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
     discord_bot, auth_recovery, broker_launcher, discord_queries, discord_slash,
+    market_calendar, clock,
 )
 from src.core import alerts as alerts_mod
 from src.core.alerts import alert
@@ -120,20 +121,37 @@ def main() -> None:
     wait_minutes = float(cfg.get_section("runtime").get("wait_for_broker_minutes", 0) or 0)
     wait_unlimited = wait_minutes <= 0
     limit_text = "接続できるまで待機します" if wait_unlimited else f"最大{wait_minutes:.0f}分待機します"
-    connected = broker_wait.wait_for_broker(
-        client.refresh_token,
-        timeout_seconds=wait_minutes * 60,
-        unlimited=wait_unlimited,
-        on_wait_start=lambda: alert(
-            "kabuステーションのログイン待ち",
-            f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
-            f"kabuステーションを起動してログインしてください（{limit_text}）。",
-        ),
-        on_connected=lambda waited: alert(
-            "kabuステーションへ接続しました",
-            f"{waited / 60:.1f}分の待機後に接続し、{tm.description(mode)}で稼働を開始します。",
-        ),
-    )
+    # 休場日は待たない。土日祝は kabuステーションにログインしていないのが普通で、
+    # 無制限に待つとスケジューラが起動せず db_backup 等の日次ジョブまで止まる。
+    # さらに「ログイン待ち」の🔴が届き、対応不要な通知で🔴の価値が下がる
+    # （2026-09-05 土曜に実際に発生。取引が無い日に接続を必須にする理由が無い）。
+    is_closed_today = market_calendar.is_holiday(clock.today())
+    if is_closed_today:
+        logger.info(
+            "休場日のためkabuステーションのログイン待ちを省略します"
+            f"（{market_calendar.holiday_name(clock.today())}）"
+        )
+        try:
+            client.refresh_token()
+            connected = True
+        except Exception as e:
+            connected = False
+            logger.info(f"休場日: kabuステーションへ接続できませんが起動を続行します: {e}")
+    else:
+        connected = broker_wait.wait_for_broker(
+            client.refresh_token,
+            timeout_seconds=wait_minutes * 60,
+            unlimited=wait_unlimited,
+            on_wait_start=lambda: alert(
+                "kabuステーションのログイン待ち",
+                f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
+                f"kabuステーションを起動してログインしてください（{limit_text}）。",
+            ),
+            on_connected=lambda waited: alert(
+                "kabuステーションへ接続しました",
+                f"{waited / 60:.1f}分の待機後に接続し、{tm.description(mode)}で稼働を開始します。",
+            ),
+        )
     if connected:
         broker_auth.mark_valid()
     else:
@@ -142,7 +160,10 @@ def main() -> None:
         broker_auth.mark_expired("起動時にkabuステーションへ接続できませんでした")
         # 実発注モード（live / semi_live）でAPI接続できないまま起動を続けると、口座状態を
         # 把握できないまま発注ロジックだけが動く危険な状態になる（fail-closed）。
-        if tm.places_real_orders(mode):
+        # ただし休場日は発注機会そのものが無いため中断しない。認証は expired のままなので
+        # 発注ゲートは閉じたままで、翌営業日の token_refresh / auth_recovery_check が
+        # 回復させる。ここで中断すると休場日に一切起動できなくなる。
+        if tm.places_real_orders(mode) and not is_closed_today:
             logger.critical(
                 f"{tm.description(mode)}でkabuステーション接続に失敗。起動を中断します。"
             )
@@ -161,6 +182,8 @@ def main() -> None:
             base_url=cfg.get_section("kabu_station").get("base_url", ""),
             dash_host=dash_conf.get("host", "127.0.0.1"),
             dash_port=dash_conf.get("port", 8080),
+            # 休場日は未ログインが通常なので疎通は見ない（設定ミスの検査は続ける）
+            skip_api=is_closed_today,
         )
         preflight.log_results(result)
         if not result["ok"] and tm.places_real_orders(mode):
@@ -199,6 +222,14 @@ def main() -> None:
         終日401のまま「発注可」を表示し続ける抜け殻状態になっていた）。
         失敗したら発注を止めたうえで通知し、ログインされ次第そのまま自動復帰する。
         """
+        # 休場日は取引が無く、認証が切れていても異常ではない。ここで通知すると
+        # 「対応不要な🔴」が毎週末に届き、本物の🔴を無視する癖がつく
+        # （2026-09-05 土曜に実際に発報した）。cron の mon-fri と二重で守る。
+        if market_calendar.is_holiday(clock.today()):
+            logger.info(
+                f"トークン更新省略: 本日は休場です（{market_calendar.holiday_name(clock.today())}）"
+            )
+            return
         try:
             client.refresh_token()
             broker_auth.mark_valid()

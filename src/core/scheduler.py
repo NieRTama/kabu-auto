@@ -40,9 +40,13 @@ class TradingScheduler:
                 day_of_week="mon-fri", hour=8, minute=25, id="risk_reset",
             )
         if "token_refresh" in cb:
+            # 休場日はトークンを取る必要が無く、取れなくても異常ではない。
+            # 曜日指定が無いと土日祝にも走り、🔴「再ログインが必要です」を誤発報する
+            # （2026-09-05 土曜に実際に発生）。祝日は cron では表せないため
+            # 実装側の is_holiday でも弾く（二重の守り。heartbeat と同じ形）。
             self._scheduler.add_job(
                 cb["token_refresh"], "cron",
-                hour=8, minute=30, id="token_refresh",
+                day_of_week="mon-fri", hour=8, minute=30, id="token_refresh",
             )
         if "data_update" in cb:
             self._scheduler.add_job(
