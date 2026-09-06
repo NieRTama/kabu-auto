@@ -25,6 +25,7 @@
 REST API のみを使い、新規依存は無い（既存の requests を使う）。
 """
 import re
+import time
 from typing import Callable, Optional
 
 import requests
@@ -33,14 +34,76 @@ from loguru import logger
 API_BASE = "https://discord.com/api/v10"
 MAX_REPLY_LENGTH = 1900  # Discordの2000字制限に対する余裕
 
+# HTTPの待ち時間の上限（接続, 読み取り）。接続待ちを読み取りより短く取る。
+#
+# 背景: 2026-09-06 のネットワーク断で fetch_messages が約53秒かかり、30秒間隔の
+# ポーリングジョブが APScheduler にスキップされた
+# （"skipped: maximum number of running instances reached (1)"）。
+#
+# requests の timeout は「**接続1回あたり**」の上限であって、呼び出し全体の上限ではない。
+# 接続は候補IP（IPv6/IPv4の複数レコード）ごとに順に試されるため、接続側を短くすると
+# 到達できないIPで足止めされる時間が縮む。
+#
+# ただしこれは**発生確率を下げるだけで、超過を防ぐ保証にはならない**:
+#   - DNS解決(getaddrinfo)はこの上限の対象外で、OS側の解決待ちは止められない
+#   - 候補IPの数は環境依存（IPv6有効時はさらに増える）
+#   - poll_once() は取得1回に加えて返信ごとに send() を呼ぶため、全体の上限はさらに緩い
+# 超過そのものは起こりうる前提で、**本命の対策は超過に気づけるようにすること**
+# （APScheduler の標準logging を loguru へ橋渡しし、スキップが**ログに残る**ようにした。
+#   src/core/logger.py の _InterceptHandler。なおスキップは routine にも出るため
+#   アラート件数には載せない＝通知は飛ばない。ログを見れば必ず残っている、が担保内容）。
+CONNECT_TIMEOUT_SECONDS = 4
+READ_TIMEOUT_SECONDS = 10
+DEFAULT_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS)
+
+# 起動時の1回きりの呼び出し（get_me / fetch_bot_role_ids / prime）専用の上限。
+#
+# これらは失敗しても再試行が無い。get_me が失敗すると build() が None を返し、
+# main.py は discord_poll ジョブを登録しないため、**プロセスの生涯にわたって
+# リモコン（外出先からの緊急停止）が使えない**。よってポーリングと同じ短さでは切らない。
+#
+# 一方で**これ以上長くもしない**。build() は main.py の同期起動パス上にあり
+# （scheduler.start() より前）、ここで待つと損切り監視の開始まで遅れる。
+# リモコンの可用性のために取引本体の起動を遅らせるのは本末転倒なので、
+# 変更前の挙動（timeout=10）と同じ値に据え置く。
+STARTUP_TIMEOUT = (10, 10)
+
+# Discord のメッセージIDはスノーフレーク: 上位42bitが 2015-01-01 起点のミリ秒。
+# 「起動より前に送られたメッセージか」を、追加のAPI呼び出し無しに判定できる。
+DISCORD_EPOCH_MS = 1420070400000
+
+
+# ホストの時計と Discord サーバの時刻はズレる。厳密比較にすると、端末の時計が
+# 進んでいるときに起動**後**に送られた緊急停止を取りこぼし、返信も無いまま消える
+# （「halt が効いた」と誤認させる）。数秒の余裕を持たせて安全側に倒す。
+# 大きくしすぎると起動直前のコマンド（resume 等）を拾ってしまうので短く保つ。
+STARTUP_CUTOFF_MARGIN_MS = 5000
+
+# プロセス起動時刻。**このモジュールの読み込み時**（＝main.py の import 時）に確定する。
+# RemoteControl の生成時ではない: build() は get_me / fetch_bot_role_ids を叩いてから
+# 生成するため、ネットワーク劣化時は数十秒後になる。生成時刻を基準にすると、その間に
+# 送られた緊急停止が「起動前」に分類され、無言で捨てられてしまう。
+PROCESS_START_MS = int(time.time() * 1000)
+
+
+def message_sent_at_ms(message_id) -> Optional[int]:
+    """メッセージIDから送信時刻(ミリ秒)を取り出す。解釈できなければ None。"""
+    try:
+        return (int(message_id) >> 22) + DISCORD_EPOCH_MS
+    except (TypeError, ValueError):
+        return None
+
 
 class DiscordBotClient:
     """Discord REST API の薄いラッパー（取得と返信のみ）。"""
 
-    def __init__(self, token: str, channel_id: str, timeout: int = 10):
+    def __init__(self, token: str, channel_id: str, timeout=DEFAULT_TIMEOUT,
+                 startup_timeout=STARTUP_TIMEOUT):
         self._token = token
         self._channel_id = channel_id
         self._timeout = timeout
+        # 起動時の1回きりの呼び出しは長めに待つ（失敗するとリモコンが生涯無効になる）
+        self._startup_timeout = startup_timeout
 
     @property
     def _headers(self) -> dict:
@@ -48,17 +111,23 @@ class DiscordBotClient:
 
     def get_me(self) -> dict:
         resp = requests.get(f"{API_BASE}/users/@me", headers=self._headers,
-                            timeout=self._timeout)
+                            timeout=self._startup_timeout)
         resp.raise_for_status()
         return resp.json()
 
-    def fetch_messages(self, after: Optional[str] = None, limit: int = 20) -> list:
+    def fetch_messages(self, after: Optional[str] = None, limit: int = 20,
+                       startup: bool = False) -> list:
+        """新着メッセージを取得する。
+
+        startup=True は起動時の既読化（prime）用。再試行が無いので長めに待つ。
+        """
         params = {"limit": limit}
         if after:
             params["after"] = after
         resp = requests.get(
             f"{API_BASE}/channels/{self._channel_id}/messages",
-            headers=self._headers, params=params, timeout=self._timeout,
+            headers=self._headers, params=params,
+            timeout=self._startup_timeout if startup else self._timeout,
         )
         resp.raise_for_status()
         # Discord は新しい順で返すため、処理しやすいよう古い順に直す
@@ -73,13 +142,13 @@ class DiscordBotClient:
         """
         try:
             ch = requests.get(f"{API_BASE}/channels/{self._channel_id}",
-                              headers=self._headers, timeout=self._timeout)
+                              headers=self._headers, timeout=self._startup_timeout)
             ch.raise_for_status()
             guild_id = ch.json().get("guild_id")
             if not guild_id:
                 return set()
             me = requests.get(f"{API_BASE}/guilds/{guild_id}/members/{bot_id}",
-                              headers=self._headers, timeout=self._timeout)
+                              headers=self._headers, timeout=self._startup_timeout)
             me.raise_for_status()
             return {str(r) for r in me.json().get("roles", [])}
         except Exception as e:
@@ -199,7 +268,8 @@ class RemoteControl:
 
     def __init__(self, client: DiscordBotClient, handler: CommandHandler,
                  *, bot_id: str, allowed_user_ids: set,
-                 role_ids: Optional[set] = None):
+                 role_ids: Optional[set] = None,
+                 started_at_ms: Optional[int] = None):
         self._client = client
         self._handler = handler
         self._bot_id = bot_id
@@ -207,15 +277,52 @@ class RemoteControl:
         self._role_ids = {str(r) for r in (role_ids or set())}
         self._allowed = {str(u) for u in allowed_user_ids if str(u).strip()}
         self._last_id: Optional[str] = None
+        # 起動時の既読化が済んだか。失敗したまま poll_once に入ると、
+        # after=None で直近20件を取得して**起動前のコマンドを実行してしまう**
+        # （モジュール冒頭の「起動時点より前のメッセージは実行しない」が破れる）。
+        self._primed = False
+        # prime に失敗したときの切り分けに使う（起動前の分だけを捨てるため）。
+        # 既定はプロセス起動時刻。ここで time.time() を呼ぶと、build() の
+        # ハンドシェイクに掛かった時間の分だけ基準が後ろへずれる。
+        self._started_at_ms = (
+            PROCESS_START_MS if started_at_ms is None else started_at_ms
+        )
 
     def prime(self) -> None:
         """起動時に既存メッセージを既読扱いにする（過去コマンドの暴発防止）。"""
         try:
-            messages = self._client.fetch_messages(limit=1)
+            messages = self._client.fetch_messages(limit=1, startup=True)
             if messages:
-                self._last_id = messages[-1]["id"]
+                self._last_id = messages[-1].get("id", self._last_id)
+            # 既読位置を確定できたとき（または空チャンネル）だけ完了扱いにする。
+            # 確定しないまま完了にすると、次の poll_once が after=None で直近20件を
+            # 取得し、破棄ロジックを通らずに起動前のコマンドを実行してしまう
+            # （poll_once 側の判定と揃える）。
+            self._primed = (not messages) or self._last_id is not None
         except Exception as e:
-            logger.warning(f"Discordリモコンの初期化に失敗（次回再試行）: {e}")
+            logger.warning(f"Discordリモコンの初期化に失敗（次回のポーリングで既読化）: {e}")
+
+    def _drop_messages_from_before_startup(self, messages: list) -> list:
+        """起動より前に送られたメッセージを既読化して取り除く。
+
+        判定できないID（テスト用の連番など）は安全側に倒して「起動前」とみなす。
+        """
+        cutoff = self._started_at_ms - STARTUP_CUTOFF_MARGIN_MS
+        keep, dropped = [], []
+        for msg in messages:
+            sent_at = message_sent_at_ms(msg.get("id"))
+            if sent_at is not None and sent_at >= cutoff:
+                keep.append(msg)
+            else:
+                dropped.append(msg)
+        if dropped:
+            # INFO ではなく WARNING。コマンドを送った本人には返信が届かないため、
+            # 「送ったのに動いていない」ことに気づける手がかりを残す。
+            logger.warning(
+                f"起動時の既読化に失敗したため、起動前のDiscordメッセージ"
+                f"{len(dropped)}件を実行せず既読化しました"
+            )
+        return keep
 
     def poll_once(self) -> int:
         """新着を1回分処理する。処理したコマンド数を返す。"""
@@ -225,9 +332,29 @@ class RemoteControl:
             logger.warning(f"Discordメッセージ取得に失敗（次回再試行）: {e}")
             return 0
 
+        # このバッチは（実行するしないに関わらず）消化する。除外した分で
+        # 既読位置が止まると、次回また取得して今度は実行してしまうため、
+        # 最後にバッチ末尾まで必ず進める（Discordは時系列順で返す）。
+        # 末尾にIDが無い異常データもあり得るので、IDを持つ最後の要素を使う。
+        fetched = messages
+        batch_last_id = next(
+            (m.get("id") for m in reversed(fetched) if m.get("id")), None
+        )
+
+        if not self._primed:
+            # prime() が失敗していた場合の受け皿。既読位置が無いまま処理に入ると
+            # 直近20件をまとめて実行し、再起動のたびに過去の halt 等が暴発する。
+            # ただし**捨てるのは起動より前の分だけ**にする。起動直後に送られた
+            # 緊急停止まで無言で破棄すると「halt が効いた」と誤認させてしまう。
+            messages = self._drop_messages_from_before_startup(fetched)
+            # 既読位置を確定できないまま「既読化済み」にすると、次回 after=None で
+            # 同じバッチを取り直し、今度は破棄ロジックを通らずに起動前のコマンドを
+            # 実行してしまう。確定できたとき（または空バッチ）だけ完了扱いにする。
+            self._primed = (not fetched) or batch_last_id is not None
+
         executed = 0
         for msg in messages:
-            self._last_id = msg["id"]
+            self._last_id = msg.get("id", self._last_id)
             author = msg.get("author", {}) or {}
             if author.get("bot"):
                 continue  # 自分やほかのBotの発言は無視（無限ループ防止）
@@ -248,6 +375,9 @@ class RemoteControl:
                 self._client.send(reply)
             except Exception as e:
                 logger.error(f"Discordへの返信に失敗しました: {e}")
+
+        if batch_last_id is not None:
+            self._last_id = batch_last_id
         return executed
 
 

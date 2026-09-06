@@ -33,8 +33,14 @@ def _msg(msg_id: str, content: str, author_id: str = OWNER,
 
 
 def _rc(messages, allowed={OWNER}, handlers=None):
+    """本番と同じ結線でリモコンを作る。
+
+    本番は build() が prime() を呼んでから poll_once を回す。ここでは
+    「起動時点ではメッセージが無く、そのあとに新着が届く」状況を模す
+    （起動前のメッセージは実行しない仕様のため、prime を省くと実態とズレる）。
+    """
     client = MagicMock()
-    client.fetch_messages.return_value = messages
+    client.fetch_messages.return_value = []
     executed = []
     handlers = handlers or {
         "status": lambda a: "STATUS_OK",
@@ -44,6 +50,8 @@ def _rc(messages, allowed={OWNER}, handlers=None):
                for k, v in handlers.items()}
     rc = mod.RemoteControl(client, mod.CommandHandler(wrapped),
                            bot_id=BOT_ID, allowed_user_ids=allowed)
+    rc.prime()                                     # 起動時の既読化（本番と同じ）
+    client.fetch_messages.return_value = messages  # 以降に新着が届く
     return rc, client, executed
 
 
@@ -252,11 +260,13 @@ class TestRoleMention:
     def test_executes_command_via_role_mention(self):
         """ロールメンション経由でも実際にコマンドが動くこと（結線の検証）"""
         client = MagicMock()
-        client.fetch_messages.return_value = [self._msg_role("status")]
+        client.fetch_messages.return_value = []
         rc = mod.RemoteControl(
             client, mod.CommandHandler({"status": lambda a: "OK"}),
             bot_id=BOT_ID, allowed_user_ids={OWNER}, role_ids={self.ROLE},
         )
+        rc.prime()                                                   # 起動時の既読化
+        client.fetch_messages.return_value = [self._msg_role("status")]
         assert rc.poll_once() == 1
         client.send.assert_called_once_with("OK")
 
@@ -265,10 +275,398 @@ class TestRoleMention:
         msg = self._msg_role("status")
         msg["author"]["id"] = STRANGER
         client = MagicMock()
-        client.fetch_messages.return_value = [msg]
+        client.fetch_messages.return_value = []
         rc = mod.RemoteControl(
             client, mod.CommandHandler({"status": lambda a: "OK"}),
             bot_id=BOT_ID, allowed_user_ids={OWNER}, role_ids={self.ROLE},
         )
+        rc.prime()                               # 既読化を通す（通さないと認可を検証せず素通りする）
+        client.fetch_messages.return_value = [msg]
         assert rc.poll_once() == 0
         client.send.assert_not_called()
+
+
+class TestRequestTimeoutIsBounded:
+    """接続待ちを読み取りより短く取り、到達できないIPでの足止めを縮める。
+
+    2026-09-06: ネットワーク断で fetch_messages が約53秒かかり、30秒間隔の
+    ポーリングジョブが APScheduler にスキップされた。requests の timeout は
+    「接続1回あたり」の上限で、接続は候補IPごとに順に試される。
+
+    なお、これは超過の確率を下げるだけで防止の保証ではない（DNS解決は上限の対象外、
+    候補IP数は環境依存、poll_once は返信ごとに send も呼ぶ）。超過に気づけるように
+    する側が本命の対策なので、ここでは「上限が分かれていること」だけを固定する。
+    """
+
+    def test_fetch_messages_separates_connect_and_read_timeout(self):
+        client = mod.DiscordBotClient("tok", "chan")
+        resp = MagicMock()
+        resp.json.return_value = []
+        resp.raise_for_status.return_value = None
+        with patch.object(mod.requests, "get", return_value=resp) as req:
+            client.fetch_messages()
+        timeout = req.call_args.kwargs["timeout"]
+        assert isinstance(timeout, tuple), \
+            "接続と読み取りで別々の上限を持つこと（接続待ちだけを短くしたい）"
+        assert len(timeout) == 2
+
+    def test_send_uses_the_same_bounded_timeout(self):
+        client = mod.DiscordBotClient("tok", "chan")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        with patch.object(mod.requests, "post", return_value=resp) as req:
+            client.send("hello")
+        assert isinstance(req.call_args.kwargs["timeout"], tuple)
+
+    def test_connect_timeout_is_shorter_than_read_timeout(self):
+        """接続待ちの上限が読み取りより短いこと（足止めされるのは接続側のため）。"""
+        connect, read = mod.DEFAULT_TIMEOUT
+        assert 0 < connect < read
+
+
+class TestStartupHandshakeTimeout:
+    """起動時のハンドシェイクは、定期ポーリングより待ち時間を長く取る。
+
+    get_me() / fetch_bot_role_ids() は build() からしか呼ばれず、ここで失敗すると
+    build() が None を返す。すると main.py は discord_poll を登録しないため、
+    **プロセスの生涯にわたってリモコン（緊急停止）が使えない**。
+    ポーリングと違って「次回の再試行」が無いので、短く切ってはいけない。
+    """
+
+    def _resp(self, payload):
+        resp = MagicMock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_get_me_waits_longer_than_the_polling_timeout(self):
+        client = mod.DiscordBotClient("tok", "chan")
+        with patch.object(mod.requests, "get", return_value=self._resp({"id": "1"})) as req:
+            client.get_me()
+        connect, read = req.call_args.kwargs["timeout"]
+        assert connect > mod.DEFAULT_TIMEOUT[0]
+        assert read >= mod.DEFAULT_TIMEOUT[1]
+
+    def test_fetch_bot_role_ids_waits_longer_than_the_polling_timeout(self):
+        client = mod.DiscordBotClient("tok", "chan")
+        with patch.object(mod.requests, "get",
+                          return_value=self._resp({"guild_id": "g1", "roles": ["r1"]})) as req:
+            client.fetch_bot_role_ids("999")
+        connect, _read = req.call_args.kwargs["timeout"]
+        assert connect > mod.DEFAULT_TIMEOUT[0]
+
+    def test_polling_calls_still_use_the_shorter_timeout(self):
+        """ポーリング側は短いまま（起動用を流用して長くしない）。"""
+        client = mod.DiscordBotClient("tok", "chan")
+        with patch.object(mod.requests, "get", return_value=self._resp([])) as req:
+            client.fetch_messages()
+        assert req.call_args.kwargs["timeout"] == mod.DEFAULT_TIMEOUT
+
+
+class TestPrimeFailureDoesNotReplayHistory:
+    """起動時の既読化に失敗しても、起動前のコマンドを実行しないこと。
+
+    prime() が失敗すると _last_id が None のままになり、次の poll_once が
+    after=None で直近20件を取得して**起動前のコマンドを実行**してしまう。
+    モジュール冒頭が「起動時点より前のメッセージは実行しない（再起動で過去の
+    コマンドが暴発しない）」と保証している性質なので、失敗経路でも守る。
+    """
+
+    def _old_command(self):
+        return {
+            "id": "1", "content": f"<@{BOT_ID}> halt 昨日の理由",
+            "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}],
+        }
+
+    def _rc_with(self, client):
+        self.executed = []
+        return mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: self.executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER},
+        )
+
+    def test_history_is_not_executed_after_prime_failure(self):
+        client = MagicMock()
+        client.fetch_messages.side_effect = [RuntimeError("network down"),
+                                             [self._old_command()]]
+        rc = self._rc_with(client)
+        rc.prime()          # 既読化に失敗
+        rc.poll_once()      # 直後のポーリング
+
+        assert self.executed == [], "起動前のコマンドを実行してはいけない"
+
+    def test_history_is_marked_read_so_new_commands_still_work(self):
+        """既読化のやり直しは行い、以降の新着はちゃんと動くこと（機能を殺さない）。"""
+        new_command = {
+            "id": "2", "content": f"<@{BOT_ID}> halt 今の理由",
+            "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}],
+        }
+        client = MagicMock()
+        client.fetch_messages.side_effect = [RuntimeError("network down"),
+                                             [self._old_command()],
+                                             [new_command]]
+        rc = self._rc_with(client)
+        rc.prime()
+        rc.poll_once()      # ここで過去分を既読化するだけ
+        rc.poll_once()      # 以降は通常動作
+
+        assert self.executed == ["今の理由"]
+        assert client.fetch_messages.call_args.kwargs["after"] == "1"
+
+    def test_prime_uses_the_startup_timeout(self):
+        """prime も再試行の無い起動時1回きりの呼び出しなので、短く切らない。"""
+        client = mod.DiscordBotClient("tok", "chan")
+        resp = MagicMock()
+        resp.json.return_value = []
+        resp.raise_for_status.return_value = None
+        with patch.object(mod.requests, "get", return_value=resp) as req:
+            client.fetch_messages(limit=1, startup=True)
+        assert req.call_args.kwargs["timeout"] == mod.STARTUP_TIMEOUT
+
+
+def _snowflake(offset_ms: int = 0) -> str:
+    """Discord のスノーフレークID（上位42bitが 2015-01-01 起点のミリ秒）を作る。"""
+    import time as _t
+    ms = int(_t.time() * 1000) + offset_ms
+    return str((ms - mod.DISCORD_EPOCH_MS) << 22)
+
+
+class TestPrimeFailureKeepsPostStartupCommands:
+    """prime 失敗の受け皿が、起動**後**に届いたコマンドまで捨てないこと。
+
+    捨てたいのは起動前の分だけ。再起動直後の瞬断で prime が失敗し、その直後に
+    運用者が緊急停止を送ると、無言で破棄され「halt が効いた」と誤認する。
+    """
+
+    def _rc(self, client):
+        self.executed = []
+        return mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: self.executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER},
+        )
+
+    def _cmd(self, msg_id, arg):
+        return {"id": msg_id, "content": f"<@{BOT_ID}> halt {arg}",
+                "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+
+    def test_command_sent_after_startup_is_executed(self):
+        client = MagicMock()
+        rc = self._rc(client)                       # ここで起動時刻が決まる
+        fresh = self._cmd(_snowflake(offset_ms=1000), "今すぐ")
+        client.fetch_messages.side_effect = [RuntimeError("network down"), [fresh]]
+
+        rc.prime()
+        rc.poll_once()
+
+        assert self.executed == ["今すぐ"], "起動後に届いたコマンドは実行する"
+
+    def test_command_sent_before_startup_is_discarded(self):
+        client = MagicMock()
+        rc = self._rc(client)
+        old = self._cmd(_snowflake(offset_ms=-3600_000), "1時間前")
+        client.fetch_messages.side_effect = [RuntimeError("network down"), [old]]
+
+        rc.prime()
+        rc.poll_once()
+
+        assert self.executed == [], "起動前のコマンドは実行しない"
+
+    def test_mixed_batch_runs_only_the_new_one(self):
+        client = MagicMock()
+        rc = self._rc(client)
+        old = self._cmd(_snowflake(offset_ms=-3600_000), "1時間前")
+        fresh = self._cmd(_snowflake(offset_ms=1000), "今すぐ")
+        client.fetch_messages.side_effect = [RuntimeError("network down"), [old, fresh]]
+
+        rc.prime()
+        rc.poll_once()
+
+        assert self.executed == ["今すぐ"]
+
+
+class TestReadPositionNeverRewinds:
+    """既読位置を巻き戻さないこと。
+
+    巻き戻すと、破棄したはずのメッセージを次回のポーリングで取り直し、
+    今度は _primed=True なので**実行してしまう**。
+    """
+
+    def _rc(self, client):
+        self.executed = []
+        return mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: self.executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER},
+        )
+
+    def _cmd(self, msg_id, arg):
+        return {"id": msg_id, "content": f"<@{BOT_ID}> halt {arg}",
+                "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+
+    def test_read_position_advances_past_discarded_messages(self):
+        """除外した分を含め、既読位置はバッチ末尾まで進むこと。
+
+        途中で止まると、除外したメッセージを次回また取得し、そのときは
+        _primed=True なので**実行してしまう**。
+        """
+        client = MagicMock()
+        rc = self._rc(client)
+        old1 = self._cmd(_snowflake(offset_ms=-7200_000), "2時間前")
+        old2 = self._cmd(_snowflake(offset_ms=-3600_000), "1時間前")
+        client.fetch_messages.side_effect = [
+            RuntimeError("network down"), [old1, old2], [],
+        ]
+        rc.prime()
+        rc.poll_once()
+        rc.poll_once()
+
+        assert self.executed == [], "起動前のコマンドは実行しない"
+        assert client.fetch_messages.call_args.kwargs["after"] == old2["id"],             "既読位置がバッチ末尾まで進んでいない（次回また取得してしまう）"
+
+    def test_missing_id_does_not_crash(self):
+        client = MagicMock()
+        rc = self._rc(client)
+        no_id = {"content": f"<@{BOT_ID}> halt x",
+                 "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+        client.fetch_messages.side_effect = [RuntimeError("down"), [no_id]]
+        rc.prime()
+        rc.poll_once()   # KeyError で落ちないこと
+
+
+class TestStartupCutoffTolerance:
+    def test_has_a_margin_for_clock_skew(self):
+        """ホスト時計とDiscordサーバ時刻のズレを吸収する余裕があること。
+
+        厳密比較だと、端末の時計が進んでいる場合に起動**後**の緊急停止を
+        取りこぼす（＝halt が効いたと誤認させる）。
+        """
+        assert mod.STARTUP_CUTOFF_MARGIN_MS > 0
+
+
+class TestStartupTimeIsProcessStart:
+    """起動時刻の基準は「プロセス起動」であって「RemoteControl 生成」ではない。
+
+    build() は get_me / fetch_bot_role_ids を叩いてから RemoteControl を作る。
+    ネットワークが劣化していると（各10秒×3リクエスト）生成は数十秒後になり、
+    同じ障害で prime() も失敗する。生成時刻を基準にすると、その間に送られた
+    緊急停止が「起動前」に分類されて無言で捨てられる。
+    """
+
+    def _rc(self, client, **kw):
+        self.executed = []
+        return mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: self.executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER}, **kw,
+        )
+
+    def _cmd(self, msg_id, arg):
+        return {"id": msg_id, "content": f"<@{BOT_ID}> halt {arg}",
+                "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+
+    def test_default_start_time_is_process_start_not_construction(self):
+        rc = self._rc(MagicMock())
+        assert rc._started_at_ms == mod.PROCESS_START_MS
+
+    def test_command_sent_during_a_slow_handshake_is_executed(self):
+        """ハンドシェイク中（起動後・生成前）に届いたコマンドは実行すること。"""
+        import time as _t
+        started = int(_t.time() * 1000) - 120_000          # 2分前にプロセス起動
+        client = MagicMock()
+        rc = self._rc(client, started_at_ms=started)
+        during = self._cmd(_snowflake(offset_ms=-60_000), "起動直後")  # 1分前＝起動後
+        client.fetch_messages.side_effect = [RuntimeError("down"), [during]]
+
+        rc.prime()
+        rc.poll_once()
+
+        assert self.executed == ["起動直後"]
+
+    def test_command_sent_before_process_start_is_still_discarded(self):
+        import time as _t
+        started = int(_t.time() * 1000) - 120_000
+        client = MagicMock()
+        rc = self._rc(client, started_at_ms=started)
+        before = self._cmd(_snowflake(offset_ms=-300_000), "5分前")   # 起動より前
+        client.fetch_messages.side_effect = [RuntimeError("down"), [before]]
+
+        rc.prime()
+        rc.poll_once()
+
+        assert self.executed == []
+
+
+class TestUnreadablePositionKeepsGuard:
+    """既読位置を確定できなければ、既読化済みにしないこと。
+
+    確定しないまま _primed=True にすると、次回 after=None で同じバッチを取り直し、
+    今度は破棄ロジックを通らずに起動前のコマンドを実行してしまう。
+    """
+
+    def test_batch_without_ids_does_not_disable_the_guard(self):
+        executed = []
+        no_id = {"content": f"<@{BOT_ID}> halt 過去分",
+                 "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+        client = MagicMock()
+        client.fetch_messages.side_effect = [
+            RuntimeError("down"), [no_id], [no_id],
+        ]
+        rc = mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER},
+        )
+        rc.prime()
+        rc.poll_once()
+        rc.poll_once()
+
+        assert executed == [], "既読位置が確定できない間は起動前扱いを続ける"
+
+
+class TestPrimeWithoutReadPositionKeepsGuard:
+    """prime() が既読位置を確定できなければ、既読化済みにしないこと。
+
+    poll_once 側は同じ条件を防いでいるのに prime 側が素通りだと、
+    次の poll_once が after=None で直近20件を取得し、破棄ロジックを
+    通らずに起動前の halt 等を実行してしまう。
+    """
+
+    def test_message_without_id_does_not_disable_the_guard(self):
+        executed = []
+        no_id = {"content": f"<@{BOT_ID}> halt 前日分",
+                 "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+        old = {"id": _snowflake(offset_ms=-86_400_000),
+               "content": f"<@{BOT_ID}> halt 前日分",
+               "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+        client = MagicMock()
+        # prime は成功するがIDが無い -> 既読位置が確定しない
+        client.fetch_messages.side_effect = [[no_id], [old]]
+        rc = mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER},
+        )
+        rc.prime()
+        rc.poll_once()
+
+        assert executed == [], "既読位置が確定していない間は起動前扱いを続ける"
+
+    def test_empty_channel_still_counts_as_primed(self):
+        """空チャンネルは既読化済みとして扱う（以降の新着は普通に動く）。"""
+        executed = []
+        fresh = {"id": _snowflake(offset_ms=1000),
+                 "content": f"<@{BOT_ID}> halt 今すぐ",
+                 "author": {"id": OWNER, "bot": False}, "mentions": [{"id": BOT_ID}]}
+        client = MagicMock()
+        client.fetch_messages.side_effect = [[], [fresh]]
+        rc = mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids={OWNER},
+        )
+        rc.prime()
+        rc.poll_once()
+
+        assert executed == ["今すぐ"]
