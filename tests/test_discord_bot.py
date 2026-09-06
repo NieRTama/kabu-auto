@@ -670,3 +670,42 @@ class TestPrimeWithoutReadPositionKeepsGuard:
         rc.poll_once()
 
         assert executed == ["今すぐ"]
+
+
+class TestUnconfiguredAllowListFailsClosed:
+    """許可ユーザーが未設定なら、誰のコマンドも実行しないこと（fail-closed）。
+
+    `DISCORD_ALLOWED_USER_ID` 未設定だと main.py は空セットを渡す。
+    `if self._allowed and ...` という書き方だと**判定ごとスキップ**され、
+    同じチャンネルにいる誰でも halt / resume を実行できてしまう。
+    モジュール冒頭が謳う「送信者IDが許可リストと一致するメッセージだけを実行する」
+    「未設定なら機能ごと無効」の両方に反する。
+    """
+
+    def test_poll_once_executes_nothing_when_allow_list_is_empty(self):
+        executed = []
+        client = MagicMock()
+        client.fetch_messages.return_value = []
+        rc = mod.RemoteControl(
+            client,
+            mod.CommandHandler({"halt": lambda a: executed.append(a) or "停止"}),
+            bot_id=BOT_ID, allowed_user_ids=set(),
+        )
+        rc.prime()
+        client.fetch_messages.return_value = [
+            _msg("1", f"<@{BOT_ID}> halt 誰でも実行できてはいけない", author_id=STRANGER)
+        ]
+
+        assert rc.poll_once() == 0
+        assert executed == []
+        client.send.assert_not_called()
+
+    def test_build_disables_the_feature_when_allow_list_is_empty(self):
+        """未設定なら機能ごと無効にする（設定漏れで開放状態にしない）。"""
+        with patch.object(mod.DiscordBotClient, "get_me", return_value={"id": BOT_ID}):
+            assert mod.build("token", "chan", set(), {"status": lambda a: "OK"}) is None
+
+    def test_build_ignores_blank_user_ids(self):
+        """空文字だけの指定も未設定と同じ扱いにする（main.py は {""} を渡す）。"""
+        with patch.object(mod.DiscordBotClient, "get_me", return_value={"id": BOT_ID}):
+            assert mod.build("token", "chan", {""}, {"status": lambda a: "OK"}) is None

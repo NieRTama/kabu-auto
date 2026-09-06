@@ -124,3 +124,28 @@ class TestWiring:
         src = inspect.getsource(ds)
         for forbidden in ("KABU_API_PASSWORD", "os.environ[", ".env"):
             assert forbidden not in src, f"秘密情報を扱う実装が入っている: {forbidden}"
+
+
+class TestSlashUnconfiguredAllowListFailsClosed:
+    """スラッシュコマンド側も、許可ユーザー未設定なら誰も実行できないこと。
+
+    メンション方式と同じ穴（`if self._allowed and ...` で判定ごとスキップ）が
+    あったため、同じ基準で塞ぐ。
+    """
+
+    def _server(self, allowed):
+        return ds.SlashCommandServer("tok", "chan1", allowed, {"halt": lambda a: "停止"})
+
+    def test_rejects_everyone_when_allow_list_is_empty(self):
+        ok, reason = self._server(set())._is_authorized("999", "chan1")
+        assert ok is False
+        assert reason
+
+    def test_still_allows_configured_user(self):
+        ok, _ = self._server({"111"})._is_authorized("111", "chan1")
+        assert ok is True
+
+    def test_build_disables_the_feature_when_allow_list_is_empty(self):
+        if not ds.available():
+            pytest.skip("discord.py 未導入")
+        assert ds.build("tok", "chan1", set(), {"halt": lambda a: "停止"}) is None

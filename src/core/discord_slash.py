@@ -79,7 +79,8 @@ class SlashCommandServer:
         """実行してよい相手・場所か。メンション方式と同じ基準を使う。"""
         if str(channel_id) != self._channel_id:
             return False, "このチャンネルでは実行できません"
-        if self._allowed and str(user_id) not in self._allowed:
+        # メンション方式と同じく fail-closed（空なら誰も通さない）
+        if str(user_id) not in self._allowed:
             logger.warning(
                 f"許可されていないユーザーのスラッシュコマンドを拒否しました: user_id={user_id}"
             )
@@ -175,6 +176,12 @@ def build(token: str, channel_id: str, allowed_user_ids: set,
     未設定・discord.py 未導入なら None（機能ごと無効。既存挙動と完全一致）。
     """
     if not token or not channel_id:
+        return None
+    if not {str(u) for u in (allowed_user_ids or set()) if str(u).strip()}:
+        logger.warning(
+            "DISCORD_ALLOWED_USER_ID が未設定のためスラッシュコマンドを無効にします"
+            "（許可ユーザーが空のまま動かすと同じチャンネルの誰でも操作できるため）"
+        )
         return None
     if not available():
         logger.info(

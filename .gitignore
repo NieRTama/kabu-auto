@@ -37,6 +37,9 @@ data/trading_halt.json
 chatlog2.md
 risk_profile.json
 
+# 損益率の基準資金（実際の投入額。環境ごとに異なり、公開リポジトリに置く値ではない）
+reference_capital.json
+
 # 旧形式ウォッチリスト（watchlists.json に移行済み。後方互換のため残置するが追跡しない）
 watchlist.json
 

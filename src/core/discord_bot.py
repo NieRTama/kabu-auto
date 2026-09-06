@@ -360,7 +360,10 @@ class RemoteControl:
                 continue  # 自分やほかのBotの発言は無視（無限ループ防止）
             if not is_mentioned(msg, self._bot_id, self._role_ids):
                 continue
-            if self._allowed and str(author.get("id")) not in self._allowed:
+            # 許可リストが空でも素通りさせない（fail-closed）。`self._allowed and ...`
+            # と書くと未設定時に判定ごとスキップされ、同じチャンネルの誰でも
+            # halt / resume を実行できてしまう。
+            if str(author.get("id")) not in self._allowed:
                 logger.warning(
                     f"許可されていないユーザーからのDiscordコマンドを拒否しました: "
                     f"user_id={author.get('id')}"
@@ -385,6 +388,14 @@ def build(token: str, channel_id: str, allowed_user_ids: set,
           handlers: dict) -> Optional[RemoteControl]:
     """設定からリモコンを構築する。未設定・接続失敗なら None（機能無効）。"""
     if not token or not channel_id:
+        return None
+    # 許可ユーザーが空なら機能ごと無効にする。空のまま動かすと、設定漏れが
+    # 「誰でも操作できる」状態として表に出ず、事故になるまで気づけない。
+    if not {str(u) for u in (allowed_user_ids or set()) if str(u).strip()}:
+        logger.warning(
+            "DISCORD_ALLOWED_USER_ID が未設定のためDiscordリモコンを無効にします"
+            "（許可ユーザーが空のまま動かすと同じチャンネルの誰でも操作できるため）"
+        )
         return None
     client = DiscordBotClient(token, channel_id)
     try:
