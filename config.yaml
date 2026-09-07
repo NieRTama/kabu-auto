@@ -143,10 +143,20 @@ runtime:
   # kabuステーション(KabuS.exe)が落ちているとき、自動で起動するか。
   # kabu-auto はデスクトップセッション内で動くため、起動すれば画面が出て
   # 認証アプリでの承認ができる。認証自体は自動化しない（承認は人が行う）。
-  auto_launch_broker: true
+  #
+  # false にしている理由（2026-09-07）: 起動元を「人」に一本化するため。
+  # kabuステーションは**プロセスが生きたまま認証だけ**が切れるので、自動起動は
+  # 「落ちている」ときにしか効かない一方で、Windowsの自動起動・手動起動と
+  # 競合して二重起動の一因になっていた。起動が必要なときは Discord の
+  # `launch` コマンド（人の明示操作）か、手で起動する。
+  auto_launch_broker: false
   broker_exe_path: ""              # 空なら %LOCALAPPDATA%\kabuStation\KabuS.exe
   # 1日の起動試行上限。証券会社側の障害時は起動しても認証できないため、
   # 無意味な起動を繰り返さないよう上限を設ける（0で無制限）。
+  # **自動起動にだけ効く**。Discord の `launch`（人の明示操作）は上限で止めない
+  # ——自動起動を無効にした構成ではそれが唯一の起動経路になるため。
+  # 誤操作による二重起動は launcher 側のクールダウンが防ぐ。
+  # したがって auto_launch_broker: false の間、この値は実質使われない。
   max_launch_attempts_per_day: 3
 
 backtest:

@@ -21,7 +21,8 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, auth_recovery, broker_launcher, discord_queries, discord_slash,
+    discord_bot, auth_recovery, broker_launcher, broker_watch, discord_queries,
+    discord_slash,
     market_calendar, clock,
 )
 from src.core import alerts as alerts_mod
@@ -203,8 +204,14 @@ def main() -> None:
     services = TradingServices(client, risk, order_mgr, model)
 
     # ─── インフラ系の小ジョブ（composition root に置く）──────
-    def _launch_broker() -> tuple[bool, str]:
-        """kabuステーションを起動する（設定を読んで launcher へ委譲）。"""
+    def _launch_broker(*, manual: bool = False) -> tuple[bool, str]:
+        """kabuステーションを起動する（設定を読んで launcher へ委譲）。
+
+        manual=True は人が明示的に頼んだ起動（Discord の launch）。日次上限は
+        「自動起動の暴走」を止めるためのものなので、人の操作までは縛らない
+        （自動起動を無効にした構成では、これが唯一の起動経路になる）。
+        誤操作による二重起動は launcher 側のクールダウンが防ぐ。
+        """
         rt = cfg.get_section("runtime")
         return broker_launcher.launch(
             rt.get("broker_exe_path", "") or "",
@@ -212,6 +219,7 @@ def main() -> None:
                 rt.get("max_launch_attempts_per_day",
                        broker_launcher.DEFAULT_MAX_ATTEMPTS_PER_DAY)
             ),
+            manual=manual,
         )
 
     def token_refresh():
@@ -235,12 +243,40 @@ def main() -> None:
             broker_auth.mark_valid()
         except Exception as e:
             broker_auth.mark_expired(str(e))
+            # アプリの生死で案内を変える。「新しく起動しないでください」と無条件に
+            # 言うと、本当にクラッシュしたとき（2026-08-31）に「何もするな」と
+            # 伝えることになり、終日取引が止まる。
+            # is_running() ではなく probe_running() を使う（確認できなかったことを
+            # 「起動中」と混同しない。前者は起動判断用に安全側へ倒している）。
+            alive = broker_launcher.probe_running()
+            if alive is True:
+                guidance = (
+                    "kabuステーションは起動したまま認証だけが日次で切れます。"
+                    "アプリは起動しているので、新しく起動せず（二重起動になります）、"
+                    "開いている窓でログインしてください。"
+                )
+            elif alive is False:
+                guidance = (
+                    "kabuステーション自体が起動していません。"
+                    "アプリを起動してログインしてください。"
+                )
+            else:
+                guidance = (
+                    "アプリが起動しているかは確認できませんでした。"
+                    "窓が開いていればそこでログインし（二重起動を避けるため"
+                    "新しく起動しない）、開いていなければ起動してください。"
+                )
             alert(
                 "kabuステーションの再ログインが必要です",
-                "APIトークン更新に失敗しました（ログイン認証切れ）。kabuステーションに"
-                "ログインしてください。ログインが済み次第、自動で取引を再開します"
+                "APIトークン更新に失敗しました（ログイン認証切れ）。\n"
+                f"{guidance}\n"
+                "ログインが済み次第、自動で取引を再開します"
                 f"（時間制限なく待ち続けます）。詳細: {e}",
             )
+
+    # プロセス断を知らせるかどうかの判断は broker_watch に置いてある
+    # （休場日・判定不能・再通知間隔・自動起動の有無の分岐をテストできるようにするため）。
+    broker_down = broker_watch.BrokerDownNotifier()
 
     def auth_recovery_check():
         """認証切れの間、定期的に再接続を試みて自動復帰する。
@@ -265,26 +301,45 @@ def main() -> None:
             client.refresh_token,
             on_recovered=_on_recovered,
         )
-        if recovered or not broker_auth.is_expired():
-            return
 
-        # 認証切れが続いている。kabuステーションのプロセス自体が落ちていれば
-        # 起動する（2026-08-31 にアプリがクラッシュし、翌朝まで待機のままだった）。
-        # 認証（2段階認証）は自動化せず、承認は認証アプリで人が行う。
+        # KabuS.exe の生存確認は**認証の状態に関わらず毎回**行う。ここが唯一の
+        # 生存確認であり、場中のクラッシュは接続エラーになるだけで 401 ではない
+        # （kabu_client は401のときだけ mark_expired する）。認証切れの判定の
+        # 後ろに置くと、本来の対象であるクラッシュ復帰に永久に到達しない。
         rt = cfg.get_section("runtime")
-        if not rt.get("auto_launch_broker", True):
-            return
-        if broker_launcher.is_running():
-            return
-        ok, detail = _launch_broker()
-        if ok:
-            alert(
-                "kabuステーションを起動しました",
-                f"{detail}\n認証アプリで承認してください。承認後は自動で取引を再開します。",
-                level=alerts_mod.LEVEL_INFO,
-            )
-        else:
-            logger.info(f"kabuステーションの自動起動は行いませんでした: {detail}")
+        # 既定は False（起動元を人に一本化する運用）。キーが欠けた設定で
+        # 自動起動が黙って復活すると、Windowsの自動起動と競合して二重起動が再発する。
+        auto_launch = bool(rt.get("auto_launch_broker", False))
+        alive = broker_launcher.probe_running()
+        in_window = broker_watch.in_notify_window(clock.now())
+
+        # 通知より先に起動を試す。通知文へ「実際にどうなったか」を載せるため
+        # （先に「試みます」と書くと、起動できなかった事実が隠れる）。
+        # 夜間・休場日に閉じるのは通常の操作なので、通知と同じ窓の中だけで起動する。
+        # 起動するのは、プロセスが見つからず**かつAPIにも到達できない**ときだけ。
+        # tasklist の判定だけを根拠にすると、プロセス名の変更などで誤って False に
+        # なった場合、APIが正常稼働しているのに5分ごとに追加起動してしまう。
+        launch_result = None
+        if alive is False and not recovered and auto_launch and in_window:
+            launch_result = _launch_broker()
+            if launch_result[0]:
+                alert(
+                    "kabuステーションを起動しました",
+                    f"{launch_result[1]}\n認証アプリで承認してください。"
+                    "承認後は自動で取引を再開します。",
+                    level=alerts_mod.LEVEL_INFO,
+                )
+            else:
+                logger.warning(
+                    f"kabuステーションの自動起動は行われませんでした: {launch_result[1]}"
+                )
+
+        notice = broker_down.check(
+            alive=alive, now=time.monotonic(), notify_window=in_window,
+            auto_launch=auto_launch, launch_result=launch_result,
+        )
+        if notice:
+            alert(*notice)
 
     def db_backup():
         try:
@@ -329,7 +384,7 @@ def main() -> None:
 
     def _cmd_launch(_args: str) -> str:
         """kabuステーションを起動する（認証は認証アプリで人が行う）。"""
-        ok, detail = _launch_broker()
+        ok, detail = _launch_broker(manual=True)
         if ok:
             return f"{detail}\n認証アプリで承認してください。承認後は自動で取引を再開します"
         return detail
