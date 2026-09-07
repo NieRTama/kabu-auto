@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -111,6 +112,59 @@ def bridge_stdlib_logging() -> None:
             lg.setLevel(logging.WARNING)
 
 
+def disable_console_quick_edit() -> bool:
+    """Windowsコンソールの「簡易編集モード」を切る。
+
+    戻り値は「**コンソール由来の停止リスクが無い状態か**」。
+    そもそもコンソールを持たない実行（サービス化・出力のリダイレクト・CI）や
+    非Windowsは、止まりようが無いので True を返す。False を返すのは
+    「コンソールはあるのに簡易編集を切れなかった」場合だけで、
+    呼び出し側はそのときだけ警告する（毎回警告すると通知の価値が下がる）。
+
+    簡易編集モードが有効なコンソールは、**窓の中をクリックして選択した瞬間に
+    そこへ出力するプロセスを停止させる**。解除するまで戻らない。
+
+    2026-09-07、これで取引システム全体が約3時間停止した。停止の連鎖はこうなる:
+
+        stop_loss_check が logger.error()
+          → loguru がハンドラのロックを取得
+          → stderr(=コンソール)へ write ……選択中のため戻らない
+          → **ロックを握ったまま**なので、以後ログを出す全スレッドが待機
+          → APScheduler の本体ループも WebSocket も停止
+
+    9:05の朝発注・損切り監視・認証の自動復帰がすべて動かず、実弾を持ったまま
+    無防備になった。**ログを1行出そうとしただけで全機能が止まる**構造だった。
+
+    ここでモードを切っても、右クリックメニューからのコピーは使える。
+    コンソールを持たない実行（サービス化・出力のリダイレクト）や非Windowsでは
+    何もせず False を返す（失敗しても起動を妨げない）。
+    """
+    if os.name != "nt":
+        return True                 # 非Windowsはこの停止の仕方をしない
+    try:
+        import ctypes
+
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        # QuickEdit を落とすときは EXTENDED_FLAGS を必ず立てる必要がある
+        # （立てないと SetConsoleMode がマウス関連ビットを無視する）。
+        ENABLE_EXTENDED_FLAGS = 0x0080
+
+        k32 = ctypes.windll.kernel32
+        handle = k32.GetStdHandle(STD_INPUT_HANDLE)
+        if handle == 0 or handle == -1:
+            return True             # コンソールが無い＝止まりようが無い
+        mode = ctypes.c_uint32()
+        if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return True             # コンソールが無い（リダイレクト等）
+        if not mode.value & ENABLE_QUICK_EDIT_MODE:
+            return True             # 既に無効
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        return bool(k32.SetConsoleMode(handle, new_mode))
+    except Exception:
+        return False                # 失敗しても起動は続ける
+
+
 def dated_log_path(log_file: str, tag: str = "") -> str:
     """設定されたログパスのファイル名末尾に日付（と任意のタグ）を入れたパターンを返す。
 
@@ -142,7 +196,16 @@ def setup() -> None:
     # （Knowledge.md 12章「機密情報の扱い」）。例外の型・発生箇所は残るので調査には困らない。
     _no_leak = {"diagnose": False}
 
-    logger.add(sys.stderr, level=level, colorize=True, **_no_leak,
+    # コンソールの簡易編集モードを切る（クリック選択による停止を防ぐ。上の関数を参照）
+    quick_edit_disabled = disable_console_quick_edit()
+
+    # enqueue=True は**必須**。コンソールへの書き込みは詰まることがあり
+    # （簡易編集モードでの選択・Ctrl+S・端末側の停止）、同期のままだと
+    # loguru のハンドラロックを握ったまま止まって**アプリ全体が凍結**する
+    # （2026-09-07 に約3時間停止。上の disable_console_quick_edit() 参照）。
+    # enqueue にすると書き込みは専用スレッドへ渡され、詰まっても呼び出し側は進む。
+    # 簡易編集モードを切っただけでは Ctrl+S 等の別経路が残るため、両方入れる。
+    logger.add(sys.stderr, level=level, colorize=True, enqueue=True, **_no_leak,
                format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level:<8}</level> | {message}")
 
     # ログは1日単位で区切り（毎日0時にローテーション）、ファイル名末尾に日付を付与する。
@@ -182,3 +245,10 @@ def setup() -> None:
     bridge_stdlib_logging()
 
     logger.info("Logger initialized")
+    if not quick_edit_disabled:
+        # 切れなかった場合は、コンソールをクリックすると止まる危険が残る。
+        # 黙って進むと「なぜか固まる」の再来になるので、起動時に一度だけ知らせる。
+        logger.warning(
+            "コンソールの簡易編集モードを無効化できませんでした。"
+            "窓の中をクリックして選択すると出力が止まります（Escapeで解除）"
+        )

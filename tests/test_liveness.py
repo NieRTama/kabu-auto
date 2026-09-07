@@ -78,6 +78,7 @@ class TestClientMarksOnSuccess:
             cfg_mock.get_section.return_value = {"base_url": "http://x/kabusapi"}
             client = mod.KabuClient()
         resp = MagicMock()
+        resp.status_code = 200   # 実物は int。素のMagicMockだと比較が常に真になる
         resp.json.return_value = {"CurrentPrice": 100}
         with patch.object(mod.requests, "request", return_value=resp), \
              patch.object(mod.time, "monotonic", return_value=777.0):
@@ -90,8 +91,12 @@ class TestClientMarksOnSuccess:
         with patch.object(mod, "cfg") as cfg_mock:
             cfg_mock.get_section.return_value = {"base_url": "http://x/kabusapi"}
             client = mod.KabuClient()
+        # HTTPステータス自体は正常でも、後段で失敗すれば印は付けない
+        # （このテストの関心は「例外が出たら mark_alive しない」ことなので、
+        #   ステータスコードの経路とは独立に固定する）
         resp = MagicMock()
-        resp.raise_for_status.side_effect = RuntimeError("401")
+        resp.status_code = 200
+        resp.raise_for_status.side_effect = RuntimeError("boom")
         with patch.object(mod.requests, "request", return_value=resp):
             with pytest.raises(RuntimeError):
                 client.get_board("7203")

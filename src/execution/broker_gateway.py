@@ -17,7 +17,7 @@ from src.api.kabu_client import KabuClient
 from src.core import config as cfg
 from src.execution.broker_constants import (
     AccountType, CashMargin, DelivType, Exchange, FrontOrderType,
-    FUND_TYPE_DEFAULT, SecurityType, Side,
+    FUND_TYPE_BUY, FUND_TYPE_SELL, SecurityType, Side,
 )
 
 
@@ -35,7 +35,9 @@ class BrokerGateway:
             "Side": side.value,
             "CashMargin": CashMargin.CASH.value,
             "DelivType": DelivType.AUTO.value,
-            "FundType": FUND_TYPE_DEFAULT,
+            # 預り区分は売買で値が違う。共通の値を使うと現物買いが
+            # 「預り区分が未設定です」(Code 1010004) で拒否される（2026-09-07 に発生）。
+            "FundType": FUND_TYPE_BUY if side is Side.BUY else FUND_TYPE_SELL,
             "AccountType": AccountType.SPECIFIC.value,
             "Qty": quantity,
             "ExpireDay": 0,  # 当日中

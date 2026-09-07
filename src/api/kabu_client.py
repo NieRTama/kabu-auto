@@ -68,8 +68,33 @@ class KabuClient:
         )
         if resp.status_code == 401:
             broker_auth.mark_expired(f"{method} {path} が401を返しました")
+        if resp.status_code >= 400:
+            # kabuステーションは失敗理由を**本文**に入れて返す
+            # （例: {"Code":1010004,"Message":"預り区分が未設定です。"}）。
+            # raise_for_status() の例外文はステータス行だけで本文を含まないため、
+            # そのままだとログに「400 Bad Request」としか残らず原因が分からない。
+            # 2026-09-07 の発注拒否は、kabuステーション側のログを見るまで特定できなかった。
+            # 本文は最大200字だけ載せる（注文内容が長くログを埋めないように）。
+            raise requests.HTTPError(
+                f"{resp.status_code} {resp.reason} for {method} {path}: "
+                f"{self._error_detail(resp)}",
+                response=resp,
+            )
         resp.raise_for_status()
         return resp
+
+    @staticmethod
+    def _error_detail(resp: requests.Response) -> str:
+        """エラー応答から原因を1行で取り出す（本文が壊れていても落ちない）。"""
+        try:
+            body = resp.json()
+        except Exception:
+            return (resp.text or "")[:200]
+        if isinstance(body, dict):
+            code, msg = body.get("Code"), body.get("Message")
+            if msg:
+                return f"Code={code} {msg}" if code is not None else str(msg)
+        return str(body)[:200]
 
     # ─── REST API ────────────────────────────────────────
 

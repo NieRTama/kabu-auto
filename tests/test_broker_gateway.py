@@ -43,6 +43,34 @@ class TestPayloads:
         assert sent["FrontOrderType"] == 10
         assert sent["Price"] == 0
 
+
+class TestFundType:
+    """預り区分は売買で値が違う（2026-09-07 の発注拒否の回帰防止）。
+
+    システムとして初めて出した現物買いが
+    `{"Code":1010004,"Message":"預り区分が未設定です。"}` で拒否された。
+    売買共通で "  "（空白2文字）を送っていたが、これは**現物売でのみ有効**な値。
+    買いが一度も成立していなかったため2か月以上露見しなかった。
+    """
+
+    def test_buy_specifies_custody(self, gw):
+        gateway, client = gw
+        gateway.send_buy_limit("2157", 1006.0, 200)
+        sent = client.send_order.call_args[0][0]
+        assert sent["FundType"] == "02", "現物買いは預り区分（保護預り）を明示する"
+        assert sent["FundType"].strip() != "", "空白は現物売用の値。買いでは拒否される"
+
+    @pytest.mark.parametrize("call", [
+        lambda g: g.send_sell_limit("7203", 1100.0, 100),
+        lambda g: g.send_sell_market("7203", 100),
+        lambda g: g.send_stop_loss_market("7203", 100, 900.0),
+    ])
+    def test_sell_keeps_blank_custody(self, gw, call):
+        """売りは空白2文字のまま（買いに合わせて変えると今度は売りが壊れる）"""
+        gateway, client = gw
+        call(gateway)
+        assert client.send_order.call_args[0][0]["FundType"] == "  "
+
     def test_stop_loss_payload(self, gw):
         gateway, client = gw
         gateway.send_stop_loss_market("7203", 100, 950.0)

@@ -37,8 +37,13 @@ def _client():
 
 
 def _response(status: int, payload=None):
+    # spec=requests.Response には reason / text が含まれない（クラス属性ではなく
+    # __init__ で設定されるインスタンス属性のため）。実物に合わせて明示的に持たせる。
     resp = MagicMock(spec=requests.Response)
     resp.status_code = status
+    resp.reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized",
+                   500: "Server Error"}.get(status, "")
+    resp.text = ""
     resp.json.return_value = payload if payload is not None else {}
     if status >= 400:
         resp.raise_for_status.side_effect = requests.HTTPError(f"{status} Client Error")
@@ -97,6 +102,35 @@ class TestOtherOutcomesDoNotMarkExpired:
             with pytest.raises(requests.HTTPError):
                 c.get_positions()
         assert broker_auth.is_expired() is False
+
+    def test_error_body_is_included_in_exception(self):
+        """失敗理由（本文）を例外文に載せる（2026-09-07 の調査不能の回帰防止）。
+
+        kabuステーションは理由を本文に入れて返すが、raise_for_status() の例外文は
+        ステータス行だけで本文を含まない。そのためログに「400 Bad Request」としか
+        残らず、発注が拒否された原因をkabuステーション側のログを読むまで特定できなかった。
+        """
+        c = _client()
+        resp = _response(400, {"Code": 1010004, "Message": "預り区分が未設定です。"})
+        with patch.object(mod.requests, "request", return_value=resp):
+            with pytest.raises(requests.HTTPError) as ei:
+                c.send_order({"Symbol": "2157"})
+        text = str(ei.value)
+        assert "1010004" in text
+        assert "預り区分" in text
+
+    def test_error_body_that_is_not_json_is_tolerated(self):
+        """本文がJSONでなくても落ちない（調査用の情報取得で例外を出さない）"""
+        c = _client()
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 500
+        resp.reason = "Server Error"
+        resp.json.side_effect = ValueError("not json")
+        resp.text = "<html>error</html>"
+        with patch.object(mod.requests, "request", return_value=resp):
+            with pytest.raises(requests.HTTPError) as ei:
+                c.get_positions()
+        assert "html" in str(ei.value)
 
     def test_connection_error_is_not_auth_expiry(self):
         """kabuステーション未起動（接続不可）は broker_wait / preflight の担当"""

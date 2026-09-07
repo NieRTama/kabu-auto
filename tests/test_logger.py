@@ -134,3 +134,90 @@ class TestActualLevelSplitBehavior:
             assert "info message" not in warn_content
         finally:
             loguru_logger.remove()
+
+
+class TestConsoleBlockingProtection:
+    """コンソールへの書き込みでアプリ全体が凍結しないこと（2026-09-07 の実害）。
+
+    Windowsコンソールの簡易編集モードは、窓の中をクリックして選択した瞬間に
+    そこへ出力するプロセスを止める。loguru はハンドラのロックを握ったまま
+    stderr へ書くため、**ログを1行出そうとしただけで全スレッドが停止**した。
+    py-spy のスタックでは stop_loss_check → logger.error → StreamSink.write で
+    止まり、APScheduler の本体ループも WebSocket もロック待ちになっていた。
+    実際に約3時間停止し、朝の発注・損切り監視・認証復帰がすべて動かなかった。
+    """
+
+    def _stderr_kwargs(self, tmp_path):
+        """setup() が stderr シンクへ渡した引数を取り出す。"""
+        import sys
+        captured = {}
+
+        def fake_add(sink, **kwargs):
+            if sink is sys.stderr:
+                captured.update(kwargs)
+            return 1
+
+        conf = {"logging": {"level": "INFO", "file": str(tmp_path / "kabu_auto.log")}}
+        with patch.object(log_setup.cfg, "get_section", lambda s: conf.get(s, {})):
+            with patch.object(log_setup.logger, "add", side_effect=fake_add), \
+                 patch.object(log_setup.logger, "remove"), \
+                 patch.object(log_setup.logger, "info"), \
+                 patch.object(log_setup.logger, "warning"), \
+                 patch.object(log_setup, "disable_console_quick_edit", return_value=True):
+                log_setup.setup()
+        return captured
+
+    def test_stderr_sink_is_enqueued(self, tmp_path):
+        """コンソールが詰まっても呼び出し側を止めない（専用スレッドへ逃がす）"""
+        assert self._stderr_kwargs(tmp_path).get("enqueue") is True
+
+    def test_setup_disables_quick_edit(self, tmp_path):
+        """起動時に簡易編集モードを切りにいくこと（結線の検証）"""
+        conf = {"logging": {"level": "INFO", "file": str(tmp_path / "kabu_auto.log")}}
+        with patch.object(log_setup.cfg, "get_section", lambda s: conf.get(s, {})):
+            with patch.object(log_setup.logger, "add", return_value=1), \
+                 patch.object(log_setup.logger, "remove"), \
+                 patch.object(log_setup.logger, "info"), \
+                 patch.object(log_setup.logger, "warning"), \
+                 patch.object(log_setup, "disable_console_quick_edit",
+                              return_value=True) as m:
+                log_setup.setup()
+        m.assert_called_once()
+
+    def test_warns_when_quick_edit_cannot_be_disabled(self, tmp_path):
+        """切れなかったら黙らない（「なぜか固まる」の再来を防ぐ）"""
+        conf = {"logging": {"level": "INFO", "file": str(tmp_path / "kabu_auto.log")}}
+        with patch.object(log_setup.cfg, "get_section", lambda s: conf.get(s, {})):
+            with patch.object(log_setup.logger, "add", return_value=1), \
+                 patch.object(log_setup.logger, "remove"), \
+                 patch.object(log_setup.logger, "info"), \
+                 patch.object(log_setup.logger, "warning") as warn, \
+                 patch.object(log_setup, "disable_console_quick_edit", return_value=False):
+                log_setup.setup()
+        assert warn.called
+        assert "簡易編集" in warn.call_args[0][0]
+
+
+class TestDisableConsoleQuickEdit:
+    """戻り値は「コンソール由来の停止リスクが無い状態か」。
+
+    コンソールを持たない実行（サービス化・リダイレクト・CI）を False にすると、
+    毎起動で警告が出て error_rate に積まれ、通知の価値を下げる。
+    """
+
+    def test_never_raises_without_console(self):
+        assert log_setup.disable_console_quick_edit() in (True, False)
+
+    def test_true_on_non_windows(self):
+        """非Windowsはこの止まり方をしないのでリスク無し扱い"""
+        with patch.object(log_setup.os, "name", "posix"):
+            assert log_setup.disable_console_quick_edit() is True
+
+    def test_returns_false_when_api_fails(self):
+        """Windows APIが失敗しても例外を出さない"""
+        import ctypes
+        if log_setup.os.name != "nt":
+            return
+        with patch.object(ctypes, "windll", create=True) as w:
+            w.kernel32.GetStdHandle.side_effect = OSError("boom")
+            assert log_setup.disable_console_quick_edit() is False
