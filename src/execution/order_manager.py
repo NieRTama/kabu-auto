@@ -20,7 +20,7 @@ from src.core import clock
 from src.core import config as cfg
 from src.core import halt
 from src.core import trading_mode as tm
-from src.core.alerts import alert
+from src.core.alerts import LEVEL_INFO, alert
 from src.data.database import Fill, OrderApproval, OrderIntent, Position, Trade, get_session
 from src.data.market_data import latest_closes
 from src.execution import lots
@@ -366,6 +366,26 @@ class OrderManager:
 
         return self._live_buy(symbol, price, quantity, sector, rationale, source=source)
 
+    def _record_rejected(self, symbol: str, side: str, quantity: int, price: float,
+                         order_type: str, detail: str, *,
+                         sector: Optional[str] = None,
+                         intent_id: Optional[int] = None,
+                         source: str = "manual") -> None:
+        """発注が拒否された（またはHTTPエラーで例外になった）ことをTradeへ記録する。
+
+        2026-09-08 に判明: HTTP 4xx/5xx で例外になる拒否（Code=100031/100378等）は
+        `is_accepted()` の判定に到達せず、ログにしか残らなかった。実際に本日拒否された
+        3件が DB に一切記録されておらず、取引履歴・ダッシュボードから
+        「発注を試みて失敗した」事実が消えていた。HTTP 200 だが Result≠0 の拒否と
+        同じ経路へ揃え、原因（detail）を rationale に残す。
+        """
+        self._record_trade(
+            f"REJECTED-{symbol}-{uuid.uuid4().hex[:8]}", symbol, side,
+            quantity, price, status=st.REJECTED, sector=sector,
+            rationale=f"発注失敗: {detail}",
+            intent_id=intent_id, source=source, order_type=order_type,
+        )
+
     def _live_buy(self, symbol: str, price: float, quantity: int,
                   sector: Optional[str] = None, rationale: Optional[str] = None, *,
                   intent_id: Optional[int] = None, source: str = "manual") -> Optional[str]:
@@ -376,29 +396,31 @@ class OrderManager:
         """
         try:
             result = self._broker.send_buy_limit(symbol, price, quantity)
-            if not self._broker.is_accepted(result):
-                logger.error(
-                    f"買い注文拒否: {symbol} Result={result.get('Result')} "
-                    f"Message={result.get('Message', '')}"
-                )
-                self._record_trade(
-                    f"REJECTED-{symbol}-{uuid.uuid4().hex[:8]}", symbol, "BUY",
-                    quantity, price, status=st.REJECTED, sector=sector,
-                    intent_id=intent_id, source=source, order_type="LIMIT",
-                )
-                return None
-            order_id = self._broker.order_id_of(result)
-            if not order_id:
-                return None
-            self._risk.increment_order_count()
-            self._record_trade(order_id, symbol, "BUY", quantity, price, sector=sector,
-                               rationale=rationale, intent_id=intent_id, source=source,
-                               order_type="LIMIT")
-            self._set_cancel_timer(order_id)
-            return order_id
         except Exception as e:
             logger.error(f"買い注文失敗: {symbol} {e}")
+            self._record_rejected(symbol, "BUY", quantity, price, "LIMIT", str(e),
+                                  sector=sector, intent_id=intent_id, source=source)
             return None
+        if not self._broker.is_accepted(result):
+            logger.error(
+                f"買い注文拒否: {symbol} Result={result.get('Result')} "
+                f"Message={result.get('Message', '')}"
+            )
+            self._record_rejected(
+                symbol, "BUY", quantity, price, "LIMIT",
+                f"Result={result.get('Result')} {result.get('Message', '')}",
+                sector=sector, intent_id=intent_id, source=source,
+            )
+            return None
+        order_id = self._broker.order_id_of(result)
+        if not order_id:
+            return None
+        self._risk.increment_order_count()
+        self._record_trade(order_id, symbol, "BUY", quantity, price, sector=sector,
+                           rationale=rationale, intent_id=intent_id, source=source,
+                           order_type="LIMIT")
+        self._set_cancel_timer(order_id)
+        return order_id
 
     def sell(self, symbol: str, price: float, quantity: int,
              rationale: Optional[str] = None, source: str = "manual") -> Optional[str]:
@@ -442,28 +464,30 @@ class OrderManager:
         """実APIへ指値売りを送る（live / semi_live承認実行の共通実体）。"""
         try:
             result = self._broker.send_sell_limit(symbol, price, quantity)
-            if not self._broker.is_accepted(result):
-                logger.error(
-                    f"売り注文拒否: {symbol} Result={result.get('Result')} "
-                    f"Message={result.get('Message', '')}"
-                )
-                self._record_trade(
-                    f"REJECTED-{symbol}-{uuid.uuid4().hex[:8]}", symbol, "SELL",
-                    quantity, price, status=st.REJECTED,
-                    intent_id=intent_id, source=source, order_type="LIMIT",
-                )
-                return None
-            order_id = self._broker.order_id_of(result)
-            if not order_id:
-                return None
-            self._risk.increment_order_count()
-            self._record_trade(order_id, symbol, "SELL", quantity, price, rationale=rationale,
-                               intent_id=intent_id, source=source, order_type="LIMIT")
-            self._set_cancel_timer(order_id)
-            return order_id
         except Exception as e:
             logger.error(f"売り注文失敗: {symbol} {e}")
+            self._record_rejected(symbol, "SELL", quantity, price, "LIMIT", str(e),
+                                  intent_id=intent_id, source=source)
             return None
+        if not self._broker.is_accepted(result):
+            logger.error(
+                f"売り注文拒否: {symbol} Result={result.get('Result')} "
+                f"Message={result.get('Message', '')}"
+            )
+            self._record_rejected(
+                symbol, "SELL", quantity, price, "LIMIT",
+                f"Result={result.get('Result')} {result.get('Message', '')}",
+                intent_id=intent_id, source=source,
+            )
+            return None
+        order_id = self._broker.order_id_of(result)
+        if not order_id:
+            return None
+        self._risk.increment_order_count()
+        self._record_trade(order_id, symbol, "SELL", quantity, price, rationale=rationale,
+                           intent_id=intent_id, source=source, order_type="LIMIT")
+        self._set_cancel_timer(order_id)
+        return order_id
 
     def sell_market(self, symbol: str, quantity: int, reason: str = "normal",
                     rationale: Optional[str] = None) -> Optional[str]:
@@ -557,29 +581,31 @@ class OrderManager:
         """実APIへ成行売りを送る（live / semi_live退出・承認実行の共通実体）。"""
         try:
             result = self._broker.send_sell_market(symbol, quantity)
-            if not self._broker.is_accepted(result):
-                logger.error(
-                    f"成行売り注文拒否: {symbol} Result={result.get('Result')} "
-                    f"Message={result.get('Message', '')}"
-                )
-                self._record_trade(
-                    f"REJECTED-{symbol}-{uuid.uuid4().hex[:8]}", symbol, "SELL",
-                    quantity, 0.0, status=st.REJECTED,
-                    intent_id=intent_id, source=source, order_type="MARKET",
-                )
-                return None
-            order_id = self._broker.order_id_of(result)
-            if not order_id:
-                return None
-            self._risk.increment_order_count()
-            # 成行は発注時に価格未確定。price=0 で記録し、約定時に filled_price で確定する
-            self._record_trade(order_id, symbol, "SELL", quantity, 0.0, rationale=rationale,
-                               intent_id=intent_id, source=source, order_type="MARKET")
-            self._set_cancel_timer(order_id)
-            return order_id
         except Exception as e:
             logger.error(f"成行売り注文失敗: {symbol} {e}")
+            self._record_rejected(symbol, "SELL", quantity, 0.0, "MARKET", str(e),
+                                  intent_id=intent_id, source=source)
             return None
+        if not self._broker.is_accepted(result):
+            logger.error(
+                f"成行売り注文拒否: {symbol} Result={result.get('Result')} "
+                f"Message={result.get('Message', '')}"
+            )
+            self._record_rejected(
+                symbol, "SELL", quantity, 0.0, "MARKET",
+                f"Result={result.get('Result')} {result.get('Message', '')}",
+                intent_id=intent_id, source=source,
+            )
+            return None
+        order_id = self._broker.order_id_of(result)
+        if not order_id:
+            return None
+        self._risk.increment_order_count()
+        # 成行は発注時に価格未確定。price=0 で記録し、約定時に filled_price で確定する
+        self._record_trade(order_id, symbol, "SELL", quantity, 0.0, rationale=rationale,
+                           intent_id=intent_id, source=source, order_type="MARKET")
+        self._set_cancel_timer(order_id)
+        return order_id
 
     def place_stop_loss(self, symbol: str, quantity: int,
                         trigger_price: float) -> Optional[str]:
@@ -607,29 +633,36 @@ class OrderManager:
 
         try:
             result = self._broker.send_stop_loss_market(symbol, quantity, trigger_price)
-            if not self._broker.is_accepted(result):
-                logger.error(
-                    f"逆指値ストップ注文拒否: {symbol} Result={result.get('Result')} "
-                    f"Message={result.get('Message', '')}"
-                )
-                return None
-            order_id = self._broker.order_id_of(result)
-            if not order_id:
-                return None
-            self._risk.increment_order_count()
-            # ストップは発動まで生かすためタイムアウトキャンセルは設定しない
-            self._record_trade(
-                order_id, symbol, "SELL", quantity, 0.0,
-                rationale=f"ブローカー側逆指値ストップ トリガー@{trigger_price:.0f}（成行）",
-                source="broker_stop", order_type="STOP",
-            )
-            logger.warning(
-                f"ブローカー側逆指値ストップ発注: {symbol} {quantity}株 トリガー@{trigger_price:.0f}"
-            )
-            return order_id
         except Exception as e:
             logger.error(f"逆指値ストップ注文失敗: {symbol} {e}")
+            self._record_rejected(symbol, "SELL", quantity, 0.0, "STOP", str(e),
+                                  source="broker_stop")
             return None
+        if not self._broker.is_accepted(result):
+            logger.error(
+                f"逆指値ストップ注文拒否: {symbol} Result={result.get('Result')} "
+                f"Message={result.get('Message', '')}"
+            )
+            self._record_rejected(
+                symbol, "SELL", quantity, 0.0, "STOP",
+                f"Result={result.get('Result')} {result.get('Message', '')}",
+                source="broker_stop",
+            )
+            return None
+        order_id = self._broker.order_id_of(result)
+        if not order_id:
+            return None
+        self._risk.increment_order_count()
+        # ストップは発動まで生かすためタイムアウトキャンセルは設定しない
+        self._record_trade(
+            order_id, symbol, "SELL", quantity, 0.0,
+            rationale=f"ブローカー側逆指値ストップ トリガー@{trigger_price:.0f}（成行）",
+            source="broker_stop", order_type="STOP",
+        )
+        logger.warning(
+            f"ブローカー側逆指値ストップ発注: {symbol} {quantity}株 トリガー@{trigger_price:.0f}"
+        )
+        return order_id
 
     def close_all_positions(self) -> None:
         """全ポジションを成行で強制決済する（緊急用）。
@@ -641,6 +674,11 @@ class OrderManager:
         /positions 取得自体に失敗した場合は実口座の状態を把握できないため、当てずっぽうで
         DBに基づいた自動決済はせず、critical alert を出して人手確認に委ねる（fail-closed）。
         ペーパー/dry_runは実ブローカーが無いためDBを正本のまま使う。
+
+        銘柄ごとの成否を集計し、1件でも失敗があれば🔴で通知する（2026-09-08 に発覚：
+        `sell_market()` の戻り値を見ておらず、拒否されても「実行しました」というログ
+        だけで完了扱いになっていた。**最も緊急性の高い操作で、失敗が一番見えにくい**
+        という組み合わせだった）。
         """
         logger.warning("緊急全ポジション決済を実行します")
         if self._is_paper or self._mode == tm.DRY_RUN:
@@ -648,11 +686,15 @@ class OrderManager:
                 positions = session.scalars(
                     select(Position).where(Position.quantity > 0)
                 ).all()
+            succeeded, failed = [], []
             for pos in positions:
                 try:
-                    self.sell_market(pos.symbol, pos.quantity, reason="emergency")
+                    order_id = self.sell_market(pos.symbol, pos.quantity, reason="emergency")
+                    (succeeded if order_id else failed).append(pos.symbol)
                 except Exception as e:
                     logger.error(f"緊急決済失敗: {pos.symbol} {e}")
+                    failed.append(pos.symbol)
+            self._report_close_all_result(succeeded, failed)
             return
 
         try:
@@ -666,18 +708,43 @@ class OrderManager:
             )
             return
 
+        succeeded, failed = [], []
         for pos in broker_positions:
+            symbol = pos.get("Symbol")
             try:
-                symbol = pos.get("Symbol")
                 leaves_qty = int(pos.get("LeavesQty") or 0)
                 if not symbol or leaves_qty <= 0:
                     continue
                 # sell_market(reason="emergency") は送信前に同銘柄の未約定注文を
                 # 先にキャンセルする（成立すれば HoldQty による引当は解放されるため、
                 # ここでは LeavesQty=実保有数量をそのまま渡せばよい）
-                self.sell_market(symbol, leaves_qty, reason="emergency")
+                order_id = self.sell_market(symbol, leaves_qty, reason="emergency")
+                (succeeded if order_id else failed).append(symbol)
             except Exception as e:
                 logger.error(f"緊急決済失敗: {pos} {e}")
+                failed.append(symbol or str(pos))
+        self._report_close_all_result(succeeded, failed)
+
+    @staticmethod
+    def _report_close_all_result(succeeded: list, failed: list) -> None:
+        """緊急全決済の結果を集計して通知する（close_all_positions から分離）。"""
+        if not succeeded and not failed:
+            logger.info("緊急全ポジション決済: 対象銘柄がありませんでした")
+            return
+        if failed:
+            logger.critical(
+                f"緊急全ポジション決済: 成功{len(succeeded)}件 失敗{len(failed)}件 "
+                f"失敗銘柄={failed}"
+            )
+            alert(
+                "緊急全ポジション決済に失敗した銘柄があります（要確認）",
+                f"成功 {len(succeeded)}件 / 失敗 {len(failed)}件: {', '.join(failed)}。"
+                "証券会社の画面で建玉を直接確認し、必要なら手動で決済してください",
+            )
+        else:
+            logger.info(f"緊急全ポジション決済: 全{len(succeeded)}件成功")
+            alert("緊急全ポジション決済 完了", f"{len(succeeded)}銘柄を決済しました",
+                  level=LEVEL_INFO)
 
     def cancel_all_pending_buys(self) -> int:
         """未約定のBUY注文をすべてキャンセルする（kill switch 作動時の新規建玉防止）。
