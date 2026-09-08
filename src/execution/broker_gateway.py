@@ -34,9 +34,13 @@ class BrokerGateway:
             "SecurityType": SecurityType.STOCK.value,
             "Side": side.value,
             "CashMargin": CashMargin.CASH.value,
-            "DelivType": DelivType.AUTO.value,
-            # 預り区分は売買で値が違う。共通の値を使うと現物買いが
-            # 「預り区分が未設定です」(Code 1010004) で拒否される（2026-09-07 に発生）。
+            # 受渡区分・資産区分はどちらも**売買で値が違う**。共通の値にすると
+            # 片方だけ通らない状態になり、しかもエラー文言が原因を指さない。
+            #   2026-09-07 買い: FundType="  " → Code 1010004「預り区分が未設定です」
+            #   2026-09-08 売り: DelivType=2   → Code 100378「指定された市場でのお取引は…」
+            # 売りのエラーは「市場」を指すため、受渡区分が原因とは読み取れなかった。
+            "DelivType": (DelivType.DEPOSIT if side is Side.BUY
+                          else DelivType.UNSPECIFIED).value,
             "FundType": FUND_TYPE_BUY if side is Side.BUY else FUND_TYPE_SELL,
             "AccountType": AccountType.SPECIFIC.value,
             "Qty": quantity,

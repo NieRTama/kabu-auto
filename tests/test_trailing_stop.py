@@ -195,3 +195,62 @@ class TestStopLossCheckWiring:
         order_mgr.sell_market.assert_called_once_with("7203", 100, reason="trailing_stop")
         title = alert_mock.call_args[0][0]
         assert "トレーリングストップ" in title
+
+
+class TestExitOrderRejected:
+    """退出注文が拒否されたときに「実行」と通知しないこと（2026-09-08 の実害）。
+
+    9432 のトレーリングストップが発動し成行売りを出したが Code 100378 で拒否された。
+    ところが `sell_market()` の戻り値を見ずに通知していたため
+    🟢「利益確定（トレーリングストップ）実行: 9432 @168円」が飛んだ。
+    **売れたと誤認したまま、無防備な建玉を持ち続ける**のが実害。
+    """
+
+    def _run_with_result(self, order_id, exit_reason="trailing_stop"):
+        client, risk, order_mgr = MagicMock(), MagicMock(), MagicMock()
+        risk.evaluate_exit.return_value = (True, exit_reason)
+        order_mgr.sell_market.return_value = order_id
+        with patch("src.services.trading.cfg") as cfg_mock:
+            cfg_mock.get_section.return_value = {"mode": "paper"}
+            svc = TradingServices(client, risk, order_mgr)
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
+             patch("src.services.trading.watchlist_store") as watchlist_mock, \
+             patch("src.services.trading._get_position_qty", return_value=100), \
+             patch("src.services.trading.load_ohlcv") as load_ohlcv_mock, \
+             patch("src.services.trading.alert") as alert_mock:
+            watchlist_mock.get_codes.return_value = ["7203"]
+            df_mock = MagicMock()
+            df_mock.__len__.return_value = 1
+            df_mock.__getitem__.return_value.iloc.__getitem__.return_value = 1100.0
+            load_ohlcv_mock.return_value = df_mock
+            svc.stop_loss_check()
+            return alert_mock
+
+    def test_rejected_order_does_not_report_success(self):
+        alert_mock = self._run_with_result(order_id=None)
+        title = alert_mock.call_args[0][0]
+        assert "実行" not in title, f"拒否されたのに実行と通知している: {title}"
+        assert "失敗" in title
+
+    def test_rejected_order_says_position_remains(self):
+        """建玉が残っていることを本文で明示する（手当てが必要だと分かるように）"""
+        alert_mock = self._run_with_result(order_id=None)
+        title, body = alert_mock.call_args[0][0], alert_mock.call_args[0][1]
+        assert "建玉は残っています" in title
+        assert "手動" in body
+
+    def test_rejected_order_is_critical(self):
+        """退出できないのは損失に直結するので🔴（既定=critical）で送る"""
+        alert_mock = self._run_with_result(order_id=None)
+        assert "level" not in alert_mock.call_args.kwargs, "既定のcriticalで送る"
+
+    def test_successful_order_still_reports_execution(self):
+        """成功時は従来どおり🟢「実行」（失敗検知のために成功側を壊さない）"""
+        alert_mock = self._run_with_result(order_id="OID-1")
+        assert "実行" in alert_mock.call_args[0][0]
+        assert alert_mock.call_args.kwargs.get("level") == "info"
+
+    def test_stop_loss_failure_is_also_reported(self):
+        alert_mock = self._run_with_result(order_id=None, exit_reason="stop_loss")
+        title = alert_mock.call_args[0][0]
+        assert "損切り" in title and "失敗" in title

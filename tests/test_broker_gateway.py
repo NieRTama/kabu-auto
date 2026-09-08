@@ -71,6 +71,43 @@ class TestFundType:
         call(gateway)
         assert client.send_order.call_args[0][0]["FundType"] == "  "
 
+
+class TestDelivType:
+    """受渡区分も売買で値が違う（2026-09-08 の退出失敗の回帰防止）。
+
+    トレーリングストップが発動して 9432 を成行売りしようとしたが
+    `{"Code":100378,"Message":"指定された市場でのお取引はお受けできません。"}`
+    で拒否された。売買共通で 2（お預り金）を送っていたが**現物売は 0（指定なし）**。
+    エラー文言が「市場」を指すため、受渡区分が原因とは読み取れなかった。
+
+    退出が通らないのは損失に直結する（建玉を切れない）ため、売り側を特に固定する。
+    """
+
+    def test_buy_uses_deposit(self, gw):
+        gateway, client = gw
+        gateway.send_buy_limit("7203", 1000.0, 100)
+        assert client.send_order.call_args[0][0]["DelivType"] == 2
+
+    @pytest.mark.parametrize("call", [
+        lambda g: g.send_sell_limit("7203", 1100.0, 100),
+        lambda g: g.send_sell_market("7203", 100),
+        lambda g: g.send_stop_loss_market("7203", 100, 900.0),
+    ])
+    def test_sell_uses_unspecified(self, gw, call):
+        """成行・指値・逆指値のどの退出経路でも 0 であること"""
+        gateway, client = gw
+        call(gateway)
+        assert client.send_order.call_args[0][0]["DelivType"] == 0
+
+    def test_constant_names_match_actual_values(self):
+        """旧実装は `AUTO = 2  # 自動振替` で名前もコメントも誤っていた。
+        2 は「お預り金」、自動振替は 1。名前で選ぶと間違うので値を固定する。
+        """
+        from src.execution.broker_constants import DelivType
+        assert DelivType.UNSPECIFIED.value == 0
+        assert DelivType.AUTO.value == 1
+        assert DelivType.DEPOSIT.value == 2
+
     def test_stop_loss_payload(self, gw):
         gateway, client = gw
         gateway.send_stop_loss_market("7203", 100, 950.0)

@@ -293,9 +293,20 @@ class TradingServices:
                     # 損切り・トレーリングストップとも確実な約定を優先し成行で発注する
                     # （指値だと急変時に約定しない）。reason経由で日次上限・損失上限等の
                     # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
-                    self.order_mgr.sell_market(sym, qty, reason=exit_reason)
-                    title = "利益確定（トレーリングストップ）実行" if exit_reason == "trailing_stop" else "損切り実行"
-                    alert(title, f"{sym} @{price:.0f}円", level=LEVEL_INFO)
+                    order_id = self.order_mgr.sell_market(sym, qty, reason=exit_reason)
+                    label = "利益確定（トレーリングストップ）" if exit_reason == "trailing_stop" else "損切り"
+                    if order_id:
+                        alert(f"{label}実行", f"{sym} @{price:.0f}円", level=LEVEL_INFO)
+                    else:
+                        # 発注が拒否されても「実行」と通知していた（2026-09-08 に発生）。
+                        # 9432 の利確が Code 100378 で失敗したのに🟢が飛び、
+                        # **売れたと誤認したまま無防備な建玉を持ち続ける**状態になった。
+                        # 退出できないのは損失に直結するので critical で知らせる。
+                        alert(
+                            f"{label}に失敗しました（建玉は残っています）",
+                            f"{sym} {qty}株 @{price:.0f}円 の退出注文が拒否されました。"
+                            "ログを確認し、必要なら証券会社の画面から手動で決済してください。",
+                        )
             except Exception as e:
                 logger.error(f"損切りチェックエラー: {sym} {e}")
 
