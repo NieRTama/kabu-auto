@@ -54,10 +54,16 @@ class TestFundType:
     """
 
     def test_buy_specifies_custody(self, gw):
+        """この口座で選べる預り区分は「保証金代用」だけ（注文画面で確認済み）。
+
+        "02"（保護預り）は仕様上は有効だが、口座で使えないため
+        `{"Code":100031,"Message":"「預り区分」をご確認ください"}` で拒否された。
+        **仕様に載っている値でも、口座で選べるとは限らない。**
+        """
         gateway, client = gw
         gateway.send_buy_limit("2157", 1006.0, 200)
         sent = client.send_order.call_args[0][0]
-        assert sent["FundType"] == "02", "現物買いは預り区分（保護預り）を明示する"
+        assert sent["FundType"] == "AA", "現物買いは保証金代用（AA）"
         assert sent["FundType"].strip() != "", "空白は現物売用の値。買いでは拒否される"
 
     @pytest.mark.parametrize("call", [
@@ -70,6 +76,42 @@ class TestFundType:
         gateway, client = gw
         call(gateway)
         assert client.send_order.call_args[0][0]["FundType"] == "  "
+
+
+class TestExchange:
+    """発注の市場コードは 1（東証）ではない（2026-09-08 の発注不能の回帰防止）。
+
+    2026年2月の最良執行方針対応で**新規注文における「1（東証）」は廃止**され、
+    9（SOR）か 27（東証＋）の指定が必要になった（kabucom/kabusapi #1072）。
+    これを知らず 1 を送り続けたため
+    `{"Code":100378,"Message":"指定された市場でのお取引はお受けできません。"}`
+    で売買とも拒否され、トレーリングストップが発動しても決済できなかった。
+    """
+
+    @pytest.mark.parametrize("call", [
+        lambda g: g.send_buy_limit("7203", 1000.0, 100),
+        lambda g: g.send_sell_limit("7203", 1100.0, 100),
+        lambda g: g.send_sell_market("7203", 100),
+        lambda g: g.send_stop_loss_market("7203", 100, 900.0),
+    ])
+    def test_all_orders_use_orderable_exchange(self, gw, call):
+        gateway, client = gw
+        call(gateway)
+        sent = client.send_order.call_args[0][0]["Exchange"]
+        assert sent != 1, "1（東証）は新規注文では廃止済み"
+        assert sent in (9, 27), f"発注可能な市場コードは 9/27 のみ: {sent}"
+
+    def test_order_exchange_is_sor(self):
+        """既定は SOR（最良執行）。変えると約定先が変わるので明示的に固定する"""
+        from src.execution.broker_constants import Exchange
+        assert Exchange.ORDER.value == 9
+
+    def test_quote_exchange_still_uses_tosho(self):
+        """板取得・PUSH登録は照会系なので 1 のまま（発注と混同しない）"""
+        import inspect
+        import src.api.kabu_client as kc
+        for name in ("register_push", "unregister_push"):
+            assert '"Exchange": 1' in inspect.getsource(getattr(kc.KabuClient, name))
 
 
 class TestDelivType:

@@ -30,7 +30,9 @@ class BrokerGateway:
         return {
             "Password": cfg.get_api_password(),
             "Symbol": symbol,
-            "Exchange": Exchange.TOSHO.value,
+            # 発注は SOR（9）。1（東証）は2026年2月に新規注文で廃止された
+            # （Code 100378「指定された市場でのお取引はお受けできません」の原因）。
+            "Exchange": Exchange.ORDER.value,
             "SecurityType": SecurityType.STOCK.value,
             "Side": side.value,
             "CashMargin": CashMargin.CASH.value,
