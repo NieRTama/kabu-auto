@@ -321,3 +321,65 @@ def find_collisions(note_names: list[str], vault_root: Path, graph_dir: Path) ->
             if md.stem in generated:
                 collisions.add(md.stem)
     return sorted(collisions)
+
+
+def escape_wikilinks(text: str) -> str:
+    """本文中の `[[` をエスケープする。
+
+    Callable[[list[str]], dict[str, float]] のような型注釈をObsidianが
+    `[[list[str]]` というwikilinkと誤認識するため（詳細設計書.md で実際に発生）。
+    """
+    return text.replace("[[", r"\[\[")
+
+
+def _bullet_list(items: list[str]) -> str:
+    """wikilinkの箇条書きを作る。"""
+    return "\n".join(f"- [[{i}]]" for i in items)
+
+
+def _quote_block(text: str, max_lines: int = 3) -> str:
+    """docstringを引用ブロックにする（最大max_lines行）。"""
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()][:max_lines]
+    return "\n".join(f"> {escape_wikilinks(ln)}" for ln in lines)
+
+
+def render_module_note(
+    module: Module,
+    role: str,
+    dependents: list[str],
+    headings: dict[str, RoleHeading],
+    related_sections: list["Section"],
+) -> str:
+    """モジュールノート1件のMarkdownを組み立てる。
+
+    生成日時は書かない（決定的な出力にして、iCloudの無駄な再同期を避けるため）。
+    中身が空になるセクションは見出しごと省略する。
+    """
+    out = [
+        "---",
+        f"tags: [kabu-auto/module, layer/{module.layer}]",
+        f"module: {module.path}",
+        "generated_by: gen_graph_notes.py",
+        "---",
+        "",
+        f"# {module.dotted}",
+        "",
+        f"**役割**: {escape_wikilinks(role)}",
+    ]
+    if module.docstring:
+        out += ["", _quote_block(module.docstring)]
+
+    if module.deps:
+        out += ["", "## 依存先（このモジュールが使う）", "", _bullet_list(sorted(module.deps))]
+    if dependents:
+        out += ["", "## 依存元（このモジュールを使う）", "", _bullet_list(sorted(dependents))]
+
+    heading = headings.get(module.path)
+    if heading:
+        out += ["", "## 解説", "", f"- [[詳細設計書#{heading.heading_text}]]"]
+
+    if related_sections:
+        names = sorted(section_note_name(s) for s in related_sections)
+        out += ["", "## 関係する設計判断・事故", "", _bullet_list(names)]
+
+    return "\n".join(out) + "\n"

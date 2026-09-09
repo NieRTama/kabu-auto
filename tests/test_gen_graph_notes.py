@@ -378,3 +378,88 @@ class TestFindCollisions:
         graph = vault / "Claude" / "graph"
         graph.mkdir(parents=True)
         assert find_collisions(["a", "b"], vault, graph) == []
+
+
+from scripts.gen_graph_notes import escape_wikilinks, render_module_note  # noqa: E402
+
+
+class TestEscapeWikilinks:
+    def test_escapes_double_brackets_from_type_annotations(self):
+        """Callable[[list[str]], ...] が [[list[str]] というリンクに化けるのを防ぐ。
+
+        実際に詳細設計書.md で発生した事象。
+        """
+        assert "[[" not in escape_wikilinks("Callable[[list[str]], dict[str, float]]")
+
+    def test_leaves_plain_text_untouched(self):
+        assert escape_wikilinks("ふつうの説明文") == "ふつうの説明文"
+
+
+class TestRenderModuleNote:
+    def _render(self, **kw):
+        mod = kw.pop("module", Module(
+            path="src/risk/manager.py", dotted="risk.manager", layer="risk",
+            docstring="リスク管理の説明。", deps={"data.database", "core.halt"},
+        ))
+        return render_module_note(
+            module=mod,
+            role=kw.pop("role", "リスク管理"),
+            dependents=kw.pop("dependents", ["execution.order_manager", "services.trading"]),
+            headings=kw.pop("headings", {"src/risk/manager.py": RoleHeading(
+                number="1.10", role="リスク管理",
+                heading_text="1.10 src/risk/manager.py — リスク管理")}),
+            related_sections=kw.pop("related_sections", [_section()]),
+        )
+
+    def test_has_frontmatter_with_tags_and_module_path(self):
+        note = self._render()
+        assert note.startswith("---\n")
+        assert "tags: [kabu-auto/module, layer/risk]" in note
+        assert "module: src/risk/manager.py" in note
+        assert "generated_by: gen_graph_notes.py" in note
+
+    def test_shows_role_and_docstring(self):
+        note = self._render()
+        assert "**役割**: リスク管理" in note
+        assert "> リスク管理の説明。" in note
+
+    def test_lists_dependencies_sorted_as_wikilinks(self):
+        note = self._render()
+        assert "- [[core.halt]]\n- [[data.database]]" in note
+
+    def test_lists_dependents(self):
+        note = self._render()
+        assert "- [[execution.order_manager]]" in note
+        assert "- [[services.trading]]" in note
+
+    def test_links_to_explanation_section_with_anchor(self):
+        note = self._render()
+        assert "[[詳細設計書#1.10 src/risk/manager.py — リスク管理]]" in note
+
+    def test_links_to_related_sections(self):
+        note = self._render()
+        assert "[[詳細設計書-1.40-含み損益がOHLCV終値ベースで乖離]]" in note
+
+    def test_omits_empty_sections_entirely(self):
+        """依存元が無いモジュールに空の見出しを残さない。"""
+        mod = Module(path="src/core/clock.py", dotted="core.clock", layer="core",
+                     docstring="時刻。", deps=set())
+        note = render_module_note(module=mod, role="時刻", dependents=[],
+                                  headings={}, related_sections=[])
+        assert "依存先" not in note
+        assert "依存元" not in note
+        assert "解説" not in note
+        assert "関係する設計判断・事故" not in note
+
+    def test_docstring_with_type_annotation_does_not_create_a_link(self):
+        mod = Module(path="src/risk/manager.py", dotted="risk.manager", layer="risk",
+                     docstring="price_fn: Callable[[list[str]], dict[str, float]] を受ける。",
+                     deps=set())
+        note = render_module_note(module=mod, role="リスク管理", dependents=[],
+                                  headings={}, related_sections=[])
+        assert "[[" not in note
+
+    def test_contains_no_timestamp(self):
+        """生成日時を書くとiCloudが毎回全ファイルを再同期するため入れない。"""
+        note = self._render()
+        assert "生成日時" not in note
