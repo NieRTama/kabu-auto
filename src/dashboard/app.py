@@ -604,6 +604,26 @@ async def get_risk_profile_history(limit: int = 50):
     return risk_profile_store.get_history(limit)
 
 
+def _resolve_current_prices(symbols: list) -> dict:
+    """含み損益表示に使う現在値を解決する。
+
+    `_order_manager` があればその `RiskManager.get_current_prices()`（price_fn注入時は
+    ブローカーのリアルタイム板優先・未注入/失敗時はOHLCV終値）を使い、無ければ
+    （テスト環境・起動前）従来どおり OHLCV終値のみで代用する。
+
+    2026-09-09: ダッシュボードの含み損益がOHLCV終値のみで計算されており、実際は
+    +7,100円の含み益があるのに-440円の含み損と表示される事故があった
+    （yfinanceの`end`引数が排他的なため、日次データ更新でも「前営業日」までしか
+    入らない）。RiskManager側のkill switch判定と表示を同じ計算に揃える。
+    """
+    if _order_manager is not None:
+        try:
+            return _order_manager._risk.get_current_prices(symbols)
+        except Exception as e:
+            logger.warning(f"含み損益用の現在値解決に失敗（終値で代用します）: {e}")
+    return latest_closes(symbols)
+
+
 @app.get("/api/positions")
 async def get_positions():
     with get_session() as session:
@@ -611,7 +631,7 @@ async def get_positions():
             select(Position).where(Position.quantity > 0)
         ).all()
     # 銘柄ごとに最新終値を個別取得する(N+1クエリ)のを避け、まとめて1クエリで取得する
-    closes = latest_closes([p.symbol for p in positions])
+    closes = _resolve_current_prices([p.symbol for p in positions])
     result = []
     for p in positions:
         latest_price = closes.get(p.symbol)
@@ -889,7 +909,7 @@ async def get_pnl_enhanced_summary():
         ).all()
         positions = session.scalars(select(Position).where(Position.quantity > 0)).all()
     # 銘柄ごとに最新終値を個別取得する(N+1クエリ)のを避け、まとめて1クエリで取得する
-    closes = latest_closes([p.symbol for p in positions])
+    closes = _resolve_current_prices([p.symbol for p in positions])
     total_unrealized = 0.0
     for p in positions:
         close = closes.get(p.symbol)

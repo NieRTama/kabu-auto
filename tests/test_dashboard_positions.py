@@ -93,3 +93,68 @@ class TestPnlEnhancedSummaryUnrealized:
         r = client.get("/api/pnl/enhanced_summary")
         assert r.status_code == 200
         assert r.json()["total_unrealized_pnl"] == 9000.0
+
+
+class TestPositionsUsesLivePriceWhenAvailable:
+    """/api/positions・/api/pnl/enhanced_summary が、RiskManagerにprice_fnが
+    注入されている場合はOHLCV終値ではなくリアルタイム価格を使うこと。
+
+    2026-09-09: OHLCV終値だけで計算した結果、実際は+7,100円の含み益があるのに
+    -440円の含み損とダッシュボードに表示される事故があった。
+    """
+
+    def test_positions_endpoint_prefers_live_price(self, isolated_db):
+        from src.risk.manager import RiskManager
+        from src.execution.order_manager import OrderManager
+        from unittest.mock import MagicMock
+
+        _add_position("7203", quantity=100, avg_cost=1000.0)
+        _set_close("7203", 1050.0)  # 古い終値（低め）
+
+        risk = RiskManager(price_fn=lambda syms: {"7203": 1200.0})  # リアルタイム現在値
+        om = MagicMock(spec=OrderManager)
+        om._risk = risk
+        # set_order_manager() は init_auth() を呼び直し、isolated_dbフィクスチャが
+        # 無効化した認証を再度有効化してしまう（このテストの関心事ではないため
+        # 副作用を避け、_order_manager を直接差し替える）。
+        dash._order_manager = om
+        try:
+            client = TestClient(dash.app)
+            body = client.get("/api/positions").json()
+            assert body[0]["latest_price"] == 1200.0
+            assert body[0]["unrealized_pnl"] == 20000.0  # (1200-1000)*100
+        finally:
+            dash._order_manager = None
+
+    def test_enhanced_summary_prefers_live_price(self, isolated_db):
+        from src.risk.manager import RiskManager
+        from src.execution.order_manager import OrderManager
+        from unittest.mock import MagicMock
+
+        _add_position("7203", quantity=100, avg_cost=1000.0)
+        _set_close("7203", 900.0)  # 古い終値だと含み損に見える
+
+        risk = RiskManager(price_fn=lambda syms: {"7203": 1200.0})  # 実際は含み益
+        om = MagicMock(spec=OrderManager)
+        om._risk = risk
+        # set_order_manager() は init_auth() を呼び直し、isolated_dbフィクスチャが
+        # 無効化した認証を再度有効化してしまう（このテストの関心事ではないため
+        # 副作用を避け、_order_manager を直接差し替える）。
+        dash._order_manager = om
+        try:
+            client = TestClient(dash.app)
+            body = client.get("/api/pnl/enhanced_summary").json()
+            assert body["total_unrealized_pnl"] == 20000.0
+        finally:
+            dash._order_manager = None
+
+    def test_falls_back_to_ohlcv_when_no_order_manager(self, isolated_db):
+        """_order_manager未設定（テスト環境等）では従来どおりOHLCV終値を使う（回帰防止）"""
+        _add_position("7203", quantity=100, avg_cost=1000.0)
+        _set_close("7203", 1100.0)
+        assert dash._order_manager is None
+
+        client = TestClient(dash.app)
+        body = client.get("/api/positions").json()
+
+        assert body[0]["latest_price"] == 1100.0

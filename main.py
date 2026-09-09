@@ -106,7 +106,31 @@ def main() -> None:
         logger.warning(f"【{tm.description(mode)}】実際の資金を使用して取引します。")
 
     client = KabuClient()
-    risk = RiskManager()
+
+    def _live_prices(symbols: list) -> dict:
+        """保有銘柄の現在値をブローカーの板からまとめて取得する（含み損益用）。
+
+        2026-09-09: RiskManager が含み損益・ドローダウンをOHLCV終値だけで計算しており、
+        実際は+7,100円の含み益があるのに-440円の含み損と表示される事故があった
+        （yfinanceの`end`引数が排他的なため、日次データ更新でも「前営業日」までしか
+        入らない）。既にAPI接続しているブローカーの板を使う。1銘柄の取得失敗が
+        他銘柄を巻き込まないよう、失敗はログに残して読み飛ばす
+        （呼び出し元のRiskManager.get_current_prices()がOHLCV終値へフォールバックする）。
+        """
+        prices = {}
+        for sym in symbols:
+            try:
+                board = client.get_board(sym)
+                price = board.get("CurrentPrice") or 0
+                if price:
+                    prices[sym] = float(price)
+            except Exception as e:
+                logger.warning(f"含み損益用の現在値取得に失敗（終値で代用します）: {sym} {e}")
+        return prices
+
+    # paper はkabuステーションが起動していなくても動く設計（yfinance完結）のため、
+    # ここで板を叩かない。live/dry_run/semi_liveは既にAPI接続済みなので使う。
+    risk = RiskManager(price_fn=None if tm.is_paper(mode) else _live_prices)
     risk.restore_daily_state()  # 再起動しても当日の損失上限・注文数カウンタを引き継ぐ
     order_mgr = OrderManager(client, risk)
     scheduler = TradingScheduler()

@@ -7,7 +7,7 @@
 - ギャップリスク考慮
 """
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from loguru import logger
 from sqlalchemy import func, select
@@ -43,10 +43,23 @@ class RiskSnapshot:
 
 
 class RiskManager:
-    def __init__(self):
+    def __init__(self, price_fn: Optional[Callable[[list[str]], dict[str, float]]] = None):
+        """
+        price_fn: 銘柄コードのリストを受け取り {symbol: 現在値} を返す関数。
+        ブローカーのリアルタイム板から現在値を取ってくる想定（main.py で
+        client.get_board() を束ねて注入する）。None（既定）なら従来どおり
+        OHLCV終値のみで含み損益・集中度を計算する（paper運用等）。
+
+        2026-09-09 追加。OHLCV終値だけで含み損益を計算していたところ、実際は
+        +7,100円の含み益があるのに-440円の含み損と表示される事故が発生した。
+        yfinanceの`end`引数が排他的なため、日次データ更新は「前営業日」までしか
+        入らず、配信遅延を挟むと「前々営業日」まで遡ることもある
+        （§get_current_prices docstring参照）。
+        """
         self._daily_order_count = 0
         self._daily_loss_yen = 0.0
         self._conf = cfg.get_section("trading")
+        self._price_fn = price_fn
 
     def reset_daily_counters(self) -> None:
         self._daily_order_count = 0
@@ -83,6 +96,35 @@ class RiskManager:
         if pnl < 0:
             self._daily_loss_yen += abs(pnl)
 
+    def get_current_prices(self, symbols: list[str]) -> dict[str, float]:
+        """保有銘柄の「今の価格」を返す（含み損益・セクター集中度の判定に使う）。
+
+        ブローカーのリアルタイム板（price_fn）を優先し、取得できなかった銘柄
+        （price_fn未注入のpaper運用・API障害・price_fnが対応しない銘柄）だけ
+        OHLCV終値へフォールバックする。
+
+        2026-09-09 実例: OHLCV終値だけを使っていたとき、実際の保有3銘柄
+        （9432/9434/3387）で合計 -440円（含み損）と表示されたが、ブローカーの
+        リアルタイム現在値で計算すると実際は +7,100円（含み益）だった。
+        原因は yfinance の `end` 引数が排他的なため、日次データ更新
+        （毎日16:00）でも「前営業日」までのローソク足しか入らないこと
+        （配信遅延を挟むと前々営業日まで遡ることもある）。kabu-autoは
+        既にkabuステーションAPIに接続していて板情報を持っているのに、
+        含み損益の計算だけがそれを一切使っていなかった。
+        """
+        if not symbols:
+            return {}
+        prices: dict[str, float] = {}
+        if self._price_fn is not None:
+            try:
+                prices = dict(self._price_fn(symbols))
+            except Exception as e:
+                logger.warning(f"現在値のリアルタイム取得に失敗（終値で代用します）: {e}")
+        missing = [s for s in symbols if not prices.get(s)]
+        if missing:
+            prices.update(latest_closes(missing))
+        return prices
+
     def build_snapshot(self) -> RiskSnapshot:
         """リスク判定に必要なDB読取を1回のセッションでまとめて取得する（P2-6）。"""
         with get_session() as session:
@@ -101,7 +143,7 @@ class RiskManager:
                     Trade.status.in_(tuple(st.UNRESOLVED_STATUSES))
                 )
             ) or 0
-        closes = latest_closes([p.symbol for p in positions])
+        closes = self.get_current_prices([p.symbol for p in positions])
         return RiskSnapshot(
             positions=positions, open_buys=open_buys, pos_sector=pos_sector,
             unresolved_count=unresolved, closes=closes,
@@ -118,7 +160,9 @@ class RiskManager:
     def unrealized_pnl(self, snapshot: Optional[RiskSnapshot] = None) -> float:
         """保有建玉の含み損益（円・正=含み益 / 負=含み損）を返す。
 
-        最新終値が取得できない銘柄は損益0扱いで合計から除外する（avg_costで代用すると
+        価格は `get_current_prices()` 経由で取得する（price_fn注入時はブローカーの
+        リアルタイム現在値優先、無ければOHLCV終値）。price_fnもOHLCV終値も
+        取得できない銘柄は損益0扱いで合計から除外する（avg_costで代用すると
         常に0になり「データが無い」ことを隠してしまうため）。除外した銘柄は
         `unpriced_symbols()` で検知できるようにし、health.py がこれを警告として
         表面化する（合計ドローダウンが静かに過小評価されたままにならないようにするため。
@@ -143,7 +187,7 @@ class RiskManager:
                 positions = list(session.scalars(
                     select(Position).where(Position.quantity > 0)
                 ).all())
-            closes = latest_closes([p.symbol for p in positions])
+            closes = self.get_current_prices([p.symbol for p in positions])
         total = 0.0
         unpriced: list[str] = []
         for p in positions:
