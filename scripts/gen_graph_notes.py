@@ -269,3 +269,55 @@ def split_sections(doc_key: str, doc_path: str, text: str) -> list[Section]:
             )
         )
     return sections
+
+
+# Windowsのファイル名に使えない文字
+FORBIDDEN_CHARS = '\\/:*?"<>|'
+TITLE_MAX_CHARS = 24
+
+
+def sanitize_filename(name: str) -> str:
+    """ファイル名に使えない文字を除いた安全な名前を返す。"""
+    for ch in FORBIDDEN_CHARS:
+        name = name.replace(ch, "-")
+    # Windowsは末尾のドット・空白を含む名前を作れない
+    return name.strip().strip(".").strip()
+
+
+def section_note_name(section: Section) -> str:
+    """節スタブのノート名（拡張子なし）を返す。
+
+    "詳細設計書-1.40-含み損益がOHLCV終値ベースで乖離"
+    """
+    title = sanitize_filename(section.title)[:TITLE_MAX_CHARS]
+    parts = [sanitize_filename(section.doc_key)]
+    if section.number:
+        parts.append(section.number)
+    parts.append(title)
+    return "-".join(p for p in parts if p)
+
+
+def find_collisions(note_names: list[str], vault_root: Path, graph_dir: Path) -> list[str]:
+    """ノート名の衝突を検出して、衝突した名前をソートして返す。
+
+    Obsidianのwikilinkはノート名で解決するため、vault内で名前が重複すると
+    リンクが意図しない先に繋がる。graph_dir配下の既存ファイルは今回の上書き対象
+    なので衝突扱いしない。
+    """
+    collisions = set()
+
+    seen = set()
+    for name in note_names:
+        if name in seen:
+            collisions.add(name)
+        seen.add(name)
+
+    graph_dir = graph_dir.resolve()
+    generated = set(note_names)
+    if vault_root.exists():
+        for md in vault_root.rglob("*.md"):
+            if graph_dir in md.resolve().parents or md.resolve() == graph_dir:
+                continue
+            if md.stem in generated:
+                collisions.add(md.stem)
+    return sorted(collisions)

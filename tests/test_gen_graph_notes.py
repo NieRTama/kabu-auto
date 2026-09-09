@@ -307,3 +307,74 @@ class TestSplitSections:
         secs = split_sections("詳細設計書", "docs/詳細設計書.md", DETAIL_DOC)
         assert secs[0].role_heading_paths == {"src/core/config.py", "src/risk/manager.py"}
         assert secs[1].role_heading_paths == set()
+
+
+from scripts.gen_graph_notes import (  # noqa: E402
+    TITLE_MAX_CHARS,
+    find_collisions,
+    sanitize_filename,
+    section_note_name,
+)
+
+
+def _section(number="1.40", title="含み損益がOHLCV終値ベースで乖離", doc_key="詳細設計書"):
+    return Section(
+        doc_key=doc_key,
+        doc_path=f"docs/{doc_key}.md",
+        number=number,
+        title=title,
+        heading_text=f"{number} {title}".strip(),
+    )
+
+
+class TestSanitizeFilename:
+    def test_replaces_windows_forbidden_characters(self):
+        assert sanitize_filename('a/b\\c:d*e?f"g<h>i|j') == "a-b-c-d-e-f-g-h-i-j"
+
+    def test_keeps_japanese_and_parentheses(self):
+        assert sanitize_filename("含み損益（2026-09-09）") == "含み損益（2026-09-09）"
+
+    def test_strips_leading_and_trailing_whitespace_and_dots(self):
+        """Windowsは末尾のドット・空白を含むファイル名を作れない。"""
+        assert sanitize_filename("  名前.  ") == "名前"
+
+
+class TestSectionNoteName:
+    def test_includes_doc_key_number_and_title(self):
+        assert section_note_name(_section()) == "詳細設計書-1.40-含み損益がOHLCV終値ベースで乖離"
+
+    def test_omits_number_when_absent(self):
+        assert section_note_name(_section(number="", title="主な機能", doc_key="README")) == "README-主な機能"
+
+    def test_truncates_long_titles(self):
+        name = section_note_name(_section(title="あ" * 100))
+        assert name == "詳細設計書-1.40-" + "あ" * TITLE_MAX_CHARS
+
+
+class TestFindCollisions:
+    def test_detects_duplicates_among_generated_notes(self, tmp_path):
+        vault = tmp_path / "vault"
+        graph = vault / "Claude" / "graph"
+        graph.mkdir(parents=True)
+        assert find_collisions(["a", "b", "a"], vault, graph) == ["a"]
+
+    def test_detects_clash_with_existing_vault_note(self, tmp_path):
+        vault = tmp_path / "vault"
+        graph = vault / "Claude" / "graph"
+        graph.mkdir(parents=True)
+        (vault / "Claude").joinpath("README.md").write_text("既存", encoding="utf-8")
+        assert find_collisions(["README", "core.config"], vault, graph) == ["README"]
+
+    def test_ignores_notes_inside_the_graph_dir(self, tmp_path):
+        """前回の生成物は上書き対象なので衝突扱いしない。"""
+        vault = tmp_path / "vault"
+        graph = vault / "Claude" / "graph" / "modules"
+        graph.mkdir(parents=True)
+        graph.joinpath("core.config.md").write_text("前回の生成物", encoding="utf-8")
+        assert find_collisions(["core.config"], vault, vault / "Claude" / "graph") == []
+
+    def test_returns_empty_when_clean(self, tmp_path):
+        vault = tmp_path / "vault"
+        graph = vault / "Claude" / "graph"
+        graph.mkdir(parents=True)
+        assert find_collisions(["a", "b"], vault, graph) == []
