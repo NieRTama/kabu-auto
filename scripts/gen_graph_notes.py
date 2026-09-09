@@ -7,10 +7,12 @@
 
 kabu-auto本体（src/）には依存しない。src/ はテキストとして読むだけ。
 """
+import argparse
 import ast
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -521,3 +523,123 @@ def match_modules_by_symbol(body: str, modules: list[Module]) -> set[str]:
                 hits.add(module.path)
                 break
     return hits
+
+
+# 既定の出力先（機械固有）。テストは必ず --out で差し替える。
+DEFAULT_OUT = Path(
+    r"C:\Users\garnet\iCloudDrive\iCloud~md~obsidian\Tama vault\Claude\graph"
+)
+
+# 節スタブを作る対象。(ノート名になるキー, リポジトリ相対パス)
+TARGET_DOCS = [
+    ("詳細設計書", "docs/詳細設計書.md"),
+    ("概要設計書", "docs/概要設計書.md"),
+    ("README", "README.md"),
+    ("運用Runbook", "docs/運用Runbook.md"),
+]
+
+
+def build_all(repo_root: Path) -> tuple[dict[str, str], int, int]:
+    """全ノートを組み立てて {出力先の相対パス: 本文} を返す。"""
+    modules = discover_modules(repo_root)
+    dotted_of = {m.path: m.dotted for m in modules}
+
+    detail = repo_root / "docs" / "詳細設計書.md"
+    headings = extract_role_headings(detail.read_text(encoding="utf-8")) if detail.exists() else {}
+
+    sections = []
+    for key, rel in TARGET_DOCS:
+        doc = repo_root / rel
+        if doc.exists():
+            sections += split_sections(key, rel, doc.read_text(encoding="utf-8"))
+
+    # 依存元（依存グラフの反転）
+    dependents: dict[str, list[str]] = {m.dotted: [] for m in modules}
+    for m in modules:
+        for dep in m.deps:
+            if dep in dependents:
+                dependents[dep].append(m.dotted)
+
+    # モジュール -> 関係する節。自分の解説がある節は除く（`## 解説` で既にリンク
+    # 済みであり、`## 1. モジュール詳細` のような目次節が全モジュールから
+    # 参照される偽のハブになるのを防ぐ）。
+    related: dict[str, list[Section]] = {m.path: [] for m in modules}
+    for sec in sections:
+        # パス表記と記号名の両方で拾う。事故節はパスをほとんど書かず
+        # 「RiskManager」のような記号名で書くため、記号名が主な供給源になる。
+        hit = sec.modules | match_modules_by_symbol(sec.body, modules)
+        # 節ノートの「関係するモジュール」にも反映する。ここを更新しないと、
+        # モジュール側からは繋がっているのに節側は空、という非対称が起きる。
+        sec.modules = hit
+        for path in hit - sec.role_heading_paths:
+            if path in related:
+                related[path].append(sec)
+
+    notes: dict[str, str] = {}
+    for m in modules:
+        notes[f"modules/{m.dotted}.md"] = render_module_note(
+            module=m,
+            role=module_role(m, headings),
+            dependents=dependents[m.dotted],
+            headings=headings,
+            related_sections=related[m.path],
+        )
+    for sec in sections:
+        notes[f"sections/{section_note_name(sec)}.md"] = render_section_note(sec, dotted_of)
+
+    return notes, len(modules), len(sections)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLIのエントリポイント。成功で0、中断で1を返す。"""
+    parser = argparse.ArgumentParser(
+        description="kabu-autoの構造をObsidianグラフビュー用ノートとして生成する"
+    )
+    parser.add_argument("--repo", default=".", help="リポジトリのルート（既定: カレント）")
+    parser.add_argument("--out", default=str(DEFAULT_OUT), help="出力先ディレクトリ")
+    parser.add_argument("--dry-run", action="store_true", help="書かずに件数と衝突だけ報告する")
+    args = parser.parse_args(argv)
+
+    repo_root = Path(args.repo).resolve()
+    out_dir = Path(args.out)
+
+    notes, n_mod, n_sec = build_all(repo_root)
+    print(f"モジュール {n_mod} 件 / 節 {n_sec} 件 = ノート {len(notes)} 件")
+
+    # 衝突検査。vaultのルートは graph の2階層上（<vault>/Claude/graph）を想定する。
+    vault_root = out_dir.parent.parent
+    names = [Path(rel).stem for rel in notes]
+    collisions = find_collisions(names, vault_root, out_dir)
+    if collisions:
+        print("中断: ノート名がvault内の既存ノートと衝突しています")
+        for name in collisions:
+            print(f"  - {name}")
+        return 1
+
+    if args.dry_run:
+        print("dry-run のため書き込みませんでした")
+        return 0
+
+    if not out_dir.parent.exists():
+        # iCloudがオフラインだと親ごと見えない。勝手に作ると同期されない場所へ書いてしまう。
+        print(f"中断: 出力先の親ディレクトリがありません: {out_dir.parent}")
+        return 1
+
+    written = set()
+    for rel, content in sorted(notes.items()):
+        target = out_dir / rel
+        write_note(target, content)
+        written.add(target)
+
+    index = out_dir / "index.md"
+    write_note(index, render_index(n_mod, n_sec, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    written.add(index)
+
+    removed = cleanup_stale(out_dir, keep=written)
+    print(f"書き込み {len(written)} 件 / 削除 {len(removed)} 件")
+    print(f"出力先: {out_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

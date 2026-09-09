@@ -620,3 +620,108 @@ class TestMatchModulesBySymbol:
 
     def test_returns_empty_when_nothing_matches(self):
         assert match_modules_by_symbol("関係の無い文章。", _mods_with_symbols()) == set()
+
+
+from scripts.gen_graph_notes import build_all, main  # noqa: E402
+
+
+@pytest.fixture
+def full_repo(repo):
+    """Task 1 の repo にドキュメントを足した、生成を通しで動かせるリポジトリ。"""
+    _write(repo / "docs" / "詳細設計書.md", DETAIL_DOC)
+    _write(repo / "docs" / "概要設計書.md", "## 1. 概要\n\n概要の本文。\n")
+    _write(repo / "README.md", "## 主な機能\n\n機能の説明。\n")
+    _write(repo / "docs" / "運用Runbook.md", "## 1. 手順\n\n手順の本文。\n")
+    return repo
+
+
+class TestBuildAll:
+    def test_produces_a_note_per_module_and_section(self, full_repo):
+        notes, n_mod, n_sec = build_all(full_repo)
+        assert n_mod == 4
+        assert n_sec == 5      # 詳細2（1. と 1.18）+ 概要1 + README1 + Runbook1
+        assert len(notes) == n_mod + n_sec
+
+    def test_module_notes_go_under_modules_dir(self, full_repo):
+        notes, _, _ = build_all(full_repo)
+        assert "modules/risk.manager.md" in notes
+        assert "sections/README-主な機能.md" in notes
+
+    def test_dependents_are_computed_by_inverting_the_graph(self, full_repo):
+        notes, _, _ = build_all(full_repo)
+        assert "- [[main]]" in notes["modules/risk.manager.md"]
+
+    def test_links_incident_sections_found_by_symbol_name(self, full_repo):
+        """パスを書いていない事故節でも、記号名でモジュールに繋がること。
+
+        実データではこれが主経路（設計書は src/risk/manager.py ではなく
+        RiskManager と書く）。
+        """
+        _write(full_repo / "docs" / "運用Runbook.md",
+               "## 9. 障害対応\n\nRiskManager が誤った値を返す事象。\n")
+        notes, _, _ = build_all(full_repo)
+        assert "運用Runbook-9-障害対応" in notes["modules/risk.manager.md"]
+
+    def test_section_notes_also_list_symbol_matched_modules(self, full_repo):
+        """節ノート側の「関係するモジュール」にも記号名マッチを反映すること。
+
+        反映しないと、モジュール側からは繋がっているのに節側は空、という
+        非対称な表示になる。
+        """
+        _write(full_repo / "docs" / "運用Runbook.md",
+               "## 9. 障害対応\n\nRiskManager が誤った値を返す事象。\n")
+        notes, _, _ = build_all(full_repo)
+        assert "- [[risk.manager]]" in notes["sections/運用Runbook-9-障害対応.md"]
+
+    def test_own_explanation_section_is_not_listed_as_an_incident(self, full_repo):
+        """自分の解説がある節を「関係する設計判断・事故」に出さない。
+
+        出すと `## 1. モジュール詳細` のような目次節が全モジュールから参照され、
+        グラフ上で意味のない巨大ハブになる。解説は `## 解説` 側でリンク済み。
+        """
+        notes, _, _ = build_all(full_repo)
+        note = notes["modules/risk.manager.md"]
+        assert "詳細設計書-1-モジュール詳細" not in note
+
+
+class TestMain:
+    def test_dry_run_writes_nothing(self, full_repo, tmp_path, capsys):
+        out = tmp_path / "vault" / "Claude" / "graph"
+        out.parent.mkdir(parents=True)
+        rc = main(["--repo", str(full_repo), "--out", str(out), "--dry-run"])
+        assert rc == 0
+        assert not out.exists()
+        assert "モジュール" in capsys.readouterr().out
+
+    def test_writes_notes_and_index(self, full_repo, tmp_path):
+        out = tmp_path / "vault" / "Claude" / "graph"
+        out.parent.mkdir(parents=True)
+        assert main(["--repo", str(full_repo), "--out", str(out)]) == 0
+        assert (out / "index.md").exists()
+        assert (out / "modules" / "risk.manager.md").exists()
+
+    def test_aborts_when_parent_dir_missing(self, full_repo, tmp_path, capsys):
+        """iCloudがオフラインのとき、同期されない場所へ書かないための防御。"""
+        out = tmp_path / "vault" / "存在しない親" / "graph"
+        assert main(["--repo", str(full_repo), "--out", str(out)]) == 1
+        assert not out.exists()
+
+    def test_is_deterministic_except_index(self, full_repo, tmp_path):
+        """2回実行して index.md 以外がバイト単位で同一なこと。"""
+        out = tmp_path / "vault" / "Claude" / "graph"
+        out.parent.mkdir(parents=True)
+        main(["--repo", str(full_repo), "--out", str(out)])
+        first = {p.relative_to(out).as_posix(): p.read_bytes()
+                 for p in out.rglob("*.md") if p.name != "index.md"}
+        main(["--repo", str(full_repo), "--out", str(out)])
+        second = {p.relative_to(out).as_posix(): p.read_bytes()
+                  for p in out.rglob("*.md") if p.name != "index.md"}
+        assert first == second
+
+    def test_removes_stale_notes_on_rerun(self, full_repo, tmp_path):
+        out = tmp_path / "vault" / "Claude" / "graph"
+        out.parent.mkdir(parents=True)
+        main(["--repo", str(full_repo), "--out", str(out)])
+        (full_repo / "src" / "core" / "clock.py").unlink()
+        main(["--repo", str(full_repo), "--out", str(out)])
+        assert not (out / "modules" / "core.clock.md").exists()
