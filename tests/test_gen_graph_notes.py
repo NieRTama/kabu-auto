@@ -148,3 +148,76 @@ class TestResolveImport:
 
     def test_relative_import_is_ignored(self, repo):
         assert resolve_import(None, ["x"], repo) == set()
+
+
+from scripts.gen_graph_notes import (  # noqa: E402
+    RoleHeading,
+    extract_role_headings,
+    module_role,
+)
+
+DETAIL_DOC = textwrap.dedent(
+    """
+    ## 1. モジュール詳細
+
+    ### 1.1 src/core/config.py — 設定管理
+
+    本文。
+
+    ### 1.10 src/risk/manager.py — リスク管理
+
+    本文。
+
+    ## 1.18 注文モデル分離
+
+    ### 1.18.3 FIFOロット台帳（src/execution/lots.py）
+
+    型B。役割として採用してはいけない。
+
+    ### 1.33.4 通知の判断は `src/core/broker_watch.py` へ分離
+
+    型D。役割として採用してはいけない。
+    """
+).lstrip()
+
+
+class TestExtractRoleHeadings:
+    def test_extracts_type_a_headings_only(self):
+        headings = extract_role_headings(DETAIL_DOC)
+        assert set(headings) == {"src/core/config.py", "src/risk/manager.py"}
+
+    def test_captures_number_and_role(self):
+        h = extract_role_headings(DETAIL_DOC)["src/risk/manager.py"]
+        assert h.number == "1.10"
+        assert h.role == "リスク管理"
+
+    def test_heading_text_is_kept_for_anchor_links(self):
+        h = extract_role_headings(DETAIL_DOC)["src/core/config.py"]
+        assert h.heading_text == "1.1 src/core/config.py — 設定管理"
+
+    def test_type_b_heading_is_not_treated_as_a_role(self):
+        """事故節の小見出し（末尾が全角括弧）を解説節と誤認しない。"""
+        assert "src/execution/lots.py" not in extract_role_headings(DETAIL_DOC)
+
+    def test_type_d_heading_is_not_treated_as_a_role(self):
+        """バッククオート囲みの文中パスを解説節と誤認しない。"""
+        assert "src/core/broker_watch.py" not in extract_role_headings(DETAIL_DOC)
+
+
+class TestModuleRole:
+    def test_heading_wins_over_docstring(self):
+        mod = Module(path="src/risk/manager.py", dotted="risk.manager", layer="risk",
+                     docstring="docstringの1行目。")
+        headings = extract_role_headings(DETAIL_DOC)
+        assert module_role(mod, headings) == "リスク管理"
+
+    def test_falls_back_to_docstring_first_line(self):
+        mod = Module(path="src/core/clock.py", dotted="core.clock", layer="core",
+                     docstring="アプリ全体の現在時刻を一元化するモジュール。\n\n2行目。")
+        assert module_role(mod, {}) == "アプリ全体の現在時刻を一元化するモジュール。"
+
+    def test_falls_back_to_placeholder_when_no_docstring(self):
+        """docstringも見出しも無いモジュール（実測では src/core/logger.py の1件）。"""
+        mod = Module(path="src/core/logger.py", dotted="core.logger", layer="core",
+                     docstring=None)
+        assert module_role(mod, {}) == "（説明なし）"

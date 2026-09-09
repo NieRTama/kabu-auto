@@ -8,6 +8,7 @@
 kabu-auto本体（src/）には依存しない。src/ はテキストとして読むだけ。
 """
 import ast
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,3 +143,49 @@ def discover_modules(repo_root: Path) -> list[Module]:
         mod.symbols = {n for n in mod.symbols if counts[n] == 1}
 
     return sorted(modules, key=lambda m: m.path)
+
+
+# 型A の見出しだけを狙う。パスが行頭側にあり、ダッシュで役割が続くもの。
+#   ### 1.1 src/core/config.py — 設定管理
+# 型B（末尾が全角括弧）・型C（パス2個で区切りが "/"）・型D（バッククオート囲みの文中パス）
+# は意図的に弾く。これらは「そのモジュールの解説節」ではないため（仕様書 §4.3）。
+ROLE_HEADING_RE = re.compile(
+    r"^###\s*([\d.]+)\s+(src/[\w/]+\.py|main\.py)\s*[—–-]\s*(.+)$",
+    re.MULTILINE,
+)
+
+NO_ROLE = "（説明なし）"
+
+
+@dataclass
+class RoleHeading:
+    """型Aの `###` 見出し1件（モジュールの解説節）。"""
+
+    number: str           # "1.10"
+    role: str             # "リスク管理"
+    heading_text: str     # "1.10 src/risk/manager.py — リスク管理"（アンカーリンク用）
+
+
+def extract_role_headings(detail_doc: str) -> dict[str, RoleHeading]:
+    """詳細設計書から型Aの見出しを抽出する。キーはモジュールパス。"""
+    found = {}
+    for m in ROLE_HEADING_RE.finditer(detail_doc):
+        number, path, role = m.group(1), m.group(2), m.group(3).strip()
+        heading_text = m.group(0)[len("###"):].strip()
+        found[path] = RoleHeading(number=number, role=role, heading_text=heading_text)
+    return found
+
+
+def module_role(module: Module, headings: dict[str, RoleHeading]) -> str:
+    """モジュールの役割を3段フォールバックで決める。
+
+    1. 型Aの見出し（実測29件）
+    2. docstringの先頭行（実測20件）
+    3. どちらも無ければ既定文言（実測1件: src/core/logger.py）
+    """
+    heading = headings.get(module.path)
+    if heading:
+        return heading.role
+    if module.docstring:
+        return module.docstring.strip().splitlines()[0].strip()
+    return NO_ROLE
