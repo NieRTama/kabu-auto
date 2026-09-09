@@ -517,3 +517,66 @@ class TestRenderSectionNote:
         sec.excerpt = "型は Callable[[list[str]], float] である。"
         note = render_section_note(sec, DOTTED)
         assert "[[list" not in note
+
+
+from scripts.gen_graph_notes import (  # noqa: E402
+    GENERATED_MARKER,
+    cleanup_stale,
+    render_index,
+    write_note,
+)
+
+
+class TestWriteNote:
+    def test_writes_utf8_without_bom_and_lf_newlines(self, tmp_path):
+        target = tmp_path / "sub" / "ノート.md"
+        write_note(target, "# 見出し\n本文\n")
+        raw = target.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")     # BOMなし
+        assert b"\r\n" not in raw                       # CRLFなし
+        assert raw.decode("utf-8").startswith("# 見出し")
+
+    def test_creates_parent_directories(self, tmp_path):
+        write_note(tmp_path / "a" / "b" / "c.md", "x\n")
+        assert (tmp_path / "a" / "b" / "c.md").exists()
+
+
+class TestCleanupStale:
+    def test_removes_generated_files_not_in_keep(self, tmp_path):
+        old = tmp_path / "modules" / "old.md"
+        write_note(old, f"---\n{GENERATED_MARKER}\n---\n\n古い生成物\n")
+        removed = cleanup_stale(tmp_path, keep=set())
+        assert removed == [old]
+        assert not old.exists()
+
+    def test_keeps_handwritten_files(self, tmp_path):
+        """generated_by を持たない手書きノートは消さない。"""
+        mine = tmp_path / "私のメモ.md"
+        write_note(mine, "# 手で書いたノート\n")
+        removed = cleanup_stale(tmp_path, keep=set())
+        assert removed == []
+        assert mine.exists()
+
+    def test_keeps_files_in_keep_set(self, tmp_path):
+        current = tmp_path / "modules" / "core.config.md"
+        write_note(current, f"---\n{GENERATED_MARKER}\n---\n\n今回の生成物\n")
+        removed = cleanup_stale(tmp_path, keep={current})
+        assert removed == []
+        assert current.exists()
+
+    def test_returns_empty_when_dir_missing(self, tmp_path):
+        assert cleanup_stale(tmp_path / "なし", keep=set()) == []
+
+
+class TestRenderIndex:
+    def test_contains_counts_and_timestamp(self):
+        idx = render_index(49, 71, "2026-09-09 15:00:00")
+        assert "49" in idx
+        assert "71" in idx
+        assert "2026-09-09 15:00:00" in idx
+
+    def test_contains_graph_color_group_json(self):
+        """色分け設定はコピペ用JSONで案内する（.obsidian は書き換えない）。"""
+        idx = render_index(49, 71, "2026-09-09 15:00:00")
+        assert "layer/risk" in idx
+        assert "colorGroups" in idx

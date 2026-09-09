@@ -412,3 +412,95 @@ def render_section_note(section: Section, module_dotted: dict[str, str]) -> str:
         out += ["", "## 関係するモジュール", "", _bullet_list(linked)]
 
     return "\n".join(out) + "\n"
+
+
+GENERATED_MARKER = "generated_by: gen_graph_notes.py"
+
+# グラフビューの色分け設定（index.md に載せるコピペ用）。
+# .obsidian/graph.json は書き換えない（ユーザーの既存設定を壊さないため）。
+COLOR_GROUPS = [
+    ("path:Claude/graph/modules", "モジュール"),
+    ("path:Claude/graph/sections", "設計書の節"),
+    ("tag:#layer/risk", "リスク管理"),
+    ("tag:#layer/execution", "発注"),
+    ("tag:#layer/core", "基盤"),
+]
+
+
+def write_note(path: Path, content: str) -> None:
+    """ノートを書き出す（UTF-8・BOMなし・LF改行）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def cleanup_stale(graph_dir: Path, keep: set[Path]) -> list[Path]:
+    """今回生成しなかった過去の生成物を削除する（削除したパスをソートして返す）。
+
+    frontmatterに GENERATED_MARKER を持つファイルだけを消す。ユーザーが
+    graph/ 配下に手で置いたノートを巻き込まないため。
+    """
+    if not graph_dir.exists():
+        return []
+    keep_resolved = {p.resolve() for p in keep}
+    removed = []
+    for md in sorted(graph_dir.rglob("*.md")):
+        if md.resolve() in keep_resolved:
+            continue
+        try:
+            head = md.read_text(encoding="utf-8")[:400]
+        except (OSError, UnicodeDecodeError):
+            continue
+        if GENERATED_MARKER in head:
+            md.unlink()
+            removed.append(md)
+    return removed
+
+
+def render_index(module_count: int, section_count: int, generated_at: str) -> str:
+    """graph/index.md を組み立てる。生成日時を書くのはこのファイルだけ。"""
+    groups = ",\n    ".join(
+        '{"query": "%s", "color": {"a": 1, "rgb": %d}}' % (q, 0x4C78A8 + i * 0x111111)
+        for i, (q, _label) in enumerate(COLOR_GROUPS)
+    )
+    legend = "\n".join(f"| `{q}` | {label} |" for q, label in COLOR_GROUPS)
+    return f"""---
+tags: [kabu-auto/index]
+{GENERATED_MARKER}
+---
+
+# kabu-auto 構造グラフ
+
+`scripts/gen_graph_notes.py` が自動生成したノート群の目次。
+**手で編集しても次回の生成で上書きされる。**
+
+| 項目 | 値 |
+|------|-----|
+| モジュールノート | {module_count} 件 |
+| 節スタブ | {section_count} 件 |
+| 生成日時 | {generated_at} |
+
+## 使い方
+
+グラフビュー（左サイドバーの「グラフビューを開く」）で全体を眺め、
+気になるノードをクリックするとそのノートが開く。
+
+- モジュールノート … 役割・依存先・依存元・解説・関係する事故
+- 節スタブ … 要約と原本へのリンク・関係するモジュール
+
+## グラフの色分け設定
+
+Obsidianの設定は自動で書き換えていない（既存の設定を壊さないため）。
+色を付けたい場合は、グラフビュー右上の設定から「グループ」に以下を追加する。
+
+| クエリ | 意味 |
+|--------|------|
+{legend}
+
+`.obsidian/graph.json` を直接編集する場合は次を `colorGroups` に入れる。
+
+```json
+"colorGroups": [
+    {groups}
+]
+```
+"""
