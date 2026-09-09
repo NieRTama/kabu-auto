@@ -580,3 +580,43 @@ class TestRenderIndex:
         idx = render_index(49, 71, "2026-09-09 15:00:00")
         assert "layer/risk" in idx
         assert "colorGroups" in idx
+
+
+from scripts.gen_graph_notes import match_modules_by_symbol  # noqa: E402
+
+
+def _mods_with_symbols():
+    return [
+        Module(path="src/risk/manager.py", dotted="risk.manager", layer="risk",
+               symbols={"RiskManager", "unrealized_pnl"}),
+        Module(path="src/data/market_data.py", dotted="data.market_data", layer="data",
+               symbols={"latest_closes"}),
+    ]
+
+
+class TestMatchModulesBySymbol:
+    def test_matches_symbol_followed_by_a_japanese_particle(self):
+        """`RiskManagerの初期化` にマッチすること。
+
+        単語境界に \\b を使うとPythonのUnicode既定で「の」が単語文字扱いになり、
+        境界が成立せずマッチしない。日本語ドキュメントでは頻出の書き方。
+        """
+        body = "RiskManagerの初期化で例外が出る。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == {"src/risk/manager.py"}
+
+    def test_matches_symbol_in_japanese_quotes(self):
+        body = "「unrealized_pnl」が誤った値を返していた。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == {"src/risk/manager.py"}
+
+    def test_does_not_match_a_longer_identifier(self):
+        """部分一致で誤って繋がないこと。"""
+        body = "MyRiskManagerXtra は無関係のクラスである。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == set()
+
+    def test_matches_multiple_modules(self):
+        body = "RiskManager が latest_closes を呼んでいる。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == {
+            "src/risk/manager.py", "src/data/market_data.py"}
+
+    def test_returns_empty_when_nothing_matches(self):
+        assert match_modules_by_symbol("関係の無い文章。", _mods_with_symbols()) == set()

@@ -504,3 +504,20 @@ Obsidianの設定は自動で書き換えていない（既存の設定を壊さ
 ]
 ```
 """
+
+
+def match_modules_by_symbol(body: str, modules: list[Module]) -> set[str]:
+    """節本文に出てくる記号名から、関係するモジュールのパスを集める。
+
+    境界に `\\b` を使わないこと。Pythonの `re` はUnicode既定なので日本語文字が
+    `\\w` 扱いになり、`RiskManagerの初期化` のように助詞が直結するとマッチしない。
+    ASCIIの英数字とアンダースコアだけを境界とみなす。
+    """
+    hits = set()
+    for module in modules:
+        for name in module.symbols:
+            pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
+            if re.search(pattern, body):
+                hits.add(module.path)
+                break
+    return hits
