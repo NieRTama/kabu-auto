@@ -264,3 +264,18 @@ powershell -File scripts\backup_state.ps1 -NoSecrets   # .env / auth.json を含
 4. [ ] 未解決注文がゼロになったか
 5. [ ] 損失要因を記録したか（再発防止）
 6. [ ] 取引停止を解除したか（§5）
+
+---
+
+## Obsidianグラフノートの再生成
+
+コードやドキュメントを更新してpushしたら、vaultのグラフノートも再生成する。
+
+```bash
+python scripts/gen_graph_notes.py
+```
+
+- 出力先は `Tama vault/Claude/graph/`（モジュール49・節71・index 1）
+- 生成物はgit管理外。派生データなので再生成すれば復元できる
+- iCloudがオフラインだと出力先の親が見えず中断する。その場合は同期を待って再実行する
+- ノート名がvault内の既存ノートと衝突した場合も中断する。表示された名前を確認すること
