@@ -189,3 +189,83 @@ def module_role(module: Module, headings: dict[str, RoleHeading]) -> str:
     if module.docstring:
         return module.docstring.strip().splitlines()[0].strip()
     return NO_ROLE
+
+
+# 節本文からモジュール言及を拾う。型B・C・Dの見出しに出るパスもここで拾われる。
+MODULE_PATH_RE = re.compile(r"src/[\w/]+\.py|(?<![\w/])main\.py")
+
+# 見出し先頭の節番号。"1.40 タイトル" と "1. タイトル"（番号の後ろに句点）の
+# 両方を受ける。後者は実測で24件あり、受けないと番号がタイトル側へ流れ込む。
+SECTION_NUMBER_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(.*)$")
+
+EXCERPT_MAX_CHARS = 200
+EXCERPT_MAX_LINES = 3
+
+
+@dataclass
+class Section:
+    """ドキュメントの `##` 節1件（グラフのノード1個に対応）。"""
+
+    doc_key: str          # "詳細設計書"（ファイル名から拡張子を除いたもの）
+    doc_path: str         # "docs/詳細設計書.md"
+    number: str           # "1.40"（番号が無ければ ""）
+    title: str            # "含み損益が..."（番号を除いた見出し）
+    heading_text: str     # "1.40 含み損益が..."（アンカーリンク用の見出し全文）
+    modules: set[str] = field(default_factory=set)   # パス形式
+    excerpt: str = ""
+    # この節の中に型A見出し（そのモジュールの解説）を持つモジュールのパス。
+    # 「関係する設計判断・事故」から自分の解説節を除くために使う。
+    role_heading_paths: set[str] = field(default_factory=set)
+    body: str = ""        # 節の本文。記号名によるモジュール照合に使う
+
+
+def _make_excerpt(body: str) -> str:
+    """節本文の冒頭から散文を抜粋する。
+
+    表・コードブロック・引用は読んでも意味が通らないので飛ばし、最初の散文行から
+    最大3行・200文字を取る。散文が1行も無ければ空文字を返す。
+    """
+    lines, in_code = [], False
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or not line:
+            if lines:
+                break          # 散文が始まった後の空行で打ち切る
+            continue
+        if line.startswith(("|", ">", "#", "-", "*")):
+            if lines:
+                break
+            continue
+        lines.append(line)
+        if len(lines) >= EXCERPT_MAX_LINES:
+            break
+    return " ".join(lines)[:EXCERPT_MAX_CHARS]
+
+
+def split_sections(doc_key: str, doc_path: str, text: str) -> list[Section]:
+    """ドキュメントを `##` 見出しで分割して節のリストを返す（出現順）。"""
+    parts = re.split(r"^## (.+)$", text, flags=re.MULTILINE)
+    sections = []
+    # parts[0] は前置き（節に属さない）。以降 [見出し, 本文] の繰り返し。
+    for i in range(1, len(parts), 2):
+        heading_text = parts[i].strip()
+        body = parts[i + 1]
+        m = SECTION_NUMBER_RE.match(heading_text)
+        number, title = (m.group(1), m.group(2).strip()) if m else ("", heading_text)
+        sections.append(
+            Section(
+                doc_key=doc_key,
+                doc_path=doc_path,
+                number=number,
+                title=title,
+                heading_text=heading_text,
+                modules=set(MODULE_PATH_RE.findall(body)),
+                excerpt=_make_excerpt(body),
+                role_heading_paths={m.group(2) for m in ROLE_HEADING_RE.finditer(body)},
+                body=body,
+            )
+        )
+    return sections

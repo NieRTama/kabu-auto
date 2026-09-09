@@ -221,3 +221,89 @@ class TestModuleRole:
         mod = Module(path="src/core/logger.py", dotted="core.logger", layer="core",
                      docstring=None)
         assert module_role(mod, {}) == "（説明なし）"
+
+
+from scripts.gen_graph_notes import Section, split_sections  # noqa: E402
+
+SECTION_DOC = textwrap.dedent(
+    """
+    # タイトル
+
+    前置き。節に属さないので無視される。
+
+    ## 1.40 含み損益がOHLCV終値ベースで乖離していた（2026-09-09）
+
+    | 表 | は |
+    |----|----|
+    | 抜粋 | しない |
+
+    ```python
+    # コードブロックも抜粋しない
+    ```
+
+    > 引用も抜粋しない
+
+    ユーザーから報告を受けて調査した。真因は src/data/market_data.py の
+    終値が2〜3日遅れていたこと。src/risk/manager.py も同じ値を見ていた。
+
+    ## 主な機能
+
+    番号の無い見出し。
+    """
+).lstrip()
+
+
+class TestSplitSections:
+    def test_splits_on_h2_and_ignores_preamble(self):
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", SECTION_DOC)
+        assert [s.title for s in secs] == [
+            "含み損益がOHLCV終値ベースで乖離していた（2026-09-09）",
+            "主な機能",
+        ]
+
+    def test_parses_section_number(self):
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", SECTION_DOC)
+        assert secs[0].number == "1.40"
+        assert secs[1].number == ""
+
+    def test_heading_text_is_kept_for_anchor_links(self):
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", SECTION_DOC)
+        assert secs[0].heading_text == "1.40 含み損益がOHLCV終値ベースで乖離していた（2026-09-09）"
+
+    def test_collects_module_mentions_from_body(self):
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", SECTION_DOC)
+        assert secs[0].modules == {"src/data/market_data.py", "src/risk/manager.py"}
+
+    def test_excerpt_skips_tables_code_and_quotes(self):
+        """表・コードブロック・引用を飛ばして最初の散文行から抜粋する。"""
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", SECTION_DOC)
+        assert secs[0].excerpt.startswith("ユーザーから報告を受けて調査した。")
+        assert "|" not in secs[0].excerpt
+        assert "```" not in secs[0].excerpt
+
+    def test_excerpt_is_capped(self):
+        long_doc = "## 1.1 長い節\n\n" + ("あ" * 500) + "\n"
+        secs = split_sections("d", "d.md", long_doc)
+        assert len(secs[0].excerpt) <= 200
+
+    def test_section_without_prose_gets_empty_excerpt(self):
+        doc = "## 1.1 表だけの節\n\n| a | b |\n|---|---|\n"
+        secs = split_sections("d", "d.md", doc)
+        assert secs[0].excerpt == ""
+
+    def test_parses_number_followed_by_a_period(self):
+        """`## 1. モジュール詳細` 形式（番号の後ろに句点）。実測で24件ある。"""
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", DETAIL_DOC)
+        assert secs[0].number == "1"
+        assert secs[0].title == "モジュール詳細"
+
+    def test_keeps_the_body_for_symbol_matching(self):
+        """記号名によるモジュール照合（Task 8）が本文を必要とする。"""
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", DETAIL_DOC)
+        assert "本文。" in secs[0].body
+
+    def test_records_which_modules_this_section_explains(self):
+        """節の中にある型A見出し＝その節が解説しているモジュール。"""
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", DETAIL_DOC)
+        assert secs[0].role_heading_paths == {"src/core/config.py", "src/risk/manager.py"}
+        assert secs[1].role_heading_paths == set()
