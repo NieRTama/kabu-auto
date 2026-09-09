@@ -22,8 +22,9 @@ from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
 from src.core.alerts import LEVEL_INFO, alert
 from src.core.scheduler import TradingScheduler
-from src.data.database import Position, Signal, Trade, get_session
+from src.data.database import OrderIntent, Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
+from src.execution import order_status as st
 from src.risk import liquidity
 from src.strategy import ml_model
 from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
@@ -82,6 +83,37 @@ def _get_position_qty(symbol: str) -> int:
         pos = session.scalar(select(Position).where(Position.symbol == symbol))
         qty = pos.quantity if pos else 0
     return qty
+
+
+# REJECTED/CANCELLED は実際には成立しなかった発注なので「未購入」扱いにし、
+# 同日中の再挑戦を許す（板薄・スプレッド超過等での見送りは次のスロットで拾い直したい）。
+_NOT_BOUGHT_STATUSES = (st.REJECTED, st.CANCELLED)
+
+
+def _bought_today(symbol: str) -> bool:
+    """本日中に、この銘柄へのBUYが成立/進行中か（後場スロットの同日二度打ち防止）。
+
+    2026-09-09 追加。後場(afternoon_execution)は従来「保有中の銘柄はBUY対象から除外」
+    していたが、これだと前日までの保有銘柄への買い増しも一律止めてしまい、朝
+    (skip_existing=False)が許可している買い増しと矛盾していた。実際に止めるべきは
+    「朝と後場で同じシグナルセットを二重に約定させること」であり、保有の有無ではない。
+
+    Trade には作成日時列が無いため（filled_at は未約定の間 None）、紐づく
+    OrderIntent.created_at で当日判定する。
+    """
+    today_start = datetime.combine(clock.today(), datetime.min.time())
+    with get_session() as session:
+        count = session.scalar(
+            select(func.count(Trade.id))
+            .join(OrderIntent, Trade.intent_id == OrderIntent.id)
+            .where(
+                Trade.symbol == symbol,
+                Trade.side == "BUY",
+                Trade.status.notin_(_NOT_BOUGHT_STATUSES),
+                OrderIntent.created_at >= today_start,
+            )
+        ) or 0
+    return count > 0
 
 
 def _paper_available_cash(base_capital: float) -> float:
@@ -384,9 +416,11 @@ class TradingServices:
         シグナルセットを後場でも一度だけ再評価し、寄り付き直後より板が安定した
         タイミングで拾えるようにする（2026-08-25 取引頻度向上のため追加）。
 
-        skip_existing=True で「既に保有中」の銘柄はBUY対象から除外する（＝後場は
-        朝に見送った未保有銘柄を拾い直す用途に限定し、保有銘柄への買い増しはしない）。
-        未約定注文がある銘柄は OrderManager._has_pending_order() が別途止める。
+        skip_existing=True で「本日既にBUYが成立/進行中」の銘柄をBUY対象から除外する
+        （＝朝と後場で同じシグナルを二重に約定させない）。前日までの保有銘柄は対象外
+        （2026-09-09 以前は保有の有無で判定しており、買い増しも一律止めていた。
+        朝(skip_existing=False)は買い増しを許可しており、後場だけ全面禁止する理由が
+        無かった）。未約定注文がある銘柄は OrderManager._has_pending_order() が別途止める。
         """
         self._execute_pending_signals(source="afternoon_execution", skip_existing=True)
 
@@ -402,8 +436,9 @@ class TradingServices:
         値動きが落ち着いた時間」を狙う設計であり、引けに近い時間帯の約定は
         想定と異なるため（no_new_buy_minutes_before_close と同じ思想）。
 
-        skip_existing=True で未保有銘柄のみを対象にし、既存の二重発注ガード
-        （_has_pending_order）と合わせて重複発注を防ぐ。
+        skip_existing=True で「本日既にBUYが成立/進行中」の銘柄を除外し、既存の
+        二重発注ガード（_has_pending_order）と合わせて重複発注を防ぐ。前日までの
+        保有銘柄は対象外＝買い増しを許す（afternoon_execution と同じ判断。2026-09-09）。
         """
         if not TradingScheduler.is_market_open():
             logger.info("認証復帰: 場外のため発注のキャッチアップは行いません")
@@ -421,7 +456,8 @@ class TradingServices:
         """直近バッチのBUY/SELLシグナルを元に発注する（morning/afternoon共通本体）。
 
         source はジョブ名（OrderIntent.source・ログ表記に使う）。
-        skip_existing=True のときは、BUY候補のうち既に保有中の銘柄を対象から除外する。
+        skip_existing=True のときは、BUY候補のうち本日既にBUYが成立/進行中の銘柄を
+        対象から除外する（同日の二度打ち防止。前日までの保有は対象外＝買い増しを許す）。
         """
         mode = self.trading_conf.get("mode", "paper")
         if not tm.uses_morning_execution(mode):
@@ -459,8 +495,12 @@ class TradingServices:
                 logger.error(f"{label}売り発注失敗: {sig.symbol} {e}")
 
         # ── BUY シグナル: 余力を確認して買う ──────────────────────
+        # 同日の二度打ちだけを防ぐ。前日までの保有銘柄への買い増しは許可する
+        # （2026-09-09 以前は保有の有無で一律除外しており、朝が許可している
+        # 買い増しと矛盾していた）。1銘柄あたりの上限は calc_position_size 側で
+        # 既存保有評価額を差し引いた残り枠として計算される。
         if skip_existing:
-            buy_signals = [s for s in buy_signals if _get_position_qty(s.symbol) <= 0]
+            buy_signals = [s for s in buy_signals if not _bought_today(s.symbol)]
         if not buy_signals:
             return
         # 大引け間際の新規BUYは薄商い・不利約定を招きやすいので見送る（P0-6。0で無効）

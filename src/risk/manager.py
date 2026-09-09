@@ -282,14 +282,28 @@ class RiskManager:
         足りないわけではない。2026-09-03 に余力484,005円がありながら候補8銘柄が
         すべてこの理由で見送られ、ログを見ても資金不足としか読めなかった。
         原因が枠なのか現金なのかで打つ手（比率の見直し／入金）が変わるため書き分ける。
+
+        2026-09-09 追記: 既存保有分（held_value）を差し引いた「残り枠」も理由になり得る
+        （後場スロットの買い増し許可に伴い、上限を使い切った保有銘柄が該当する）。
+        こちらも held_value を明示して区別する（そうしないと「必要株数を算出できません」
+        という無内容な文面に戻ってしまう＝2026-09-03 に潰したのと同型の問題）。
         """
         if price <= 0:
             return f"価格を取得できません: {symbol}"
         budget = self.position_budget(cash_balance, snapshot)
+        held_value = self._held_value(symbol, price, snapshot)
+        remaining = max(0.0, budget - held_value)
         lot_cost = price * LOT_SIZE
         ratio = self._conf.get("max_position_ratio", 0.20)
-        if budget >= lot_cost:      # 論理上ここには来ないが、取り違えを防ぐ保険
+        if remaining >= lot_cost:      # 論理上ここには来ないが、取り違えを防ぐ保険
             return f"必要株数を算出できません: {symbol}"
+        if held_value > 0:
+            return (
+                f"単元({LOT_SIZE}株)の必要額 {lot_cost:,.0f}円 が1銘柄上限の残り枠 "
+                f"{remaining:,.0f}円 を超過（1銘柄上限 {budget:,.0f}円 のうち既存保有評価額 "
+                f"{held_value:,.0f}円 を消費済み。株価{price:,.0f}円・上限比率{ratio:.0%}・"
+                f"実効余力{cash_balance:,.0f}円）"
+            )
         return (
             f"単元({LOT_SIZE}株)の必要額 {lot_cost:,.0f}円 が1銘柄上限 {budget:,.0f}円 を超過"
             f"（株価{price:,.0f}円・上限比率{ratio:.0%}・実効余力{cash_balance:,.0f}円）"
@@ -301,6 +315,9 @@ class RiskManager:
 
         「残余力に対する比率」であることに注意。呼び出し側は購入のたびに
         cash_balance を減らすため、2件目以降の枠は自動的に小さくなる。
+
+        既存保有分は差し引かない（このメソッドは「1銘柄あたりの枠そのもの」を返す。
+        保有分の控除は `calc_position_size` / `_explain_zero_size` が `_held_value` で行う）。
         """
         max_ratio = self._conf.get("max_position_ratio", 0.20)
         # 未約定BUYの引当を差し引いた実効余力で上限を計算する
@@ -309,16 +326,46 @@ class RiskManager:
         available = max(0.0, cash_balance - reserved)
         return available * max_ratio
 
+    def _held_value(self, symbol: str, price: float,
+                    snapshot: Optional[RiskSnapshot] = None) -> float:
+        """この銘柄の現在の保有評価額（現在値ベース）。
+
+        2026-09-09 追加。後場スロットが「前日までの保有銘柄への買い増し」を許可した
+        ことに伴い、1銘柄あたりの上限（position_budget）から既存保有分を差し引いて
+        「残り枠」を出す必要が生じた。**簿価(avg_cost)ではなく引数の現在値で評価する**。
+        簿価だと値上がり銘柄の実質的な集中度を過小評価し、値下がり銘柄では過大評価する
+        （枠は「今どれだけこの銘柄に資金が寝ているか」を表すべきもののため）。
+        """
+        if snapshot is not None:
+            pos = next((p for p in snapshot.positions if p.symbol == symbol), None)
+            qty = pos.quantity if pos else 0
+        else:
+            with get_session() as session:
+                pos = session.scalar(select(Position).where(Position.symbol == symbol))
+                qty = pos.quantity if pos else 0
+        return qty * price
+
     def calc_position_size(self, symbol: str, price: float,
                            cash_balance: float,
                            snapshot: Optional[RiskSnapshot] = None) -> int:
-        """購入株数を計算する（最大投資額を超えない範囲）"""
+        """購入株数を計算する（1銘柄あたりの上限から既存保有分を差し引いた残り枠まで）。
+
+        従来は残余力に対する比率のみで上限額を出しており、既にこの銘柄をいくら
+        持っているかを見ていなかった。後場スロットで前日までの保有銘柄への買い増しを
+        許可すると、上限いっぱい保有した銘柄へさらに満額買い増そうとしてしまうため、
+        既存保有の評価額（現在値ベース。`_held_value`）を上限から差し引く。
+        """
         if price <= 0:
             return 0
         max_amount = self.position_budget(cash_balance, snapshot)
-        units = int(max_amount / (price * LOT_SIZE))
+        held_value = self._held_value(symbol, price, snapshot)
+        remaining_budget = max(0.0, max_amount - held_value)
+        units = int(remaining_budget / (price * LOT_SIZE))
         quantity = units * LOT_SIZE
-        logger.debug(f"{symbol}: 購入可能数={quantity}株 (価格={price:.0f}, 上限={max_amount:.0f}円)")
+        logger.debug(
+            f"{symbol}: 購入可能数={quantity}株 (価格={price:.0f}, 上限={max_amount:.0f}円, "
+            f"既存保有評価額={held_value:.0f}円)"
+        )
         return quantity
 
     def check_max_positions(self, candidate_symbol: Optional[str] = None,

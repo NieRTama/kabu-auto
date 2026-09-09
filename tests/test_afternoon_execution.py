@@ -8,7 +8,10 @@ afternoon_execution（後場スロット）の検証テスト
 検証observategory:
   - スケジューラに 12:35・平日で登録されていること
   - main.py から afternoon_execution がコールバック登録されていること
-  - skip_existing=True により、既に保有中の銘柄へはBUYしない（買い増ししない）こと
+  - skip_existing=True でも、**前日までの保有**にはBUYで買い増しできること
+    （2026-09-09 変更: 「未保有銘柄限定」から「同日の二度打ち防止」へ）
+  - skip_existing=True は**本日既に買った**銘柄をBUY対象から除外すること
+    （REJECTED/CANCELLEDのみで実際には成立しなかった発注は対象外＝再挑戦を許す）
   - skip_existing=True でも SELL（保有分の手仕舞い）は従来どおり行われること
   - morning_execution（skip_existing=False）は従来どおり保有有無に関係なくBUY評価すること
     （後場だけの挙動変更であり、朝の挙動を変えていないことの回帰防止）
@@ -109,12 +112,15 @@ class TestSkipExistingBehavior:
             svc = TradingServices(client, risk, order_mgr)
         return svc, risk, order_mgr
 
-    def _run(self, svc, method_name: str, signals: list, held_qty: dict):
+    def _run(self, svc, method_name: str, signals: list, held_qty: dict,
+             bought_today: set = frozenset()):
         with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
              patch.object(scheduler_mod.TradingScheduler, "is_near_close", return_value=False), \
              patch("src.services.trading._select_latest_signals", return_value=signals), \
              patch("src.services.trading._get_position_qty",
                    side_effect=lambda sym: held_qty.get(sym, 0)), \
+             patch("src.services.trading._bought_today",
+                   side_effect=lambda sym: sym in bought_today), \
              patch("src.services.trading.watchlist_store") as watchlist_mock, \
              patch("src.services.trading.load_ohlcv"), \
              patch("src.services.trading.liquidity") as liquidity_mock:
@@ -123,13 +129,25 @@ class TestSkipExistingBehavior:
             liquidity_mock.check_spread.return_value = (True, "")
             getattr(svc, method_name)()
 
-    def test_afternoon_skips_buy_for_already_held_symbol(self):
-        """後場: 既に保有中の銘柄はBUY対象から除外される（買い増ししない）"""
+    def test_afternoon_skips_buy_for_symbol_bought_today(self):
+        """後場: 本日既に買った銘柄はBUY対象から除外される（同日の二度打ち防止）"""
         svc, risk, order_mgr = self._services()
         self._run(svc, "afternoon_execution",
                    signals=[_make_signal("7203", "BUY")],
-                   held_qty={"7203": 100})
+                   held_qty={"7203": 100}, bought_today={"7203"})
         order_mgr.buy.assert_not_called()
+
+    def test_afternoon_buys_into_holding_from_before_today(self):
+        """後場: 前日までの保有銘柄には買い増しできる（2026-09-09 の挙動変更）
+
+        朝(skip_existing=False)は既に買い増しを許可しており、後場だけ全面禁止
+        する理由が無かった。実際に止めるべきは「同じシグナルでの同日二度打ち」。
+        """
+        svc, risk, order_mgr = self._services()
+        self._run(svc, "afternoon_execution",
+                   signals=[_make_signal("7203", "BUY")],
+                   held_qty={"7203": 100}, bought_today=set())
+        order_mgr.buy.assert_called_once()
 
     def test_afternoon_buys_unheld_symbol(self):
         """後場: 未保有の銘柄は通常どおりBUY評価される（朝の見送りを拾い直す）"""
@@ -148,9 +166,13 @@ class TestSkipExistingBehavior:
         order_mgr.sell.assert_called_once()
 
     def test_morning_still_buys_held_symbol(self):
-        """朝: 保有有無に関係なくBUY評価する（後場だけの挙動変更であることの回帰防止）"""
+        """朝: 保有有無に関係なくBUY評価する（後場だけの挙動変更であることの回帰防止）
+
+        _bought_today() すら呼ばれないこと（skip_existing=False は本日購入チェックも
+        適用対象外であることの確認）。
+        """
         svc, risk, order_mgr = self._services()
         self._run(svc, "morning_execution",
                    signals=[_make_signal("7203", "BUY")],
-                   held_qty={"7203": 100})
+                   held_qty={"7203": 100}, bought_today={"7203"})
         order_mgr.buy.assert_called_once()
