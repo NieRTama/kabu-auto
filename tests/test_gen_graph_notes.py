@@ -463,3 +463,57 @@ class TestRenderModuleNote:
         """生成日時を書くとiCloudが毎回全ファイルを再同期するため入れない。"""
         note = self._render()
         assert "生成日時" not in note
+
+
+from scripts.gen_graph_notes import render_section_note  # noqa: E402
+
+DOTTED = {
+    "src/risk/manager.py": "risk.manager",
+    "src/data/market_data.py": "data.market_data",
+}
+
+
+class TestRenderSectionNote:
+    def test_has_frontmatter_with_source(self):
+        sec = _section()
+        note = render_section_note(sec, DOTTED)
+        assert "tags: [kabu-auto/section, kabu-auto/詳細設計書]" in note
+        assert "source: docs/詳細設計書.md" in note
+        assert "generated_by: gen_graph_notes.py" in note
+
+    def test_title_uses_full_heading(self):
+        note = render_section_note(_section(), DOTTED)
+        assert "# 1.40 含み損益がOHLCV終値ベースで乖離" in note
+
+    def test_links_back_to_source_with_anchor(self):
+        note = render_section_note(_section(), DOTTED)
+        assert "[[詳細設計書#1.40 含み損益がOHLCV終値ベースで乖離]]" in note
+
+    def test_lists_related_modules_sorted(self):
+        sec = _section()
+        sec.modules = {"src/risk/manager.py", "src/data/market_data.py"}
+        note = render_section_note(sec, DOTTED)
+        assert "- [[data.market_data]]\n- [[risk.manager]]" in note
+
+    def test_omits_module_section_when_empty(self):
+        note = render_section_note(_section(), DOTTED)
+        assert "関係するモジュール" not in note
+
+    def test_includes_excerpt(self):
+        sec = _section()
+        sec.excerpt = "ユーザーから報告を受けて調査した。"
+        note = render_section_note(sec, DOTTED)
+        assert "ユーザーから報告を受けて調査した。" in note
+
+    def test_unknown_module_path_is_skipped(self):
+        """設計書に書かれているが実在しないモジュールへのリンクは張らない。"""
+        sec = _section()
+        sec.modules = {"src/does/not_exist.py"}
+        note = render_section_note(sec, DOTTED)
+        assert "関係するモジュール" not in note
+
+    def test_escapes_wikilinks_in_excerpt(self):
+        sec = _section()
+        sec.excerpt = "型は Callable[[list[str]], float] である。"
+        note = render_section_note(sec, DOTTED)
+        assert "[[list" not in note

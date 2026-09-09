@@ -383,3 +383,32 @@ def render_module_note(
         out += ["", "## 関係する設計判断・事故", "", _bullet_list(names)]
 
     return "\n".join(out) + "\n"
+
+
+def render_section_note(section: Section, module_dotted: dict[str, str]) -> str:
+    """節スタブ1件のMarkdownを組み立てる。
+
+    本文は原本に残し、ここには要約とリンクだけを置く（重複を作らないため）。
+    設計書に書かれていても実在しないモジュールへのリンクは張らない。
+    """
+    out = [
+        "---",
+        f"tags: [kabu-auto/section, kabu-auto/{section.doc_key}]",
+        f"source: {section.doc_path}",
+        "generated_by: gen_graph_notes.py",
+        "---",
+        "",
+        f"# {section.heading_text}",
+    ]
+    if section.excerpt:
+        out += ["", escape_wikilinks(section.excerpt)]
+
+    out += ["", "## 本文", "", f"- [[{section.doc_key}#{section.heading_text}]]"]
+
+    linked = sorted(
+        module_dotted[p] for p in section.modules if p in module_dotted
+    )
+    if linked:
+        out += ["", "## 関係するモジュール", "", _bullet_list(linked)]
+
+    return "\n".join(out) + "\n"
