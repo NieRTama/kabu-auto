@@ -54,7 +54,7 @@
 **Interfaces:**
 - Consumes: なし（最初のタスク）
 - Produces:
-  - `Module` dataclass: `path: str`（`"src/risk/manager.py"` 形式・スラッシュ区切り）, `dotted: str`（`"risk.manager"`）, `layer: str`, `docstring: str | None`, `deps: set[str]`（値は `dotted` 形式）
+  - `Module` dataclass: `path: str`（`"src/risk/manager.py"` 形式・スラッシュ区切り）, `dotted: str`（`"risk.manager"`）, `layer: str`, `docstring: str | None`, `deps: set[str]`（値は `dotted` 形式）, `symbols: set[str]`（トップレベルのクラス／関数名。曖昧なものは除去済み）
   - `discover_modules(repo_root: Path) -> list[Module]` — `path` 昇順でソート済み
   - `resolve_import(module: str | None, names: list[str], repo_root: Path) -> set[str]` — 戻り値は `"src.risk.manager"` 形式のドット表記
 
@@ -102,6 +102,10 @@ def repo(tmp_path):
         """
         from src.core import clock
         from src.core.config import get_section
+
+
+        class RiskManager:
+            pass
         ''',
     )
     _write(
@@ -150,6 +154,24 @@ class TestDiscoverModules:
         by_path = {m.path: m for m in discover_modules(repo)}
         assert by_path["src/risk/manager.py"].deps == {"core.clock", "core.config"}
 
+
+
+class TestExtractSymbols:
+    def test_collects_class_and_function_names(self, repo):
+        by_path = {m.path: m for m in discover_modules(repo)}
+        assert "RiskManager" in by_path["src/risk/manager.py"].symbols
+
+    def test_drops_short_and_undistinctive_names(self, repo):
+        """短い名前・アンダースコア無しの関数名は本文中の別語に誤マッチするので採らない。"""
+        by_path = {m.path: m for m in discover_modules(repo)}
+        assert "Cfg" not in by_path["src/core/config.py"].symbols
+        assert "load" not in by_path["src/core/config.py"].symbols
+
+    def test_drops_names_defined_in_two_modules(self, repo):
+        """同じ名前が2モジュールにあると、どちらを指すか決められないので捨てる。"""
+        by_path = {m.path: m for m in discover_modules(repo)}
+        assert "SharedThing" not in by_path["src/core/clock.py"].symbols
+        assert "SharedThing" not in by_path["src/core/config.py"].symbols
 
 class TestResolveImport:
     def test_from_package_import_module_resolves_to_the_module(self, repo):
@@ -206,7 +228,8 @@ class Module:
     dotted: str                    # "risk.manager"（src. を除いたドット表記）
     layer: str                     # "risk" / "core" / ... / main.py は "root"
     docstring: str | None = None
-    deps: set[str] = field(default_factory=set)   # dotted形式の依存先
+    deps: set[str] = field(default_factory=set)     # dotted形式の依存先
+    symbols: set[str] = field(default_factory=set)  # トップレベルのクラス／関数名
 
 
 def _to_dotted(path: str) -> str:
@@ -266,6 +289,29 @@ def _parse_deps(source: str, repo_root: Path) -> set[str]:
     return {_to_dotted(r.replace(".", "/") + ".py") for r in raw}
 
 
+# 記号名の採用条件。短い名前・ありふれた名前は本文中の別の語に誤マッチするため弾く。
+MIN_CLASS_NAME = 5
+MIN_FUNC_NAME = 8
+
+
+def _extract_symbols(tree: ast.Module) -> set[str]:
+    """モジュールのトップレベルで定義された、識別力のある名前を集める。
+
+    設計書の事故節はモジュールをパスではなく記号名で書いている
+    （例: §1.40 は "src/risk/manager.py" ではなく "RiskManager" と書く。
+    実測では src/risk/manager.py は設計書全体で1回しか出てこない）。
+    この名前で節とモジュールを繋ぐため控えておく。
+    """
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and len(node.name) >= MIN_CLASS_NAME:
+            names.add(node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if len(node.name) >= MIN_FUNC_NAME and "_" in node.name:
+                names.add(node.name)
+    return names
+
+
 def discover_modules(repo_root: Path) -> list[Module]:
     """src配下の全モジュールとmain.pyを探し、依存関係を解析して返す（path昇順）。"""
     files = [p for p in sorted((repo_root / "src").rglob("*.py")) if p.name != "__init__.py"]
@@ -285,16 +331,26 @@ def discover_modules(repo_root: Path) -> list[Module]:
             layer=_to_layer(rel),
             docstring=docstring.strip() if docstring else None,
             deps=_parse_deps(source, repo_root),
+            symbols=_extract_symbols(tree),
         )
         mod.deps.discard(mod.dotted)   # 自己参照は落とす
         modules.append(mod)
+
+    # 2つ以上のモジュールに出る名前は、どちらを指すか決められないので捨てる
+    counts: dict[str, int] = {}
+    for mod in modules:
+        for name in mod.symbols:
+            counts[name] = counts.get(name, 0) + 1
+    for mod in modules:
+        mod.symbols = {n for n in mod.symbols if counts[n] == 1}
+
     return sorted(modules, key=lambda m: m.path)
 ```
 
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 9 passed
+Expected: 12 passed
 
 - [ ] **Step 5: 実リポジトリに対して健全性を確認**
 
@@ -479,7 +535,7 @@ def module_role(module: Module, headings: dict[str, RoleHeading]) -> str:
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 17 passed
+Expected: 20 passed
 
 - [ ] **Step 5: 実データで件数を確認**
 
@@ -605,6 +661,11 @@ class TestSplitSections:
         assert secs[0].number == "1"
         assert secs[0].title == "モジュール詳細"
 
+    def test_keeps_the_body_for_symbol_matching(self):
+        """記号名によるモジュール照合（Task 8）が本文を必要とする。"""
+        secs = split_sections("詳細設計書", "docs/詳細設計書.md", DETAIL_DOC)
+        assert "本文。" in secs[0].body
+
     def test_records_which_modules_this_section_explains(self):
         """節の中にある型A見出し＝その節が解説しているモジュール。"""
         secs = split_sections("詳細設計書", "docs/詳細設計書.md", DETAIL_DOC)
@@ -647,6 +708,7 @@ class Section:
     # この節の中に型A見出し（そのモジュールの解説）を持つモジュールのパス。
     # 「関係する設計判断・事故」から自分の解説節を除くために使う。
     role_heading_paths: set[str] = field(default_factory=set)
+    body: str = ""        # 節の本文。記号名によるモジュール照合に使う
 
 
 def _make_excerpt(body: str) -> str:
@@ -695,6 +757,7 @@ def split_sections(doc_key: str, doc_path: str, text: str) -> list[Section]:
                 modules=set(MODULE_PATH_RE.findall(body)),
                 excerpt=_make_excerpt(body),
                 role_heading_paths={m.group(2) for m in ROLE_HEADING_RE.finditer(body)},
+                body=body,
             )
         )
     return sections
@@ -703,7 +766,7 @@ def split_sections(doc_key: str, doc_path: str, text: str) -> list[Section]:
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 26 passed
+Expected: 30 passed
 
 - [ ] **Step 5: 実データで件数を確認**
 
@@ -894,7 +957,7 @@ def find_collisions(note_names: list[str], vault_root: Path, graph_dir: Path) ->
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 36 passed
+Expected: 40 passed
 
 - [ ] **Step 5: 実vaultに対して衝突がないか確認（読み取りのみ）**
 
@@ -1108,7 +1171,7 @@ def render_module_note(
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 47 passed
+Expected: 51 passed
 
 - [ ] **Step 5: コミット**
 
@@ -1237,7 +1300,7 @@ def render_section_note(section: Section, module_dotted: dict[str, str]) -> str:
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 55 passed
+Expected: 59 passed
 
 - [ ] **Step 5: コミット**
 
@@ -1440,7 +1503,7 @@ Obsidianの設定は自動で書き換えていない（既存の設定を壊さ
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 63 passed
+Expected: 67 passed
 
 - [ ] **Step 5: コミット**
 
@@ -1457,7 +1520,124 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: CLI結線と初回実行・実測
+### Task 8: 記号名によるモジュール照合
+
+**Files:**
+- Modify: `scripts/gen_graph_notes.py`
+- Test: `tests/test_gen_graph_notes.py`
+
+**Interfaces:**
+- Consumes: `Module`（Task 1。`symbols` を使う）
+- Produces: `match_modules_by_symbol(body: str, modules: list[Module]) -> set[str]` — 戻り値はモジュールのパス
+
+**背景（実装者向け）:** 設計書の事故節はモジュールを**パスではなく記号名で書いている**。
+実測では `src/risk/manager.py` は設計書全体で1回（モジュール詳細節）しか出てこず、
+§1.39・§1.40 は `RiskManager` `unrealized_pnl` と書いている。パス走査だけだと
+「この事故はどのファイル発か」という最も価値のある辺がほとんど張れない。
+
+実測: パス走査のみ = 辺47本・繋がる節29/71件 → 記号名も見る = **辺125本・繋がる節48/71件**。
+
+**単語境界の注意:** `` を使ってはいけない。Pythonの `re` はUnicode既定なので
+日本語文字が `\w` 扱いになり、`RiskManagerの初期化` のように助詞が直結すると
+マッチしない（日本語ドキュメントでは頻出）。ASCIIの英数字とアンダースコアだけを
+境界とみなす先読み・後読みを使う。
+
+- [ ] **Step 1: 失敗するテストを書く**
+
+`tests/test_gen_graph_notes.py` の末尾に追記:
+
+```python
+from scripts.gen_graph_notes import match_modules_by_symbol  # noqa: E402
+
+
+def _mods_with_symbols():
+    return [
+        Module(path="src/risk/manager.py", dotted="risk.manager", layer="risk",
+               symbols={"RiskManager", "unrealized_pnl"}),
+        Module(path="src/data/market_data.py", dotted="data.market_data", layer="data",
+               symbols={"latest_closes"}),
+    ]
+
+
+class TestMatchModulesBySymbol:
+    def test_matches_symbol_followed_by_a_japanese_particle(self):
+        """`RiskManagerの初期化` にマッチすること。
+
+         を使うとPythonのUnicode既定で「の」が単語文字扱いになり、
+        境界が成立せずマッチしない。日本語ドキュメントでは頻出の書き方。
+        """
+        body = "RiskManagerの初期化で例外が出る。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == {"src/risk/manager.py"}
+
+    def test_matches_symbol_in_japanese_quotes(self):
+        body = "「unrealized_pnl」が誤った値を返していた。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == {"src/risk/manager.py"}
+
+    def test_does_not_match_a_longer_identifier(self):
+        """部分一致で誤って繋がないこと。"""
+        body = "MyRiskManagerXtra は無関係のクラスである。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == set()
+
+    def test_matches_multiple_modules(self):
+        body = "RiskManager が latest_closes を呼んでいる。"
+        assert match_modules_by_symbol(body, _mods_with_symbols()) == {
+            "src/risk/manager.py", "src/data/market_data.py"}
+
+    def test_returns_empty_when_nothing_matches(self):
+        assert match_modules_by_symbol("関係の無い文章。", _mods_with_symbols()) == set()
+```
+
+- [ ] **Step 2: テストを実行して失敗を確認**
+
+Run: `python -m pytest tests/test_gen_graph_notes.py -k MatchModulesBySymbol -v`
+Expected: FAIL — `ImportError: cannot import name 'match_modules_by_symbol'`
+
+- [ ] **Step 3: 最小の実装を書く**
+
+`scripts/gen_graph_notes.py` の末尾に追記:
+
+```python
+def match_modules_by_symbol(body: str, modules: list[Module]) -> set[str]:
+    """節本文に出てくる記号名から、関係するモジュールのパスを集める。
+
+    境界に `` を使わないこと。Pythonの `re` はUnicode既定なので日本語文字が
+    `\w` 扱いになり、`RiskManagerの初期化` のように助詞が直結するとマッチしない。
+    ASCIIの英数字とアンダースコアだけを境界とみなす。
+    """
+    hits = set()
+    for module in modules:
+        for name in module.symbols:
+            pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
+            if re.search(pattern, body):
+                hits.add(module.path)
+                break
+    return hits
+```
+
+- [ ] **Step 4: テストを実行して通ることを確認**
+
+Run: `python -m pytest tests/test_gen_graph_notes.py -v`
+Expected: 72 passed
+
+- [ ] **Step 5: コミット**
+
+```bash
+git add scripts/gen_graph_notes.py tests/test_gen_graph_notes.py
+git commit -m "feat(tools): 記号名によるモジュール照合を追加
+
+設計書の事故節はモジュールをパスではなく記号名で書いている（src/risk/manager.py
+は設計書全体で1回しか出てこず、§1.40は RiskManager と書く）。パス走査だけでは
+辺47本・繋がる節29/71件だったのが、記号名も見ると辺125本・48/71件になる。
+
+単語境界に \b を使わない。PythonのreはUnicode既定で日本語文字が \w 扱いになり、
+「RiskManagerの初期化」のように助詞が直結するとマッチしないため。
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: CLI結線と初回実行・実測
 
 **Files:**
 - Modify: `scripts/gen_graph_notes.py`
@@ -1500,6 +1680,34 @@ class TestBuildAll:
     def test_dependents_are_computed_by_inverting_the_graph(self, full_repo):
         notes, _, _ = build_all(full_repo)
         assert "- [[main]]" in notes["modules/risk.manager.md"]
+
+    def test_links_incident_sections_found_by_symbol_name(self, full_repo):
+        """パスを書いていない事故節でも、記号名でモジュールに繋がること。
+
+        実データではこれが主経路（設計書は src/risk/manager.py ではなく
+        RiskManager と書く）。
+        """
+        _write(full_repo / "docs" / "運用Runbook.md",
+               "## 9. 障害対応
+
+RiskManager が誤った値を返す事象。
+")
+        notes, _, _ = build_all(full_repo)
+        assert "運用Runbook-9-障害対応" in notes["modules/risk.manager.md"]
+
+    def test_section_notes_also_list_symbol_matched_modules(self, full_repo):
+        """節ノート側の「関係するモジュール」にも記号名マッチを反映すること。
+
+        反映しないと、モジュール側からは繋がっているのに節側は空、という
+        非対称な表示になる。
+        """
+        _write(full_repo / "docs" / "運用Runbook.md",
+               "## 9. 障害対応
+
+RiskManager が誤った値を返す事象。
+")
+        notes, _, _ = build_all(full_repo)
+        assert "- [[risk.manager]]" in notes["sections/運用Runbook-9-障害対応.md"]
 
     def test_own_explanation_section_is_not_listed_as_an_incident(self, full_repo):
         """自分の解説がある節を「関係する設計判断・事故」に出さない。
@@ -1608,8 +1816,14 @@ def build_all(repo_root: Path) -> tuple[dict[str, str], int, int]:
     # 参照される偽のハブになるのを防ぐ）。
     related: dict[str, list[Section]] = {m.path: [] for m in modules}
     for sec in sections:
-        for path in sec.modules:
-            if path in related and path not in sec.role_heading_paths:
+        # パス表記と記号名の両方で拾う。事故節はパスをほとんど書かず
+        # 「RiskManager」のような記号名で書くため、記号名が主な供給源になる。
+        hit = sec.modules | match_modules_by_symbol(sec.body, modules)
+        # 節ノートの「関係するモジュール」にも反映する。ここを更新しないと、
+        # モジュール側からは繋がっているのに節側は空、という非対称が起きる。
+        sec.modules = hit
+        for path in hit - sec.role_heading_paths:
+            if path in related:
                 related[path].append(sec)
 
     notes: dict[str, str] = {}
@@ -1687,12 +1901,12 @@ if __name__ == "__main__":
 - [ ] **Step 4: テストを実行して通ることを確認**
 
 Run: `python -m pytest tests/test_gen_graph_notes.py -v`
-Expected: 72 passed
+Expected: 84 passed
 
 - [ ] **Step 5: 既存テストを壊していないことを確認**
 
 Run: `python -m pytest -q`
-Expected: 1138 passed（既存1066 + 新規72）。失敗が出たら新規テストの副作用を疑う。
+Expected: 1150 passed（既存1066 + 新規84）。失敗が出たら新規テストの副作用を疑う。
 
 - [ ] **Step 6: dry-run で実データを確認**
 
@@ -1749,7 +1963,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 9: 運用手順への反映
+### Task 10: 運用手順への反映
 
 **Files:**
 - Modify: `C:\Users\garnet\.claude\projects\c--Users-garnet-kabu-auto\memory\obsidian_vault_sync.md`
@@ -1821,7 +2035,7 @@ cp docs/運用Runbook.md "C:/Users/garnet/iCloudDrive/iCloud~md~obsidian/Tama va
 
 ## 完了時の確認
 
-- [ ] `python -m pytest -q` が全て通る（既存1066 + 新規72 = 1138）
+- [ ] `python -m pytest -q` が全て通る（既存1066 + 新規84 = 1150）
 - [ ] `python scripts/gen_graph_notes.py --dry-run` が衝突ゼロで完走する
 - [ ] vaultに モジュール49 + 節71 + index 1 = 121ファイルが生成されている
 - [ ] Obsidianのグラフビューで、モジュール群・節群・既存ドキュメントが連結して見える
