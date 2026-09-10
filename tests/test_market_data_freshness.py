@@ -105,3 +105,50 @@ class TestLoadPriceBasis:
         market_data.upsert_ohlcv("7203", df)
 
         assert market_data.load_ohlcv("7203")["close"].iloc[0] == 502.5
+
+
+class TestUpdateSymbolReturnsStatus:
+    def test_returns_fresh_when_last_bar_matches_session(self, tmp_path):
+        cfg.load("config.yaml")
+        cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+        db.init()
+
+        now = datetime(2026, 9, 10, 16, 0)
+        fake_ticker = MagicMock()
+        fake_ticker.splits = pd.Series(dtype=float)
+        with patch.object(market_data.yf, "download",
+                          return_value=_fake_yf_frame([date(2026, 9, 9), date(2026, 9, 10)])), \
+             patch.object(market_data.yf, "Ticker", return_value=fake_ticker):
+            st = market_data.update_symbol("7203", years=1, now=now)
+
+        assert st.state == "fresh"
+        assert st.last_bar_session == date(2026, 9, 10)
+
+    def test_returns_stale_when_update_yields_old_bar(self, tmp_path):
+        cfg.load("config.yaml")
+        cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+        db.init()
+
+        now = datetime(2026, 9, 10, 16, 0)
+        fake_ticker = MagicMock()
+        fake_ticker.splits = pd.Series(dtype=float)
+        with patch.object(market_data.yf, "download",
+                          return_value=_fake_yf_frame([date(2026, 9, 8), date(2026, 9, 9)])), \
+             patch.object(market_data.yf, "Ticker", return_value=fake_ticker):
+            st = market_data.update_symbol("7203", years=1, now=now)
+
+        assert st.state == "stale"
+
+    def test_returns_missing_when_fetch_empty(self, tmp_path):
+        cfg.load("config.yaml")
+        cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+        db.init()
+
+        now = datetime(2026, 9, 10, 16, 0)
+        fake_ticker = MagicMock()
+        fake_ticker.splits = pd.Series(dtype=float)
+        with patch.object(market_data.yf, "download", return_value=pd.DataFrame()), \
+             patch.object(market_data.yf, "Ticker", return_value=fake_ticker):
+            st = market_data.update_symbol("7203", years=1, now=now)
+
+        assert st.state == "missing"

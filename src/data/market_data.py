@@ -5,13 +5,16 @@ kabuステーションAPIは板情報のリアルタイム取得に使用し、
 過去データはyfinanceで補完する（権利修正済み）。
 """
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from typing import Optional
 
 import pandas as pd
 import yfinance as yf
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import clock
+from src.data.bar_status import BarStatus, classify
 from src.data.database import OHLCV, CorporateAction, get_session
 
 
@@ -168,13 +171,36 @@ def split_factor_between(symbol: str, start: date, end: date) -> float:
     return factor
 
 
-def update_symbol(symbol: str, years: int = 3) -> None:
-    """銘柄の過去データを更新する"""
-    end = date.today()
+def update_symbol(symbol: str, years: int = 3,
+                  now: Optional[datetime] = None) -> BarStatus:
+    """銘柄の過去データと分割イベントを更新し、最終足の状態を返す。
+
+    戻り値の BarStatus は「更新した結果、この銘柄の足は基準セッションまで
+    追いついているか」を表す。呼び出し側はこれを見て、確定していない足の銘柄を
+    新規候補から除外する（保有保護の退出は止めない）。
+    """
+    now = now or clock.now()
+    end = now.date()
     start = end - timedelta(days=365 * years)
     df = fetch_ohlcv(symbol, start, end)
     added = upsert_ohlcv(symbol, df)
-    logger.info(f"データ更新: {symbol} 追加={added}件")
+    split_added = upsert_splits(symbol, fetch_splits(symbol))
+
+    last_bar = max(df.index) if not df.empty else _last_stored_session(symbol)
+    status = classify(symbol, last_bar, now)
+    logger.info(
+        f"データ更新: {symbol} 追加={added}件 分割={split_added}件 "
+        f"最終足={last_bar} 状態={status.state}"
+    )
+    return status
+
+
+def _last_stored_session(symbol: str) -> Optional[date]:
+    """DBに保存済みの最終営業日（取得が空だったときの判定に使う）。"""
+    with get_session() as session:
+        return session.scalar(
+            select(func.max(OHLCV.date)).where(OHLCV.symbol == symbol)
+        )
 
 
 def load_ohlcv(symbol: str, limit: int = 500,
