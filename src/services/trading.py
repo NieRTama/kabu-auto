@@ -9,7 +9,7 @@ main.py に集中していたスケジューラジョブのロジック（デー
 （5モジュールに分割すると同じ依存と可変modelを相互参照する結合が増えるため、
 凝集した単一クラスとした）。純粋な抽出であり挙動は main.py の旧クロージャと同一。
 """
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from loguru import logger
@@ -134,7 +134,7 @@ def _paper_available_cash(base_capital: float) -> float:
     return max(0.0, base_capital + float(realized) - invested)
 
 
-def _save_signal(sig: TradeSignal) -> None:
+def _save_signal(sig: TradeSignal, data_as_of: Optional[date] = None) -> None:
     with get_session() as session:
         session.add(Signal(
             symbol=sig.symbol,
@@ -142,6 +142,7 @@ def _save_signal(sig: TradeSignal) -> None:
             ml_score=sig.ml_score,
             combined_score=sig.combined_score,
             action=sig.action,
+            data_as_of=data_as_of,
         ))
         session.commit()
 

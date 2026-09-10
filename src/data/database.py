@@ -172,6 +172,10 @@ class Signal(Base):
     id = Column(Integer, primary_key=True)
     symbol = Column(String(10), nullable=False)
     generated_at = Column(DateTime, default=clock.now)  # JST naive（morning_executionのcutoffと統一）
+    # このシグナルの根拠にした日足の最終営業日。生成日時とは別物で、
+    # 「いつ作ったか」と「いつのデータで作ったか」を区別するために持つ。
+    # 移行前に生成された行は不明のため NULL のままにする（推測で埋めない）。
+    data_as_of = Column(Date)
     rule_score = Column(Float)
     ml_score = Column(Float)
     combined_score = Column(Float)
