@@ -73,7 +73,9 @@ class TestFreshnessGate:
                                       order_mgr=MagicMock(), model=None)
         svc._bar_states = {"7203": _status("7203", "fresh")}
 
-        assert svc._is_fresh_for_new_candidate("7203") is True
+        with patch.object(trading.clock, "now",
+                          return_value=datetime(2026, 9, 10, 16, 20)):
+            assert svc._is_fresh_for_new_candidate("7203") is True
 
     def test_unknown_symbol_is_not_fresh(self, isolated_db):
         """更新結果が無い銘柄は fresh と判定しない（安全側）"""
@@ -169,6 +171,9 @@ class TestZeroFreshAlert:
 
         with patch.object(trading.watchlist_store, "get_codes",
                           return_value=["7203", "9984"]), \
+             patch.object(trading.TradingScheduler, "is_maintenance_window",
+                          return_value=False), \
+             patch.object(trading.clock, "today", return_value=date(2026, 9, 10)), \
              patch.object(trading, "alert") as mock_alert:
             svc.signal_scan()
 
