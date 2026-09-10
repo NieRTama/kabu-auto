@@ -12,7 +12,7 @@ import yfinance as yf
 from loguru import logger
 from sqlalchemy import func, select
 
-from src.data.database import OHLCV, get_session
+from src.data.database import OHLCV, CorporateAction, get_session
 
 
 def _to_yf_symbol(symbol: str) -> str:
@@ -97,6 +97,75 @@ def upsert_ohlcv(symbol: str, df: pd.DataFrame) -> int:
                 count += 1
         session.commit()
     return count
+
+
+def fetch_splits(symbol: str) -> pd.Series:
+    """yfinanceから分割イベントを取得する（index=date, value=比率）。
+
+    価格系列の比からは分割を復元できないため、イベントAPIを唯一の権威とする。
+    取得に失敗した場合は空のSeriesを返す（分割なしと同義に扱う）。
+    """
+    try:
+        raw = yf.Ticker(_to_yf_symbol(symbol)).splits
+    except Exception as e:
+        logger.warning(f"分割イベント取得失敗: {symbol} {e}")
+        return pd.Series(dtype=float)
+    if raw is None or len(raw) == 0:
+        return pd.Series(dtype=float)
+    s = pd.Series(raw.values, index=pd.to_datetime(raw.index).date, dtype=float)
+    s.index.name = "date"
+    return s
+
+
+def upsert_splits(symbol: str, splits: pd.Series) -> int:
+    """分割イベントをDBにupsertする。新規追加件数を返す。"""
+    if splits is None or len(splits) == 0:
+        return 0
+    with get_session() as session:
+        existing = {
+            r.date: r
+            for r in session.scalars(
+                select(CorporateAction).where(
+                    CorporateAction.symbol == symbol,
+                    CorporateAction.action_type == "SPLIT",
+                )
+            ).all()
+        }
+        added = 0
+        for dt, ratio in splits.items():
+            if dt in existing:
+                existing[dt].ratio = float(ratio)
+            else:
+                session.add(CorporateAction(
+                    symbol=symbol, date=dt,
+                    action_type="SPLIT", ratio=float(ratio),
+                ))
+                added += 1
+        session.commit()
+    return added
+
+
+def split_factor_between(symbol: str, start: date, end: date) -> float:
+    """start（含む）～end（含む）の間に起きた分割比率の積を返す。
+
+    1対2分割が1回なら 2.0。分割が無ければ 1.0。
+    「当時100株だった建玉が今何株か」「当時の株価が今いくらに調整されているか」を
+    対応付けるのに使う。
+    """
+    with get_session() as session:
+        rows = session.scalars(
+            select(CorporateAction).where(
+                CorporateAction.symbol == symbol,
+                CorporateAction.action_type == "SPLIT",
+                CorporateAction.date >= start,
+                CorporateAction.date <= end,
+            )
+        ).all()
+    factor = 1.0
+    for r in rows:
+        if r.ratio:
+            factor *= float(r.ratio)
+    return factor
 
 
 def update_symbol(symbol: str, years: int = 3) -> None:

@@ -35,6 +35,26 @@ class OHLCV(Base):
     __table_args__ = (Index("ix_ohlcv_symbol_date", "symbol", "date", unique=True),)
 
 
+class CorporateAction(Base):
+    """企業行動（分割・併合）。
+
+    調整済み価格からは分割比率を導出できない（Yahooの生終値も分割調整済みの
+    ため、生値と調整値の比は配当しか表さない）。分割イベントそのものを
+    権威ある情報として保存し、株数・必要資金の算定に使う。
+    """
+    __tablename__ = "corporate_actions"
+    id = Column(Integer, primary_key=True)
+    symbol = Column(String(10), nullable=False)
+    date = Column(Date, nullable=False)
+    action_type = Column(String(10), nullable=False)  # "SPLIT"
+    ratio = Column(Float)  # 1対2分割なら 2.0
+
+    __table_args__ = (
+        Index("ix_corporate_actions_symbol_date", "symbol", "date", "action_type",
+              unique=True),
+    )
+
+
 class OrderIntent(Base):
     """発注の「意図」（Phase 5 / 4.2）。
 
