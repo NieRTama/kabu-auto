@@ -178,7 +178,11 @@ src/data/
 「当時100株買えたか」の判定が変わる。分割で株数と価格が整合し、
 **分割だけでは評価額・現金・損益が増えない**ことを最小テストで固定する。
 
-分割・併合の比率は調整済み終値と生の終値の比の変化から導出する。
+**分割・併合の比率は価格系列から導出しない。** Yahooの生の終値（`auto_adjust=False`）は
+分割については既に調整済みで、`Adj Close` が追加で配当調整を行うため、
+生値と調整値の比の変化は配当しか表さない。`yfinance.Ticker.splits` が返す
+分割イベントそのものを唯一の権威とし、新テーブル `CorporateAction` に保存する。
+
 配当は現金として扱い、調整価格と二重計上しない。
 
 ### 確定足の判定（R5）
@@ -572,6 +576,7 @@ NaN行が `compute_rule_score` と `predict_proba` へ流れる。
 
 | 変更 | 内容 | 互換性 |
 |---|---|---|
+| 新テーブル `CorporateAction` | `symbol` / `date` / `action_type`（`"SPLIT"`）/ `ratio`。分割イベントの権威ある記録 | 加算のみ |
 | 新テーブル `Dataset` | `dataset_id`（内容ハッシュ）/ 採取履歴ID / 生成日時 / 銘柄集合 / 期間 / `feature_version` / `strategy_version` / `execution_model_version` / ファイルパス / SHA256 / 入力OHLCVの内容ハッシュ | 加算のみ |
 | 新テーブル `Prediction` | `event_id` / `evaluation_run_id` / `model_id` / 予測時刻 / 生確率 / 校正後確率 / 出所fold / 予測用途 | 加算のみ |
 | 新テーブル `PredictionOutcome` | `event_id` / 実績ラベル / 確定時刻。満期後に関連付ける | 加算のみ |
