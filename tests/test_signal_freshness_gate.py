@@ -106,3 +106,36 @@ class TestFreshnessGate:
 
         assert states["7203"].state == "missing"
         assert svc._is_fresh_for_new_candidate("7203") is False
+
+
+class TestDataBatchId:
+    def test_data_update_issues_batch_id(self, isolated_db):
+        svc = trading.TradingServices(client=MagicMock(), risk=MagicMock(),
+                                      order_mgr=MagicMock(), model=None)
+        with patch.object(trading, "update_symbol",
+                          return_value=_status("7203", "fresh")), \
+             patch.object(trading.watchlist_store, "get_all_codes",
+                          return_value=["7203"]):
+            svc.data_update()
+
+        assert svc._data_batch_id is not None
+        assert len(svc._data_batch_id) > 0
+
+    def test_batch_id_changes_between_updates(self, isolated_db):
+        svc = trading.TradingServices(client=MagicMock(), risk=MagicMock(),
+                                      order_mgr=MagicMock(), model=None)
+        with patch.object(trading, "update_symbol",
+                          return_value=_status("7203", "fresh")), \
+             patch.object(trading.watchlist_store, "get_all_codes",
+                          return_value=["7203"]):
+            svc.data_update()
+            first = svc._data_batch_id
+            svc.data_update()
+            second = svc._data_batch_id
+
+        assert first != second
+
+    def test_batch_id_is_none_before_first_update(self, isolated_db):
+        svc = trading.TradingServices(client=MagicMock(), risk=MagicMock(),
+                                      order_mgr=MagicMock(), model=None)
+        assert svc._data_batch_id is None

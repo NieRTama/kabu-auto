@@ -11,6 +11,7 @@ main.py に集中していたスケジューラジョブのロジック（デー
 """
 from datetime import date, datetime, timedelta
 from typing import Optional
+import uuid
 
 from loguru import logger
 from sqlalchemy import func, select
@@ -163,6 +164,10 @@ class TradingServices:
         # 可否判定に使う。data_update より前に signal_scan が動いた場合は空のままで、
         # そのときは全銘柄が「新規候補にしない」と判定される（安全側）。
         self._bar_states: dict[str, BarStatus] = {}
+        # data_update が払い出す確定スナップショットの識別子。signal_scan は
+        # この ID の入力集合だけを見る。16:00更新→16:20スキャンという時間差にのみ
+        # 依存していると、部分更新の最中に入力が入れ替わったことに気付けない。
+        self._data_batch_id: Optional[str] = None
 
     # ─── データ更新 ─────────────────────────────────────
     def data_update(self) -> dict[str, BarStatus]:
@@ -183,11 +188,12 @@ class TradingServices:
                     symbol=sym, last_bar_session=None,
                     observed_at=clock.now(), is_final=False, state="missing",
                 )
+        self._data_batch_id = f"{clock.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
         self._bar_states = states
         fresh = sum(1 for s in states.values() if s.state == "fresh")
         logger.info(
-            f"データ更新完了: 対象={len(states)}銘柄 確定={fresh} "
-            f"未確定={len(states) - fresh}"
+            f"データ更新完了: batch={self._data_batch_id} 対象={len(states)}銘柄 "
+            f"確定={fresh} 未確定={len(states) - fresh}"
         )
         return states
 
@@ -388,7 +394,7 @@ class TradingServices:
                 f"シグナルスキャン省略: 本日は休場です（{market_calendar.holiday_name(clock.today())}）"
             )
             return
-        logger.info("シグナルスキャン開始...")
+        logger.info(f"シグナルスキャン開始... batch={self._data_batch_id}")
         is_paper = self.trading_conf.get("mode", "paper") == "paper"
         sectors = watchlist_store.get_sectors()
         paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
