@@ -22,6 +22,7 @@ from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
 from src.core.alerts import LEVEL_INFO, alert
 from src.core.scheduler import TradingScheduler
+from src.data.bar_status import BarStatus
 from src.data.database import OrderIntent, Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
 from src.execution import order_status as st
@@ -158,16 +159,47 @@ class TradingServices:
         self.trading_conf = cfg.get_section("trading")
         self.data_conf = cfg.get_section("data")
         self.liquidity_conf = cfg.get_section("liquidity")
+        # 直近の data_update で得た銘柄ごとの最終足状態。signal_scan が新規候補の
+        # 可否判定に使う。data_update より前に signal_scan が動いた場合は空のままで、
+        # そのときは全銘柄が「新規候補にしない」と判定される（安全側）。
+        self._bar_states: dict[str, BarStatus] = {}
 
     # ─── データ更新 ─────────────────────────────────────
-    def data_update(self) -> None:
+    def data_update(self) -> dict[str, BarStatus]:
+        """全リストの銘柄の日足を更新し、銘柄ごとの最終足状態を返す。
+
+        非アクティブリストもMLモデル学習データとして使うため全リストを対象にする。
+        更新に失敗した銘柄は missing として記録し、その日の新規候補から外す
+        （古い足のまま新しいシグナルを作らないため）。
+        """
         years = self.data_conf.get("history_years", 3)
-        # 全リストの銘柄を更新する（非アクティブリストもMLモデル学習データとして使うため）
+        states: dict[str, BarStatus] = {}
         for sym in watchlist_store.get_all_codes():
             try:
-                update_symbol(sym, years=years)
+                states[sym] = update_symbol(sym, years=years)
             except Exception as e:
                 logger.error(f"データ更新失敗: {sym} {e}")
+                states[sym] = BarStatus(
+                    symbol=sym, last_bar_session=None,
+                    observed_at=clock.now(), is_final=False, state="missing",
+                )
+        self._bar_states = states
+        fresh = sum(1 for s in states.values() if s.state == "fresh")
+        logger.info(
+            f"データ更新完了: 対象={len(states)}銘柄 確定={fresh} "
+            f"未確定={len(states) - fresh}"
+        )
+        return states
+
+    def _is_fresh_for_new_candidate(self, symbol: str) -> bool:
+        """この銘柄を新規候補として扱ってよいか。
+
+        更新結果が無い銘柄は fresh と判定しない（安全側）。
+        なおこの判定は**新規の戦略シグナルにのみ**適用する。保有保護の退出
+        （損切り・トレーリング）と既存注文の管理は鮮度に関わらず実行する。
+        """
+        st = self._bar_states.get(symbol)
+        return st is not None and st.state == "fresh"
 
     # ─── ML週次再学習 ───────────────────────────────────
     def ml_retrain(self) -> None:
@@ -362,11 +394,19 @@ class TradingServices:
         paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
         for sym in watchlist_store.get_codes():
             try:
+                if not self._is_fresh_for_new_candidate(sym):
+                    st = self._bar_states.get(sym)
+                    logger.info(
+                        f"新規候補から除外: {sym} "
+                        f"（最終足={getattr(st, 'last_bar_session', None)} "
+                        f"状態={getattr(st, 'state', 'unknown')}）"
+                    )
+                    continue
                 df = load_ohlcv(sym)
                 if len(df) < 30:
                     continue
                 sig = gen_signal(sym, df, self.model)
-                _save_signal(sig)
+                _save_signal(sig, data_as_of=self._bar_states[sym].last_bar_session)
                 if sig.action not in ("BUY", "SELL"):
                     continue
                 logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")
