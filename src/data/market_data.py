@@ -21,12 +21,20 @@ def _to_yf_symbol(symbol: str) -> str:
 
 
 def fetch_ohlcv(symbol: str, start: date, end: date, retries: int = 2) -> pd.DataFrame:
-    """yfinanceから権利修正済みOHLCVを取得する（一時的な通信エラーは指定回数までリトライ）"""
+    """yfinanceからOHLCVを取得する（一時的な通信エラーは指定回数までリトライ）。
+
+    `end` は **その日を含む**。yfinance公式仕様の end は排他境界のため、
+    ここで内部的に +1日する。呼び出し側では一切加減算しないこと
+    （内部と呼び出し側の双方で1日足す事故を防ぐため、境界の解釈は
+    この関数に一元化する）。
+    """
     yf_sym = _to_yf_symbol(symbol)
+    # yfinance の end は排他境界。引数は「含む」なので +1日して渡す。
+    yf_end = end + timedelta(days=1)
     df = pd.DataFrame()
     for attempt in range(retries + 1):
         try:
-            df = yf.download(yf_sym, start=start.isoformat(), end=end.isoformat(),
+            df = yf.download(yf_sym, start=start.isoformat(), end=yf_end.isoformat(),
                              auto_adjust=True, progress=False)
             break
         except Exception as e:
