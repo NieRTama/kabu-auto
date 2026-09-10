@@ -21,8 +21,9 @@ from src.core import market_calendar
 from src.core import config as cfg
 from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
-from src.core.alerts import LEVEL_INFO, alert
+from src.core.alerts import LEVEL_INFO, LEVEL_WARNING, alert
 from src.core.scheduler import TradingScheduler
+from src.data import bar_status
 from src.data.bar_status import BarStatus
 from src.data.database import OrderIntent, Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
@@ -200,12 +201,20 @@ class TradingServices:
     def _is_fresh_for_new_candidate(self, symbol: str) -> bool:
         """この銘柄を新規候補として扱ってよいか。
 
-        更新結果が無い銘柄は fresh と判定しない（安全側）。
+        更新結果が無い銘柄は fresh と判定しない（安全側）。`_bar_states` は
+        直近の data_update() 実行時点の凍結値であるため、state だけを信じると
+        「data_update が今日まだ完了していない／走行中に signal_scan が始まった」
+        場合に前営業日分の"fresh"を素通しさせてしまう。呼び出し時点の
+        as_of_session と last_bar_session を突き合わせて再検証する。
+
         なおこの判定は**新規の戦略シグナルにのみ**適用する。保有保護の退出
         （損切り・トレーリング）と既存注文の管理は鮮度に関わらず実行する。
         """
         st = self._bar_states.get(symbol)
-        return st is not None and st.state == "fresh"
+        if st is None or st.state != "fresh":
+            return False
+        expected = bar_status.as_of_session(clock.now())
+        return st.last_bar_session == expected
 
     # ─── ML週次再学習 ───────────────────────────────────
     def ml_retrain(self) -> None:
@@ -398,9 +407,12 @@ class TradingServices:
         is_paper = self.trading_conf.get("mode", "paper") == "paper"
         sectors = watchlist_store.get_sectors()
         paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
-        for sym in watchlist_store.get_codes():
+        excluded_count = 0
+        codes = watchlist_store.get_codes()
+        for sym in codes:
             try:
                 if not self._is_fresh_for_new_candidate(sym):
+                    excluded_count += 1
                     st = self._bar_states.get(sym)
                     logger.info(
                         f"新規候補から除外: {sym} "
@@ -445,6 +457,14 @@ class TradingServices:
                                                 source="signal_scan")
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
+
+        if codes and excluded_count == len(codes):
+            alert(
+                "新規シグナル0件",
+                f"全{len(codes)}銘柄が鮮度不足で新規候補から除外されました"
+                f"（batch={self._data_batch_id}）。data_updateの遅延・失敗を確認してください。",
+                level=LEVEL_WARNING,
+            )
 
     # ─── 前営業日シグナルの発注（朝・後場で共有）─────────────
     def morning_execution(self) -> None:

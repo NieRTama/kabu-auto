@@ -208,7 +208,11 @@ def load_ohlcv(symbol: str, limit: int = 500,
     """DBからOHLCVを読み込みDataFrameで返す（最新limit件を時系列昇順で返す）。
 
     price_basis:
-      "adjusted" … 調整済み終値を close として返す（特徴量・リターン計算用）
+      "adjusted" … 調整済み終値を close として返す（特徴量・リターン計算用）。
+                   open/high/low にも同じ調整比率(adjusted_close/close)を掛けて
+                   返すことで、low <= close <= high の不変条件を保つ
+                   （auto_adjust=False化により生のOHLと調整済みcloseが別々に
+                   保存されるようになったため、この分岐で明示的に揃える）。
       "raw"      … 生の終値を close として返す（株数・単元・必要資金・現金の算定用）
 
     分けないと、1対2分割で過去価格が半値に調整された銘柄について
@@ -224,17 +228,28 @@ def load_ohlcv(symbol: str, limit: int = 500,
         ).all()))
     if not rows:
         return pd.DataFrame()
-    data = [
-        {
-            "date": r.date,
-            "open": r.open,
-            "high": r.high,
-            "low": r.low,
-            "close": (r.adjusted_close or r.close) if price_basis == "adjusted" else r.close,
-            "volume": r.volume,
-        }
-        for r in rows
-    ]
+    data = []
+    for r in rows:
+        if price_basis == "adjusted":
+            adj_close = r.adjusted_close or r.close
+            ratio = (adj_close / r.close) if r.close else 1.0
+            data.append({
+                "date": r.date,
+                "open": r.open * ratio,
+                "high": r.high * ratio,
+                "low": r.low * ratio,
+                "close": adj_close,
+                "volume": r.volume,
+            })
+        else:
+            data.append({
+                "date": r.date,
+                "open": r.open,
+                "high": r.high,
+                "low": r.low,
+                "close": r.close,
+                "volume": r.volume,
+            })
     df = pd.DataFrame(data).set_index("date")
     df.index = pd.to_datetime(df.index)
     return df

@@ -7,6 +7,7 @@ from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from src.core import config as cfg
 from src.data import database as db
@@ -105,6 +106,38 @@ class TestLoadPriceBasis:
         market_data.upsert_ohlcv("7203", df)
 
         assert market_data.load_ohlcv("7203")["close"].iloc[0] == 502.5
+
+    def test_adjusted_basis_preserves_low_close_high_invariant(self, tmp_path):
+        """adjusted基準の足はlow <= close <= highを満たす（生OHLと調整close混在の回帰防止）"""
+        cfg.load("config.yaml")
+        cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+        db.init()
+
+        # 生の終値1000円に対し、配当調整で調整済み終値が850円まで下がったケース
+        # （生のlow=980はadjusted_close=850より高い＝そのまま返すと不変条件が壊れる）
+        df = pd.DataFrame(
+            {
+                "open": [1000.0], "high": [1010.0], "low": [980.0],
+                "close": [1000.0], "adjusted_close": [850.0], "volume": [100000],
+            },
+            index=[date(2026, 9, 10)],
+        )
+        df.index.name = "date"
+        market_data.upsert_ohlcv("7203", df)
+
+        adj = market_data.load_ohlcv("7203", price_basis="adjusted")
+        row = adj.iloc[0]
+        assert row["low"] <= row["close"] <= row["high"]
+        # 比率850/1000=0.85を生のOHLにも掛けて揃えていることを確認
+        assert row["open"] == pytest.approx(850.0)
+        assert row["high"] == pytest.approx(858.5)
+        assert row["low"] == pytest.approx(833.0)
+
+        raw = market_data.load_ohlcv("7203", price_basis="raw")
+        raw_row = raw.iloc[0]
+        # rawは調整せずそのまま返す
+        assert raw_row["open"] == 1000.0
+        assert raw_row["low"] == 980.0
 
 
 class TestUpdateSymbolReturnsStatus:

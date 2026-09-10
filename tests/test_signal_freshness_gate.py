@@ -107,6 +107,25 @@ class TestFreshnessGate:
         assert states["7203"].state == "missing"
         assert svc._is_fresh_for_new_candidate("7203") is False
 
+    def test_fresh_flag_is_revalidated_against_current_time(self, isolated_db):
+        """_bar_statesが前営業日分の"fresh"のまま残っていても、現在時刻の基準
+        セッションと一致しなければ新規候補にしない（部分更新中の素通し防止）"""
+        svc = trading.TradingServices(client=MagicMock(), risk=MagicMock(),
+                                      order_mgr=MagicMock(), model=None)
+        # 前営業日(2026-09-09)分の"fresh"が残っている状態を模す
+        stale_but_marked_fresh = BarStatus(
+            symbol="7203",
+            last_bar_session=date(2026, 9, 9),
+            observed_at=datetime(2026, 9, 9, 16, 0),
+            is_final=True,
+            state="fresh",
+        )
+        svc._bar_states = {"7203": stale_but_marked_fresh}
+
+        with patch.object(trading.clock, "now",
+                          return_value=datetime(2026, 9, 10, 16, 20)):
+            assert svc._is_fresh_for_new_candidate("7203") is False
+
 
 class TestDataBatchId:
     def test_data_update_issues_batch_id(self, isolated_db):
@@ -139,3 +158,37 @@ class TestDataBatchId:
         svc = trading.TradingServices(client=MagicMock(), risk=MagicMock(),
                                       order_mgr=MagicMock(), model=None)
         assert svc._data_batch_id is None
+
+
+class TestZeroFreshAlert:
+    def test_alerts_when_all_symbols_excluded(self, isolated_db):
+        """全銘柄が鮮度不足で除外されたらWARNINGアラートを出す"""
+        svc = trading.TradingServices(client=MagicMock(), risk=MagicMock(),
+                                      order_mgr=MagicMock(), model=None)
+        svc._bar_states = {}  # 空 = 全銘柄が鮮度不足
+
+        with patch.object(trading.watchlist_store, "get_codes",
+                          return_value=["7203", "9984"]), \
+             patch.object(trading, "alert") as mock_alert:
+            svc.signal_scan()
+
+        assert mock_alert.called
+        args, kwargs = mock_alert.call_args
+        assert kwargs.get("level") == trading.LEVEL_WARNING or \
+               (len(args) >= 3 and args[2] == trading.LEVEL_WARNING)
+
+
+class TestGateWiring:
+    """鮮度ゲートの結線をソース検証で固定する（signal_scanは呼ぶ、stop_loss_checkは呼ばない）"""
+
+    def _source(self, name):
+        import inspect
+        return inspect.getsource(getattr(trading.TradingServices, name))
+
+    def test_signal_scan_calls_freshness_gate(self):
+        assert "_is_fresh_for_new_candidate" in self._source("signal_scan")
+
+    def test_stop_loss_check_does_not_call_freshness_gate(self):
+        """保有保護の退出は鮮度に関わらず実行する。ゲートを絶対に持ち込まない"""
+        assert "_is_fresh_for_new_candidate" not in self._source("stop_loss_check")
+        assert "_bar_states" not in self._source("stop_loss_check")
