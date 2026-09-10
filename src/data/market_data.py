@@ -35,7 +35,7 @@ def fetch_ohlcv(symbol: str, start: date, end: date, retries: int = 2) -> pd.Dat
     for attempt in range(retries + 1):
         try:
             df = yf.download(yf_sym, start=start.isoformat(), end=yf_end.isoformat(),
-                             auto_adjust=True, progress=False)
+                             auto_adjust=False, progress=False)
             break
         except Exception as e:
             if attempt < retries:
@@ -50,6 +50,13 @@ def fetch_ohlcv(symbol: str, start: date, end: date, retries: int = 2) -> pd.Dat
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [c.lower() for c in df.columns]
+    # auto_adjust=False では "Adj Close" が来る。列名を DB のカラム名に揃える。
+    # 生OHLC（株数・必要資金の算定用）と調整済み終値（特徴量・リターン用）を分けて持つ。
+    if "adj close" in df.columns:
+        df = df.rename(columns={"adj close": "adjusted_close"})
+    if "adjusted_close" not in df.columns:
+        # 提供側が調整済み終値を返さない場合は生の終値で埋める（用途の分離は維持する）
+        df["adjusted_close"] = df["close"]
     df.index = pd.to_datetime(df.index).date
     df.index.name = "date"
     return df
@@ -75,7 +82,7 @@ def upsert_ohlcv(symbol: str, df: pd.DataFrame) -> int:
                 rec.low = float(row.get("low", 0))
                 rec.close = float(row.get("close", 0))
                 rec.volume = int(row.get("volume", 0))
-                rec.adjusted_close = float(row.get("close", 0))
+                rec.adjusted_close = float(row.get("adjusted_close", row.get("close", 0)))
             else:
                 session.add(OHLCV(
                     symbol=symbol,
@@ -85,7 +92,7 @@ def upsert_ohlcv(symbol: str, df: pd.DataFrame) -> int:
                     low=float(row.get("low", 0)),
                     close=float(row.get("close", 0)),
                     volume=int(row.get("volume", 0)),
-                    adjusted_close=float(row.get("close", 0)),
+                    adjusted_close=float(row.get("adjusted_close", row.get("close", 0))),
                 ))
                 count += 1
         session.commit()
@@ -101,8 +108,19 @@ def update_symbol(symbol: str, years: int = 3) -> None:
     logger.info(f"データ更新: {symbol} 追加={added}件")
 
 
-def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
-    """DBからOHLCVを読み込みDataFrameで返す（最新limit件を時系列昇順で返す）"""
+def load_ohlcv(symbol: str, limit: int = 500,
+               price_basis: str = "adjusted") -> pd.DataFrame:
+    """DBからOHLCVを読み込みDataFrameで返す（最新limit件を時系列昇順で返す）。
+
+    price_basis:
+      "adjusted" … 調整済み終値を close として返す（特徴量・リターン計算用）
+      "raw"      … 生の終値を close として返す（株数・単元・必要資金・現金の算定用）
+
+    分けないと、1対2分割で過去価格が半値に調整された銘柄について
+    「当時100株買えたか」の判定が変わる。
+    """
+    if price_basis not in ("adjusted", "raw"):
+        raise ValueError(f"price_basis は 'adjusted' か 'raw': {price_basis}")
     with get_session() as session:
         rows = list(reversed(session.scalars(
             select(OHLCV).where(OHLCV.symbol == symbol)
@@ -117,7 +135,7 @@ def load_ohlcv(symbol: str, limit: int = 500) -> pd.DataFrame:
             "open": r.open,
             "high": r.high,
             "low": r.low,
-            "close": r.adjusted_close or r.close,
+            "close": (r.adjusted_close or r.close) if price_basis == "adjusted" else r.close,
             "volume": r.volume,
         }
         for r in rows
