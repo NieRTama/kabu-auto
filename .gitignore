@@ -45,3 +45,6 @@ watchlist.json
 
 # OS
 .DS_Store
+
+# git worktree（superpowers:using-git-worktrees 用の作業ディレクトリ）
+.worktrees/
