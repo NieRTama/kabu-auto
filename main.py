@@ -21,7 +21,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, auth_recovery, broker_launcher, broker_watch, discord_queries,
+    discord_bot, auth_recovery, broker_launcher, broker_full_login, broker_watch, discord_queries,
     discord_slash,
     market_calendar, clock,
 )
@@ -246,6 +246,54 @@ def main() -> None:
             manual=manual,
         )
 
+    def _full_login_broker(*, manual: bool = False) -> tuple[bool, str]:
+        """kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化する
+        （設定を読んで broker_full_login へ委譲）。
+
+        manual=True は人が明示的に頼んだ実行（Discord の full_login）。
+        broker_launcher.launch() の manual と同じ考え方で、日次上限では止めない。
+        """
+        rt = cfg.get_section("runtime")
+        return broker_full_login.run(
+            manual=manual,
+            max_attempts_per_day=int(
+                rt.get("broker_full_login_max_attempts_per_day",
+                       broker_full_login.DEFAULT_MAX_ATTEMPTS_PER_DAY)
+            ),
+            timeout_seconds=int(
+                rt.get("broker_full_login_timeout_seconds",
+                       broker_full_login.DEFAULT_TIMEOUT_SECONDS)
+            ),
+        )
+
+    def broker_full_login_job():
+        """スケジューラから呼ばれる完全自動ログインジョブ（平日06:45）。
+
+        broker_full_login_enabled が false の間は何もしない（段階導入のフラグ）。
+        休場日は認証が切れていても異常ではないため実行しない
+        （token_refreshと同じ二重ガードの型。2026-09-05に休場日誤発報の実例あり）。
+        """
+        rt = cfg.get_section("runtime")
+        if not bool(rt.get("broker_full_login_enabled", False)):
+            return
+        if market_calendar.is_holiday(clock.today()):
+            logger.info(
+                f"完全自動ログイン省略: 本日は休場です（{market_calendar.holiday_name(clock.today())}）"
+            )
+            return
+        ok, detail = _full_login_broker()
+        if ok:
+            alert(
+                "kabuステーションの完全自動ログインを実行しました",
+                detail,
+                level=alerts_mod.LEVEL_INFO,
+            )
+        else:
+            alert(
+                "kabuステーションの完全自動ログインに失敗しました",
+                f"{detail}\n手動でログインしてください。",
+            )
+
     def token_refresh():
         """毎朝のトークン更新。失敗＝ログイン認証切れとみなし、再ログインを待って復帰する。
 
@@ -413,6 +461,11 @@ def main() -> None:
             return f"{detail}\n認証アプリで承認してください。承認後は自動で取引を再開します"
         return detail
 
+    def _cmd_full_login(_args: str) -> str:
+        """kabuステーションの起動〜ログイン〜2段階認証入力まで完全自動で行う。"""
+        ok, detail = _full_login_broker(manual=True)
+        return detail
+
     def _cmd_reconnect(_args: str) -> str:
         """ログイン直後に「今すぐ繋いで」と指示するためのコマンド。
 
@@ -452,6 +505,7 @@ def main() -> None:
         "orders": (_cmd_orders, "未約定注文の一覧"),
         "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),
         "launch": (_cmd_launch, "kabuステーションを起動する（認証は手動）"),
+        "full_login": (_cmd_full_login, "kabuステーションの起動〜ログイン〜2段階認証入力まで完全自動化する"),
         "halt": (_cmd_halt, "取引を停止する（例: halt 様子見。退出は継続）"),
         "resume": (_cmd_resume, "取引を再開する"),
     }
@@ -469,6 +523,7 @@ def main() -> None:
         atexit.register(slash.stop)
 
     # ─── スケジューラのコールバック登録 ──────────────────────
+    scheduler.register("broker_full_login", broker_full_login_job)
     scheduler.register("risk_reset", risk.reset_daily_counters)
     scheduler.register("token_refresh", token_refresh)
     scheduler.register("data_update", services.data_update)

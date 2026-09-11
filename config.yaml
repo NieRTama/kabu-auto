@@ -158,6 +158,21 @@ runtime:
   # 誤操作による二重起動は launcher 側のクールダウンが防ぐ。
   # したがって auto_launch_broker: false の間、この値は実質使われない。
   max_launch_attempts_per_day: 3
+  # ─── 完全自動ログイン（2026-09-11〜）─────────────────────
+  # 上記の「認証（2段階認証）は自動化しない」という方針を転換し、Gmail API経由の
+  # ワンタイムパスワード自動取得・自動入力（kabusapi-auto-login-template、
+  # WSL2/Docker側 ~/projects/kabusapi-auto-login-template に導入済み）を使って
+  # Kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化できるように
+  # した。false の間は broker_full_login は一切動かず、従来通り人がログインする。
+  # 段階導入のため既定は false。実運用で安全性を確認してから true にする。
+  broker_full_login_enabled: false
+  # WSL側スクリプトのタイムアウト秒数。ハングしても親プロセス(kabu-auto本体)を
+  # 巻き込まない。
+  broker_full_login_timeout_seconds: 180
+  # 1日の完全自動ログイン試行上限。broker起動と同じ考え方で、無意味な
+  # リトライの暴走を防ぐ。**自動実行(平日06:45)にだけ効く**。Discordの
+  # full_login（人の明示操作）は上限で止めない。
+  broker_full_login_max_attempts_per_day: 3
 
 backtest:
   # 理想約定を仮定したバックテストは実運用と乖離する。約定価格へ不利方向に加える

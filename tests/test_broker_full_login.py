@@ -218,3 +218,33 @@ class TestSchedulerWiring:
             sched.start()
         ids = {c.kwargs["id"] for c in mock_add_job.call_args_list}
         assert "broker_full_login" not in ids
+
+
+MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+
+
+def _main_src() -> str:
+    """main.py の中身。相対パスで開くとルート以外からの pytest で落ちる。"""
+    return MAIN_PY.read_text(encoding="utf-8")
+
+
+class TestMainWiring:
+    def test_discord_full_login_command_registered(self):
+        import re
+        assert re.search(r'"full_login":\s*\(?_cmd_full_login', _main_src()), (
+            "full_login コマンドが登録されていない"
+        )
+
+    def test_scheduler_job_registered(self):
+        assert 'scheduler.register("broker_full_login"' in _main_src()
+
+    def test_holiday_is_skipped(self):
+        """休場日に誤発報しないこと（token_refreshと同じ二重ガードの型）。"""
+        i = _main_src().index("def broker_full_login_job")
+        body = _main_src()[i:i + 800]
+        assert "market_calendar.is_holiday" in body
+
+    def test_disabled_by_default_flag_is_checked(self):
+        i = _main_src().index("def broker_full_login_job")
+        body = _main_src()[i:i + 800]
+        assert "broker_full_login_enabled" in body
