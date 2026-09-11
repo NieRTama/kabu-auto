@@ -48,6 +48,11 @@ _lock = threading.Lock()
 _attempts: int = 0
 _attempts_date: Optional[date] = None
 _last_run_at: float = -float('inf')
+# 実行中フラグ。クールダウン（経過時間ベース）とは別に、subprocess.run() の
+# 実行中は無条件で二重実行を拒否する（タイムアウト上限が180秒＝クールダウンの
+# 60秒を大きく上回るため、経過時間だけのガードでは実行中の60〜180秒の間に
+# 到着した呼び出しをすり抜けさせてしまう）。
+_running: bool = False
 
 
 def _today() -> date:
@@ -62,11 +67,12 @@ def _now() -> float:
 
 def reset() -> None:
     """テスト用に試行回数とクールダウンを初期化する。"""
-    global _attempts, _attempts_date, _last_run_at
+    global _attempts, _attempts_date, _last_run_at, _running
     with _lock:
         _attempts = 0
         _attempts_date = None
         _last_run_at = -float('inf')
+        _running = False
 
 
 def attempts_today() -> int:
@@ -99,18 +105,25 @@ def run(*, manual: bool = False,
     manual=True は人が明示的に頼んだ実行（Discordコマンド）。broker_launcher.launch()
     と同じく、日次上限では止めない。
 
-    `_lock` は「クールダウン・日次上限のチェックと予約」「完了時刻の記録」だけを
-    保持し、`subprocess.run()`（最大 timeout_seconds 秒、既定180秒）の実行中は
-    手放す。Discordリモコンのポーリング等、他の呼び出しがこの長い外部呼び出しの
-    間ずっとブロックされるのを避けるため（緊急停止(halt)経路が数分止まるのは
-    取引システムとして安全上望ましくない）。
+    `_lock` は「クールダウン・日次上限・実行中フラグのチェックと予約」
+    「完了時刻の記録」だけを保持し、`subprocess.run()`（最大 timeout_seconds 秒、
+    既定180秒）の実行中は手放す。Discordリモコンのポーリング等、他の呼び出しが
+    この長い外部呼び出しの間ずっとブロックされるのを避けるため（緊急停止(halt)
+    経路が数分止まるのは取引システムとして安全上望ましくない）。
+
+    二重実行の防止は「経過時間ベースのクールダウン（60秒）」と
+    「実行中フラグ（`_running`）」の2段構え。クールダウンだけでは、
+    タイムアウト上限（既定180秒）がクールダウン秒数を超えるため、実行中の
+    60〜180秒の間に到着した呼び出しが素通りしてしまう（`elapsed` が
+    `RERUN_COOLDOWN_SECONDS` を超えるため）。`_running` は経過時間に関係なく
+    「今まさに1本実行中かどうか」だけを見るので、この隙間を塞ぐ。
 
     注意: WSLコマンドは wsl_distro/project_dir/script_path を f-string で
     シェルエスケープ無しに埋め込んでいる。現状 main.py は既定値以外を渡さない
     ため安全だが、将来これらを設定ファイル等の外部入力で差し替え可能にする場合は
     埋め込み前に shlex.quote() を通すこと。
     """
-    global _attempts, _last_run_at
+    global _attempts, _last_run_at, _running
 
     with _lock:
         now = _now()
@@ -120,6 +133,12 @@ def run(*, manual: bool = False,
                 f"直前に実行しています（{int(elapsed)}秒前）。"
                 f"{RERUN_COOLDOWN_SECONDS}秒は再実行しません"
             )
+        if _running:
+            # クールダウン（経過時間）だけでは、タイムアウト上限（既定180秒）が
+            # クールダウン秒数（60秒）を超えるため、実行中の60〜180秒の間に
+            # 到着した呼び出しがこの上のチェックを素通りしてしまう。経過時間に
+            # 関係なく「実行中は無条件で拒否する」ことでその隙間を塞ぐ。
+            return False, "既に実行中です。完了までお待ちください"
 
         _roll_over_if_new_day()
         if manual:
@@ -138,6 +157,7 @@ def run(*, manual: bool = False,
         # クールダウンに掛かり subprocess を二重に走らせない）。完了後に
         # 実際の完了時刻で上書きする（cooldownは完了時刻basisにするため）。
         _last_run_at = now
+        _running = True
 
     command = [
         "wsl", "-d", wsl_distro, "--", "bash", "-lc",
@@ -150,6 +170,7 @@ def run(*, manual: bool = False,
     except subprocess.TimeoutExpired:
         with _lock:
             _last_run_at = _now()
+            _running = False
         logger.error(f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）")
         return False, (
             f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）。"
@@ -159,11 +180,13 @@ def run(*, manual: bool = False,
     except Exception as e:
         with _lock:
             _last_run_at = _now()
+            _running = False
         logger.error(f"完全自動ログインの実行に失敗しました: {e}")
         return False, f"実行に失敗しました: {e}"
 
     with _lock:
         _last_run_at = _now()
+        _running = False
 
     if result.returncode != 0:
         # WSL側スクリプトは set -e のため、docker compose up --build 等の

@@ -284,6 +284,64 @@ class TestLockNotHeldDuringSubprocess:
         )
 
 
+class TestRunningFlagBlocksOverlapPastCooldownWindow:
+    """経過時間ベースのクールダウン（60秒）だけでは、タイムアウト上限
+    （既定180秒）がそれを上回るため、実行中の60〜180秒の間に到着した
+    呼び出しがクールダウン判定を素通りしてしまう。`_running` フラグは
+    経過時間に関係なく実行中を無条件で拒否することでこれを塞ぐ
+    （ラウンド2の回帰テスト。round-1のロック縮小がこの隙間を再導入した）。
+    """
+
+    def test_second_caller_is_rejected_while_first_is_still_running_past_cooldown(self):
+        t = [1000.0]
+
+        def clock():
+            return t[0]
+
+        first_call_started = threading.Event()
+        release_first_call = threading.Event()
+
+        def slow_run(*args, **kwargs):
+            first_call_started.set()
+            assert release_first_call.wait(timeout=5), "1回目の実行が解放されなかった"
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        results = {}
+
+        def worker():
+            with patch.object(bfl, "_now", clock):
+                results["first"] = bfl.run(max_attempts_per_day=0)
+
+        with patch.object(bfl.subprocess, "run", side_effect=slow_run) as mock_run:
+            th = threading.Thread(target=worker)
+            th.start()
+            assert first_call_started.wait(timeout=5), (
+                "1回目のsubprocess呼び出しが開始しなかった"
+            )
+
+            # クールダウン(60秒)を超えて時計を進める。だが1回目はまだ
+            # subprocess.run の中でブロックされたまま（まだ解放していない）。
+            t[0] += 65
+
+            with patch.object(bfl, "_now", clock):
+                ok2, detail2 = bfl.run(max_attempts_per_day=0)
+
+            release_first_call.set()
+            th.join(timeout=5)
+
+        assert ok2 is False
+        assert "実行中" in detail2
+        assert mock_run.call_count == 1, (
+            f"subprocess.run が{mock_run.call_count}回実行された"
+            "（実行中フラグが二重実行を防げていない）"
+        )
+        assert results["first"][0] is True
+
+
 class TestSchedulerWiring:
     def test_broker_full_login_registered_as_cron_job(self):
         sched = scheduler_mod.TradingScheduler()
