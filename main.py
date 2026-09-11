@@ -464,6 +464,8 @@ def main() -> None:
     def _cmd_full_login(_args: str) -> str:
         """kabuステーションの起動〜ログイン〜2段階認証入力まで完全自動で行う。"""
         ok, detail = _full_login_broker(manual=True)
+        if ok:
+            return f"{detail}\n接続確認まで数分かかることがあります"
         return detail
 
     def _cmd_reconnect(_args: str) -> str:
