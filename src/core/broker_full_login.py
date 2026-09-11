@@ -98,13 +98,24 @@ def run(*, manual: bool = False,
 
     manual=True は人が明示的に頼んだ実行（Discordコマンド）。broker_launcher.launch()
     と同じく、日次上限では止めない。
+
+    `_lock` は「クールダウン・日次上限のチェックと予約」「完了時刻の記録」だけを
+    保持し、`subprocess.run()`（最大 timeout_seconds 秒、既定180秒）の実行中は
+    手放す。Discordリモコンのポーリング等、他の呼び出しがこの長い外部呼び出しの
+    間ずっとブロックされるのを避けるため（緊急停止(halt)経路が数分止まるのは
+    取引システムとして安全上望ましくない）。
+
+    注意: WSLコマンドは wsl_distro/project_dir/script_path を f-string で
+    シェルエスケープ無しに埋め込んでいる。現状 main.py は既定値以外を渡さない
+    ため安全だが、将来これらを設定ファイル等の外部入力で差し替え可能にする場合は
+    埋め込み前に shlex.quote() を通すこと。
     """
     global _attempts, _last_run_at
 
     with _lock:
         now = _now()
         elapsed = now - _last_run_at
-        if _last_run_at > 0 and elapsed < RERUN_COOLDOWN_SECONDS:
+        if elapsed < RERUN_COOLDOWN_SECONDS:
             return False, (
                 f"直前に実行しています（{int(elapsed)}秒前）。"
                 f"{RERUN_COOLDOWN_SECONDS}秒は再実行しません"
@@ -122,34 +133,51 @@ def run(*, manual: bool = False,
             _attempts += 1
             attempt_no = _attempts
 
-        command = [
-            "wsl", "-d", wsl_distro, "--", "bash", "-lc",
-            f"cd {project_dir} && ./{script_path}",
-        ]
-        try:
-            result = subprocess.run(
-                command, capture_output=True, text=True, timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired:
-            _last_run_at = now
-            logger.error(f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）")
-            return False, f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）"
-        except Exception as e:
-            _last_run_at = now
-            logger.error(f"完全自動ログインの実行に失敗しました: {e}")
-            return False, f"実行に失敗しました: {e}"
-
+        # 「これから実行する」印として現在時刻を仮置きする。これは同時実行の
+        # ガードを兼ねる（ロック解放直後に別呼び出しが来ても、この時刻で
+        # クールダウンに掛かり subprocess を二重に走らせない）。完了後に
+        # 実際の完了時刻で上書きする（cooldownは完了時刻basisにするため）。
         _last_run_at = now
 
-        if result.returncode != 0:
-            logger.error(
-                f"完全自動ログインが失敗しました（rc={result.returncode}）: "
-                f"{result.stderr.strip()[:500]}"
-            )
-            return False, (
-                f"完全自動ログインに失敗しました（rc={result.returncode}）: "
-                f"{result.stderr.strip()[:300]}"
-            )
+    command = [
+        "wsl", "-d", wsl_distro, "--", "bash", "-lc",
+        f"cd {project_dir} && ./{script_path}",
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        with _lock:
+            _last_run_at = _now()
+        logger.error(f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）")
+        return False, (
+            f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）。"
+            "WSL側の処理が残っている可能性があるため、手動でログインする前に"
+            "既存のログイン試行が完了していないか確認してください"
+        )
+    except Exception as e:
+        with _lock:
+            _last_run_at = _now()
+        logger.error(f"完全自動ログインの実行に失敗しました: {e}")
+        return False, f"実行に失敗しました: {e}"
+
+    with _lock:
+        _last_run_at = _now()
+
+    if result.returncode != 0:
+        # WSL側スクリプトは set -e のため、docker compose up --build 等の
+        # 診断出力の多くが stdout に出る。stderr が空だと失敗理由が丸ごと
+        # 消えるので、空のときは stdout にフォールバックする。
+        detail_source = result.stderr.strip() or result.stdout.strip()
+        logger.error(
+            f"完全自動ログインが失敗しました（rc={result.returncode}）: "
+            f"{detail_source[:500]}"
+        )
+        return False, (
+            f"完全自動ログインに失敗しました（rc={result.returncode}）: "
+            f"{detail_source[:300]}"
+        )
 
     how = "手動" if attempt_no is None else f"本日{attempt_no}回目"
     logger.warning(f"完全自動ログインを実行しました（{how}）")

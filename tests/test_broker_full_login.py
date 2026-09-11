@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.core import broker_full_login as bfl
+import src.core.scheduler as scheduler_mod
 
 
 _SHARED_CLOCK = itertools.count(0, 10_000)
@@ -83,10 +84,27 @@ class TestFailure:
         assert ok is False
         assert "失敗" in detail
 
+    def test_nonzero_returncode_falls_back_to_stdout_when_stderr_is_empty(self):
+        """WSL側スクリプトは set -e のため診断出力の多くが stdout に出る。
+        stderr が空でも失敗理由が失われないこと（Fix 3の回帰防止）。"""
+        ok, detail, _ = _run(
+            returncode=1, stderr="", stdout="docker compose up --build に失敗しました"
+        )
+        assert ok is False
+        assert "docker compose up --build に失敗しました" in detail
+
     def test_timeout_is_reported_not_raised(self):
         ok, detail, _ = _run(raise_timeout=True)
         assert ok is False
         assert "タイムアウト" in detail
+
+    def test_timeout_message_warns_about_lingering_wsl_state(self):
+        """タイムアウトはWSL側プロセスの停止を保証しないため、手動ログイン前に
+        既存試行の残存を確認するよう促す文言を含むこと（Fix 4）。"""
+        ok, detail, _ = _run(raise_timeout=True)
+        assert ok is False
+        assert "WSL" in detail
+        assert "確認" in detail
 
     def test_unexpected_exception_is_reported_not_raised(self):
         ok, detail, _ = _run(raise_error=OSError("wsl.exe not found"))
@@ -193,7 +211,77 @@ class TestConcurrentRun:
         assert mock_run.call_count == 1, f"{mock_run.call_count}回実行された"
 
 
-import src.core.scheduler as scheduler_mod
+class TestCooldownAnchorsToCompletionTime:
+    """クールダウンは実行開始時刻ではなく完了時刻を基準にすること（Fix 2a）。
+
+    タイムアウト上限いっぱいまでかかった実行の直後は、経過時間の見かけ上
+    クールダウンをすり抜けてはならない（そこはWSL側スクリプトが直前に
+    KabuS.exeをkillし直したばかりの、最も再実行を避けたいタイミングのため）。
+    """
+
+    def test_long_run_still_cools_down_immediately_after_completion(self):
+        t = [1000.0]
+
+        def clock():
+            return t[0]
+
+        def slow_run(*args, **kwargs):
+            # 実行に180秒（タイムアウト上限相当）かかったことを模す。
+            # 開始時刻を基準にする旧実装なら、次の呼び出しの経過時間は
+            # 見かけ上180秒経過したことになりクールダウンをすり抜ける。
+            t[0] += 180
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch.object(bfl, "_now", clock), \
+             patch.object(bfl.subprocess, "run", side_effect=slow_run):
+            ok1, _ = bfl.run(max_attempts_per_day=0)
+        assert ok1 is True
+
+        with patch.object(bfl, "_now", clock), \
+             patch.object(bfl.subprocess, "run", side_effect=slow_run) as mock_run2:
+            ok2, detail2 = bfl.run(max_attempts_per_day=0)
+
+        assert ok2 is False
+        assert "直前に実行" in detail2
+        mock_run2.assert_not_called()
+
+
+class TestLockNotHeldDuringSubprocess:
+    """_lock は subprocess.run() の実行中は保持しないこと（Fix 2b）。
+
+    Discordリモコンのポーリング等がその間ブロックされ続けると、
+    緊急停止(halt)経路まで最大180秒止まりうる安全上の懸念があるため。
+    """
+
+    def test_attempts_today_does_not_block_while_run_is_in_flight(self):
+        def slow_run(*args, **kwargs):
+            time.sleep(0.3)
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        def worker():
+            bfl.run(max_attempts_per_day=0)
+
+        with patch.object(bfl.subprocess, "run", side_effect=slow_run):
+            th = threading.Thread(target=worker)
+            th.start()
+            time.sleep(0.05)  # worker が subprocess.run 内でブロック中のはず
+            start = time.perf_counter()
+            bfl.attempts_today()
+            elapsed = time.perf_counter() - start
+            th.join(timeout=5)
+
+        assert elapsed < 0.2, (
+            f"attempts_today() が {elapsed:.3f}秒ブロックされた"
+            "（_lockがsubprocess実行中も保持されている疑い）"
+        )
 
 
 class TestSchedulerWiring:
