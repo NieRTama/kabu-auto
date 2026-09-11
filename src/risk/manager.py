@@ -6,6 +6,7 @@
 - セクター集中制限
 - ギャップリスク考慮
 """
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -43,6 +44,17 @@ class RiskSnapshot:
 
 
 class RiskManager:
+    # get_current_prices() のリアルタイム価格キャッシュのTTL（秒）。
+    # 2026-09-11実例: ダッシュボードの /api/positions と /api/pnl_enhanced_summary が
+    # それぞれ独立に price_fn（=ブローカーの get_board REST呼び出し）を呼び、
+    # フロントエンドがこの2つを10秒ごとに Promise.all で同時実行するため、同じ保有銘柄に
+    # 10秒ごとに最低2重のAPI呼び出しが発生していた。ここに朝/後場の売買判定ループの
+    # get_board 呼び出しが重なり、kabuステーションAPIの実行回数制限（Code=4001006）に
+    # 達して429が多発した（直近15分で495件の警告）。
+    # TTLはダッシュボードのポーリング間隔（10秒）より十分短くし、次のポーリングサイクルでは
+    # 必ず新しい値を取ることでリアルタイム性を大きく損なわない範囲に留める。
+    _PRICE_CACHE_TTL_SEC = 5.0
+
     def __init__(self, price_fn: Optional[Callable[[list[str]], dict[str, float]]] = None):
         """
         price_fn: 銘柄コードのリストを受け取り {symbol: 現在値} を返す関数。
@@ -60,6 +72,7 @@ class RiskManager:
         self._daily_loss_yen = 0.0
         self._conf = cfg.get_section("trading")
         self._price_fn = price_fn
+        self._price_cache: dict[str, tuple[float, float]] = {}  # symbol -> (price,取得時刻)
 
     def reset_daily_counters(self) -> None:
         self._daily_order_count = 0
@@ -116,10 +129,23 @@ class RiskManager:
             return {}
         prices: dict[str, float] = {}
         if self._price_fn is not None:
-            try:
-                prices = dict(self._price_fn(symbols))
-            except Exception as e:
-                logger.warning(f"現在値のリアルタイム取得に失敗（終値で代用します）: {e}")
+            now = time.monotonic()
+            to_fetch = []
+            for s in symbols:
+                cached = self._price_cache.get(s)
+                if cached is not None and now - cached[1] < self._PRICE_CACHE_TTL_SEC:
+                    prices[s] = cached[0]
+                else:
+                    to_fetch.append(s)
+            if to_fetch:
+                try:
+                    fetched = dict(self._price_fn(to_fetch))
+                    for s, p in fetched.items():
+                        if p:
+                            self._price_cache[s] = (p, now)
+                    prices.update(fetched)
+                except Exception as e:
+                    logger.warning(f"現在値のリアルタイム取得に失敗（終値で代用します）: {e}")
         missing = [s for s in symbols if not prices.get(s)]
         if missing:
             prices.update(latest_closes(missing))
