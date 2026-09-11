@@ -821,3 +821,4 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 - `config.yaml` の `broker_full_login_enabled` を一度手動で `true` にし、Discordの `full_login` コマンドで実際にWSL経由のログインが通ることを確認する（パスワード・Gmail API認証情報が必要なため自動テスト化できない）
 - 実運用で数日、`health_check`（15分毎エラー率）・`auth_recovery_check`（5分間隔）が完全自動ログインの再起動時間帯をノイズとして拾っていないか確認する
 - 問題なければ平日06:45の自動実行（`broker_full_login_enabled: true`）へ切り替える
+- **平日06:45の無人自動実行に移行する前に**、kabu-auto本体を起動しているタスクスケジューラのタスクが「ログオン時のみ実行（対話セッションあり）」になっていることを確認する。WSL側 `login_kabustation.ps1` の SendKeys は対話デスクトップを必要とするため、非対話（サービス相当）実行だと動作しない（最終レビュー Recommendation #4 より）
