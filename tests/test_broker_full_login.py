@@ -183,8 +183,7 @@ class TestConcurrentRun:
             ok, _ = bfl.run(max_attempts_per_day=0)
             started.append(ok)
 
-        with patch.object(bfl, "_now", lambda: float(next(_SHARED_CLOCK))), \
-             patch.object(bfl.subprocess, "run", side_effect=slow_run) as mock_run:
+        with patch.object(bfl.subprocess, "run", side_effect=slow_run) as mock_run:
             threads = [threading.Thread(target=worker) for _ in range(2)]
             for th in threads:
                 th.start()
