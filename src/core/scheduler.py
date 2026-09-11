@@ -39,7 +39,8 @@ class TradingScheduler:
             # （2026-09-11、broker_full_login.py参照。従来「認証は自動化しない」
             # 方針だったが、Gmail API経由のワンタイムパスワード自動入力へ転換した）。
             # 平日06:45（risk_reset(8:25)より前）に実行し、完了後は既存の
-            # wait_for_broker_minutes（無制限待機）がAPI接続を引き継ぐ。
+            # auth_recovery_check（5分間隔）がAPI接続を引き継ぐ（wait_for_broker_minutes
+            # は起動時の一度きりの待機にしか効かず、この時点では対象外）。
             self._scheduler.add_job(
                 cb["broker_full_login"], "cron",
                 day_of_week="mon-fri", hour=6, minute=45, id="broker_full_login",
