@@ -191,3 +191,30 @@ class TestConcurrentRun:
                 th.join(timeout=10)
 
         assert mock_run.call_count == 1, f"{mock_run.call_count}回実行された"
+
+
+import src.core.scheduler as scheduler_mod
+
+
+class TestSchedulerWiring:
+    def test_broker_full_login_registered_as_cron_job(self):
+        sched = scheduler_mod.TradingScheduler()
+        sched.register("broker_full_login", MagicMock())
+        with patch.object(sched._scheduler, "add_job") as mock_add_job, \
+             patch.object(sched._scheduler, "start"):
+            sched.start()
+        calls = {c.kwargs["id"]: c for c in mock_add_job.call_args_list}
+        assert "broker_full_login" in calls
+        call = calls["broker_full_login"]
+        assert call.args[1] == "cron"
+        assert call.kwargs.get("day_of_week") == "mon-fri"
+        assert call.kwargs.get("hour") == 6
+        assert call.kwargs.get("minute") == 45
+
+    def test_omitted_when_not_registered(self):
+        sched = scheduler_mod.TradingScheduler()
+        with patch.object(sched._scheduler, "add_job") as mock_add_job, \
+             patch.object(sched._scheduler, "start"):
+            sched.start()
+        ids = {c.kwargs["id"] for c in mock_add_job.call_args_list}
+        assert "broker_full_login" not in ids

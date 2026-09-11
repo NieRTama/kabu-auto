@@ -1,5 +1,6 @@
 """
 APSchedulerによるジョブスケジューラ
+- 毎朝6:45: kabuステーション完全自動ログイン（broker_full_login_enabled=trueのときのみ実働）
 - 毎朝8:25: 日次リスクカウンタリセット
 - 毎朝8:30: APIトークン更新
 - 毎日16:00: データ更新
@@ -33,6 +34,16 @@ class TradingScheduler:
     def start(self) -> None:
         cb = self._registered_callbacks
 
+        if "broker_full_login" in cb:
+            # Kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化する
+            # （2026-09-11、broker_full_login.py参照。従来「認証は自動化しない」
+            # 方針だったが、Gmail API経由のワンタイムパスワード自動入力へ転換した）。
+            # 平日06:45（risk_reset(8:25)より前）に実行し、完了後は既存の
+            # wait_for_broker_minutes（無制限待機）がAPI接続を引き継ぐ。
+            self._scheduler.add_job(
+                cb["broker_full_login"], "cron",
+                day_of_week="mon-fri", hour=6, minute=45, id="broker_full_login",
+            )
         if "risk_reset" in cb:
             # 取引開始前に日次カウンタ（注文数・損失額）をリセットする
             self._scheduler.add_job(
