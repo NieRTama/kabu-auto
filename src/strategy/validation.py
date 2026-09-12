@@ -260,3 +260,37 @@ def apply_training_window(train_events: pd.DataFrame,
     return train_events[
         train_events["decision_at"] >= cutoff
     ].reset_index(drop=True)
+
+
+@dataclass(frozen=True)
+class TrainingInputs:
+    """このfoldで学習に使ってよい入力一式。
+
+    **学習に入る入力はすべてこの関数を通す。** そうしておけば「学習側へ
+    未来が入っていないか」の検査が1箇所で済む。
+    """
+    events: pd.DataFrame
+    weights: np.ndarray
+    preprocessor: Preprocessor
+    fold: Fold
+
+
+def training_inputs(events: pd.DataFrame, fold: Fold, *,
+                    window_sessions: Optional[int] = None,
+                    embargo_sessions: int = 0,
+                    feature_cols: Optional[list] = None) -> TrainingInputs:
+    """foldの学習締切で固定された入力一式を返す。
+
+    適用の順序に意味がある。purge → 学習窓 → 重み → 前処理 の順で、
+    **絞り込みが終わった集合に対して重みと統計量を求める**。順序を逆にすると、
+    後から落とすイベントが重みや平均に混ざる。
+
+    spec §14 の段階C完了条件「そのfoldの学習締切で固定されたモデルについて、
+    外側foldの値を変えてもモデル・前処理・重み・閾値が変わらない」は、
+    この関数の出力が変わらないことで検証できる。
+    """
+    train, _ = split_events(events, fold, embargo_sessions=embargo_sessions)
+    train = apply_training_window(train, window_sessions)
+    weights = training_weights(train)
+    pre = fit_preprocessor(train, feature_cols=feature_cols)
+    return TrainingInputs(events=train, weights=weights, preprocessor=pre, fold=fold)

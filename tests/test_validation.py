@@ -545,3 +545,110 @@ class TestTrainingWindow:
         train = self._train()
         with pytest.raises(ValueError, match="window_sessions"):
             validation.apply_training_window(train, window_sessions=0)
+
+
+class TestTrainingInputs:
+    def _events(self):
+        events = _daily_events(["7203", "9984"], date(2026, 1, 5), 90, holding=3)
+        events["f1"] = np.arange(len(events), dtype=float)
+        events["f2"] = np.arange(len(events), dtype=float) * 1.5
+        return events
+
+    def test_bundles_events_weights_and_preprocessor(self):
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        got = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        assert len(got.weights) == len(got.events)
+        assert got.preprocessor.n_fitted == len(got.events)
+        assert got.fold == fold
+
+    def test_training_inputs_respect_purge(self):
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        got = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        assert (got.events["label_end_at"] < fold.val_start).all()
+
+    def test_training_window_is_applied_before_weights_and_fit(self):
+        """窓で絞ったあとの集合で重みと前処理が決まる"""
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        full = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        windowed = validation.training_inputs(
+            events, fold, window_sessions=10, feature_cols=["f1", "f2"])
+        assert len(windowed.events) < len(full.events)
+        assert windowed.preprocessor.n_fitted == len(windowed.events)
+        assert windowed.preprocessor.means["f1"] != pytest.approx(
+            full.preprocessor.means["f1"])
+
+
+class TestOuterFoldIsUntouchable:
+    """spec §14 段階C完了条件: そのfoldの学習締切で固定された入力は、
+    外側foldの値を変えても変わらない"""
+
+    def _events(self):
+        events = _daily_events(["7203", "9984"], date(2026, 1, 5), 90, holding=3)
+        events["f1"] = np.arange(len(events), dtype=float)
+        events["f2"] = np.arange(len(events), dtype=float) * 1.5
+        return events
+
+    def _tamper_outside_training(self, events: pd.DataFrame, fold) -> pd.DataFrame:
+        """学習締切より後のイベントを、値・ラベル・終了時点すべて書き換える"""
+        out = events.copy()
+        after = out["decision_at"] > fold.train_end
+        out.loc[after, "f1"] = -123456.0
+        out.loc[after, "f2"] = 987654.0
+        out.loc[after, "label"] = 1
+        out.loc[after, "label_end_at"] = date(2030, 1, 1)
+        out.loc[after, "net_return"] = 9.99
+        return out
+
+    def test_training_events_do_not_change(self):
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        before = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        after = validation.training_inputs(
+            self._tamper_outside_training(events, fold), fold, feature_cols=["f1", "f2"])
+        assert list(before.events["event_id"]) == list(after.events["event_id"])
+
+    def test_weights_do_not_change(self):
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        before = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        after = validation.training_inputs(
+            self._tamper_outside_training(events, fold), fold, feature_cols=["f1", "f2"])
+        assert before.weights == pytest.approx(after.weights)
+
+    def test_preprocessor_does_not_change(self):
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        before = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        after = validation.training_inputs(
+            self._tamper_outside_training(events, fold), fold, feature_cols=["f1", "f2"])
+        assert before.preprocessor.means["f1"] == pytest.approx(after.preprocessor.means["f1"])
+        assert before.preprocessor.stds["f1"] == pytest.approx(after.preprocessor.stds["f1"])
+        assert before.preprocessor.positive_rate == pytest.approx(
+            after.preprocessor.positive_rate)
+
+    def test_transformed_training_features_do_not_change(self):
+        events = self._events()
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        before = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+        after = validation.training_inputs(
+            self._tamper_outside_training(events, fold), fold, feature_cols=["f1", "f2"])
+        Xb = validation.apply_preprocessor(
+            before.preprocessor, before.events, feature_cols=["f1", "f2"])
+        Xa = validation.apply_preprocessor(
+            after.preprocessor, after.events, feature_cols=["f1", "f2"])
+        pd.testing.assert_frame_equal(Xb, Xa)
+
+    def test_holds_for_every_fold(self):
+        events = self._events()
+        for fold in validation.calendar_folds(events, n_splits=5):
+            before = validation.training_inputs(events, fold, feature_cols=["f1", "f2"])
+            if len(before.events) == 0:
+                continue
+            after = validation.training_inputs(
+                self._tamper_outside_training(events, fold), fold,
+                feature_cols=["f1", "f2"])
+            assert list(before.events["event_id"]) == list(after.events["event_id"])
+            assert before.weights == pytest.approx(after.weights)
