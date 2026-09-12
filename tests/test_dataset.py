@@ -434,3 +434,20 @@ class TestBuildEventsMulti:
         events = dataset.build_events_multi(
             {"7203": _ohlcv(120), "0000": _ohlcv(5)}, _policy_conf(), _costs())
         assert set(events["symbol"].unique()) == {"7203"}
+
+    def test_skips_a_symbol_that_actually_raises(self, monkeypatch):
+        """本物の例外（必須列の欠落等）が起きた銘柄だけを、他を止めずにスキップする
+
+        _ohlcv(5)のようなデータ不足は例外を投げず0行を返すだけなので、
+        except Exceptionの分岐自体はこれまで検証されていなかった。
+        """
+        monkeypatch.setattr(
+            dataset, "rule_scores",
+            lambda f: pd.Series([0.99] * len(f), index=f.index))
+
+        good = _ohlcv(120)
+        broken = _ohlcv(120).drop(columns=["volume"])  # 必須列の欠落でKeyErrorを誘発
+
+        events = dataset.build_events_multi(
+            {"7203": good, "0000": broken}, _policy_conf(), _costs())
+        assert set(events["symbol"].unique()) == {"7203"}
