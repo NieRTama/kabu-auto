@@ -65,7 +65,7 @@
 | `src/strategy/indicators.py`（改修） | RSIの端点を仕様化。日付を保持しマスクを返す新APIを追加（既存APIは無変更） |
 | `tests/test_indicators.py`（新規） | RSI端点3ケース、マスク、将来行を足しても過去が変わらないこと、既存APIの回帰 |
 | `tests/test_policy.py`（新規） | 基準線の算出、逐次遷移、日足内の順序、悲観／楽観の差、最大保有期間 |
-| `tests/test_execution.py`（新規） | T+1寄りエントリー、ギャップダウン約定、未約定、コスト控除が一度だけ行われること |
+| `tests/test_backtest_execution.py`（新規） | T+1寄りエントリー、ギャップダウン約定、未約定、コスト控除が一度だけ行われること |
 
 ### 段階B後半（本計画のスコープ外）
 
@@ -1133,7 +1133,7 @@ EOF
 
 **Files:**
 - Create: `src/backtest/execution.py`
-- Test: `tests/test_execution.py`
+- Test: `tests/test_backtest_execution.py`
 
 **Interfaces:**
 - Consumes: `src/strategy/policy.Observation`（足の型として再利用する）
@@ -1149,7 +1149,7 @@ EOF
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`tests/test_execution.py` を新規作成する。
+`tests/test_backtest_execution.py` を新規作成する。
 
 ```python
 """過去検証の執行アダプタ（src/backtest/execution.py）のテスト
@@ -1219,7 +1219,7 @@ class TestEntryFill:
 
 - [ ] **Step 2: テストを実行して失敗を確認**
 
-Run: `pytest tests/test_execution.py -v`
+Run: `pytest tests/test_backtest_execution.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'src.backtest.execution'`
 
 - [ ] **Step 3: 実装を書く**
@@ -1308,7 +1308,7 @@ def entry_fill(next_bar: Observation, quantity: int, costs: CostConfig) -> Fill:
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
-Run: `pytest tests/test_execution.py -v`
+Run: `pytest tests/test_backtest_execution.py -v`
 Expected: PASS（6件）
 
 - [ ] **Step 5: BOM確認とコミット**
@@ -1316,7 +1316,7 @@ Expected: PASS（6件）
 Run: `head -c 3 src/backtest/execution.py | xxd`（`2222 22` を確認）
 
 ```bash
-git add src/backtest/execution.py tests/test_execution.py
+git add src/backtest/execution.py tests/test_backtest_execution.py
 git commit -m "$(cat <<'EOF'
 feat(backtest): 執行アダプタの型とT+1寄りエントリーを追加
 
@@ -1336,7 +1336,7 @@ EOF
 
 **Files:**
 - Modify: `src/backtest/execution.py`（`exit_fill` と `net_return` を追加）
-- Test: `tests/test_execution.py`
+- Test: `tests/test_backtest_execution.py`
 
 **Interfaces:**
 - Consumes: Task 6 の `Fill` / `CostConfig` / `sell_fill_price`、Task 4 の `policy.ExitIntent`
@@ -1357,7 +1357,7 @@ EOF
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`tests/test_execution.py` の末尾に追記する。
+`tests/test_backtest_execution.py` の末尾に追記する。
 
 ```python
 def _intent(reason=policy.STOP_LINE, trigger=930.0, order_type="STOP"):
@@ -1455,7 +1455,7 @@ class TestNetReturn:
 
 - [ ] **Step 2: テストを実行して失敗を確認**
 
-Run: `pytest tests/test_execution.py -v`
+Run: `pytest tests/test_backtest_execution.py -v`
 Expected: FAIL — `AttributeError: module 'src.backtest.execution' has no attribute 'exit_fill'`
 
 - [ ] **Step 3: 実装を追加**
@@ -1516,7 +1516,7 @@ def net_return(entry: Fill, exit_: Fill, costs: CostConfig) -> float:
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
-Run: `pytest tests/test_execution.py -v`
+Run: `pytest tests/test_backtest_execution.py -v`
 Expected: PASS（14件）
 
 - [ ] **Step 5: 全体回帰を確認**
@@ -1529,7 +1529,7 @@ Expected: 失敗が増えていないこと
 Run: `head -c 3 src/backtest/execution.py | xxd`（`2222 22` を確認）
 
 ```bash
-git add src/backtest/execution.py tests/test_execution.py
+git add src/backtest/execution.py tests/test_backtest_execution.py
 git commit -m "$(cat <<'EOF'
 feat(backtest): 退出約定とコスト控除後の純収益を追加
 
@@ -1562,7 +1562,7 @@ Expected: PASS（3件）
 
 - [ ] **確認3: Tの終値で判断してもT+1以降にのみ約定する**
 
-Run: `pytest tests/test_execution.py::TestEntryFill -v` と `pytest tests/test_execution.py::TestExitFillMarket -v`
+Run: `pytest tests/test_backtest_execution.py::TestEntryFill -v` と `pytest tests/test_backtest_execution.py::TestExitFillMarket -v`
 Expected: PASS
 
 - [ ] **確認4: 既存の公開関数の挙動が変わっていない**

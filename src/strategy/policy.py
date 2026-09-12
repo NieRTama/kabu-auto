@@ -31,6 +31,10 @@ TIME_LIMIT = "TIME_LIMIT"    # 最大保有営業日数に到達
 PEAK_BASIS_PREVIOUS = "previous"          # 既定（悲観）: 前営業日終了時点のピークで当日の線を固定
 PEAK_BASIS_SAME_SESSION = "same_session"  # 楽観: 当日の高値を即座に反映
 
+# 約定方式
+ORDER_TYPE_STOP = "STOP"      # 当日中に基準価格へ到達したとみなす
+ORDER_TYPE_MARKET = "MARKET"  # 翌営業日の寄りで成行
+
 
 @dataclass(frozen=True)
 class HoldingState:
@@ -74,8 +78,8 @@ class ExitIntent:
 
     trigger_price は発動の基準となった価格であり、実際にいくらで約定したかは
     execution.py が決める（ギャップダウン時は基準価格では約定できない）。
-    order_type は "STOP"（当日中に基準価格へ到達したとみなす）または
-    "MARKET"（翌営業日の寄りで成行）。
+    order_type は ORDER_TYPE_STOP（当日中に基準価格へ到達したとみなす）または
+    ORDER_TYPE_MARKET（翌営業日の寄りで成行）。
     """
     reason: str
     trigger_price: Optional[float]
@@ -177,13 +181,13 @@ def step(state: HoldingState, obs: Observation, conf: PolicyConfig, *,
     line = stop_line(judged, conf)
     if obs.low <= line:
         reason = TRAILING if is_armed(judged, conf) else STOP_LINE
-        return next_state, ExitIntent(reason=reason, trigger_price=line, order_type="STOP")
+        return next_state, ExitIntent(reason=reason, trigger_price=line, order_type=ORDER_TYPE_STOP)
 
     if obs.score is not None and obs.score <= conf.sell_threshold:
-        return next_state, ExitIntent(reason=SIGNAL_SELL, trigger_price=None, order_type="MARKET")
+        return next_state, ExitIntent(reason=SIGNAL_SELL, trigger_price=None, order_type=ORDER_TYPE_MARKET)
 
     if next_state.sessions_held >= conf.max_holding_sessions:
-        return next_state, ExitIntent(reason=TIME_LIMIT, trigger_price=None, order_type="MARKET")
+        return next_state, ExitIntent(reason=TIME_LIMIT, trigger_price=None, order_type=ORDER_TYPE_MARKET)
 
     return next_state, None
 

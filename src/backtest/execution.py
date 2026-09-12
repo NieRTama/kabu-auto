@@ -16,7 +16,7 @@ from datetime import date
 from typing import Optional
 
 from src.core import config as cfg
-from src.strategy.policy import ExitIntent, Observation
+from src.strategy.policy import ExitIntent, Observation, ORDER_TYPE_STOP, ORDER_TYPE_MARKET
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ def exit_fill(intent: ExitIntent, bar: Observation, next_bar: Optional[Observati
         翌営業日の寄りで成行約定する。満了日の終値で判断して同じ終値で約定する
         経路を作らない（レビューF04）。翌足が無ければ未約定。
     """
-    if intent.order_type == "STOP":
+    if intent.order_type == ORDER_TYPE_STOP:
         if intent.trigger_price is None:
             raise ValueError("STOP の意図には trigger_price が必要です")
         raw = min(bar.open, intent.trigger_price)
@@ -105,6 +105,8 @@ def exit_fill(intent: ExitIntent, bar: Observation, next_bar: Optional[Observati
     if next_bar is None:
         # 足が尽きた＝この意図は約定していない。呼び出し側は未成熟として扱う
         return None
+    if intent.order_type != ORDER_TYPE_MARKET:
+        raise ValueError(f"未知の order_type です: {intent.order_type}")
     return Fill(
         at=next_bar.session,
         price=sell_fill_price(next_bar.open, costs),
@@ -120,10 +122,19 @@ def net_return(entry: Fill, exit_: Fill, costs: CostConfig) -> float:
     ここで二重に引かない。手数料だけを売買それぞれの約定代金に対して控除する。
     控除の責務をこのモジュールに閉じることで、期待値の式（spec §8）の末尾で
     コストを再度引く二重計上を防ぐ。
+
+    entry と exit の quantity が一致しない場合（部分決済）は、呼び出し側が
+    按分・分割の責任を持つべきなので ValueError にする。buy_amount が0以下
+    （価格または数量が不正）の場合も、本物の0%リターンと区別するため
+    0.0を返さず例外にする。
     """
+    if entry.quantity != exit_.quantity:
+        raise ValueError(
+            f"entry と exit の数量が一致しません: {entry.quantity} != {exit_.quantity}"
+        )
     buy_amount = entry.price * entry.quantity
     if buy_amount <= 0:
-        return 0.0
+        raise ValueError(f"buy_amount が不正です: price={entry.price}, quantity={entry.quantity}")
     sell_amount = exit_.price * exit_.quantity
     commission = (buy_amount + sell_amount) * costs.commission_pct
     return (sell_amount - buy_amount - commission) / buy_amount

@@ -756,7 +756,7 @@ paper経路の執行仮定もこの設定で切り替わる（段階D後半）�
 | `tests/test_market_data_freshness.py` | 引け後のT日更新、確定足判定、更新失敗・部分更新、stale銘柄の候補除外 |
 | `tests/test_corporate_actions.py` | 1対2分割で株数と価格が整合し、分割だけでは評価額・現金・損益が増えないこと |
 | `tests/test_policy.py` | 逐次状態遷移、ブレークイーブン発動、日足内の順序（当日高値を遡って使わない）、`TIME_LIMIT` |
-| `tests/test_execution.py` | ギャップダウン約定、未約定・部分約定、コスト控除が一度だけ行われること |
+| `tests/test_backtest_execution.py` | ギャップダウン約定、未約定・部分約定、コスト控除が一度だけ行われること |
 | `tests/test_dataset.py` | 列の充足、`label_end_at` の正しさ、未成熟の別ステータス化、同一内容なら同じ `dataset_id` |
 | `tests/test_validation.py` | 日付境界分割、purge、fold内での重み再計算、前処理が学習側のみでfitされること |
 | `tests/test_walkforward.py` | T+1執行、資金競合、セクター上限、期間中再学習の締切、degraded伝播 |

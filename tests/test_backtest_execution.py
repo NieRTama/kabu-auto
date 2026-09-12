@@ -154,3 +154,29 @@ class TestNetReturn:
         entry = execution.Fill(at=date(2026, 9, 2), price=1000.0, quantity=100, reason="ENTRY")
         exit_ = execution.Fill(at=date(2026, 9, 5), price=930.0, quantity=100, reason=policy.STOP_LINE)
         assert execution.net_return(entry, exit_, _costs(comm=0.0)) == pytest.approx(-0.07)
+
+
+class TestExitFillRejectsUnknownOrderType:
+    def test_raises_on_unknown_order_type(self):
+        """STOPでもMARKETでもないorder_typeは例外にする（黙って成行約定にしない）"""
+        bar = _bar(session=date(2026, 9, 2), c=1005.0)
+        next_bar = _bar(session=date(2026, 9, 3), o=990.0)
+        bad_intent = policy.ExitIntent(reason="X", trigger_price=None, order_type="LIMIT")
+        with pytest.raises(ValueError, match="未知の order_type"):
+            execution.exit_fill(bad_intent, bar, next_bar, quantity=100, costs=_costs())
+
+
+class TestNetReturnRejectsInvalidInput:
+    def test_raises_on_quantity_mismatch(self):
+        """部分決済（数量不一致）は按分責任が呼び出し側にあるため例外にする"""
+        entry = execution.Fill(at=date(2026, 9, 2), price=1000.0, quantity=100, reason="ENTRY")
+        exit_ = execution.Fill(at=date(2026, 9, 5), price=1100.0, quantity=50, reason=policy.TRAILING)
+        with pytest.raises(ValueError, match="数量が一致しません"):
+            execution.net_return(entry, exit_, _costs(comm=0.0))
+
+    def test_raises_on_non_positive_buy_amount(self):
+        """buy_amountが0以下は本物の0%リターンと区別するため例外にする"""
+        entry = execution.Fill(at=date(2026, 9, 2), price=0.0, quantity=100, reason="ENTRY")
+        exit_ = execution.Fill(at=date(2026, 9, 5), price=1100.0, quantity=100, reason=policy.TRAILING)
+        with pytest.raises(ValueError, match="buy_amount"):
+            execution.net_return(entry, exit_, _costs(comm=0.0))
