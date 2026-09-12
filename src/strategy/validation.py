@@ -14,7 +14,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from src.strategy.dataset import STATUS_RESOLVED
+from src.strategy.dataset import STATUS_RESOLVED, uniqueness_weights
 
 
 @dataclass(frozen=True)
@@ -176,3 +176,14 @@ def inner_folds(train_events: pd.DataFrame, n_splits: int = 3) -> list:
     そこに含まれていないため、内側foldがそれに触れることは構造的にない。
     """
     return calendar_folds(train_events, n_splits=n_splits)
+
+
+def training_weights(train_events: pd.DataFrame) -> np.ndarray:
+    """学習イベント集合に対して一意性重みを計算し直す。
+
+    **purge後の学習集合に対して呼ぶこと。** イベント表全体で一度計算した重みを
+    各foldへ流すと、検証側イベントの終了時点が学習側の重みへ影響する（spec §7）。
+    段階B後半で sample_weight を列として保存しなかったのはこのためで、
+    ここが正しい呼び出し口になる。
+    """
+    return uniqueness_weights(train_events)

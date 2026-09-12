@@ -349,3 +349,73 @@ class TestInnerFolds:
         short = _daily_events(["7203"], date(2026, 1, 5), 2, holding=0)
         with pytest.raises(ValueError, match="セッション"):
             validation.inner_folds(short, n_splits=3)
+
+
+class TestTrainingWeights:
+    def test_length_matches_training_events(self):
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=2)
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        train, _ = validation.split_events(events, fold)
+        assert len(validation.training_weights(train)) == len(train)
+
+    def test_weights_are_positive_for_resolved_events(self):
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=2)
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        train, _ = validation.split_events(events, fold)
+        w = validation.training_weights(train)
+        assert (w > 0).all()
+
+    def test_recomputed_from_the_training_subset_only(self):
+        """全期間で計算した重みとは値が異なる＝fold内で計算し直している。
+
+        差が出るのは学習期間の**末尾**のイベント。先頭付近のイベントは、
+        重なり相手が全期間にも部分集合にも等しく含まれるため値が一致する。
+        末尾では後続の重なり相手が切り落とされ、重みが上がる。
+        """
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=5)
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        train, _ = validation.split_events(events, fold)
+
+        whole = dataset.uniqueness_weights(events)
+        in_fold = validation.training_weights(train)
+
+        last_id = train["event_id"].iloc[-1]
+        pos = list(events["event_id"]).index(last_id)
+        assert in_fold[-1] > whole[pos]
+
+    def test_early_training_events_keep_the_same_weight(self):
+        """逆に、重なり相手が全て学習側に残る先頭付近では値が一致する。
+
+        これが成り立たないなら、重みの計算が集合の大きさ自体に依存している
+        （＝相対的な重なりを測れていない）ことになる。
+        """
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=5)
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        train, _ = validation.split_events(events, fold)
+
+        whole = dataset.uniqueness_weights(events)
+        in_fold = validation.training_weights(train)
+
+        first_id = train["event_id"].iloc[0]
+        pos = list(events["event_id"]).index(first_id)
+        assert in_fold[0] == pytest.approx(whole[pos])
+
+    def test_validation_side_does_not_affect_training_weights(self):
+        """検証側イベントの終了時点を変えても学習側の重みは変わらない（spec §7）"""
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=2)
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        train, _ = validation.split_events(events, fold)
+        before = validation.training_weights(train)
+
+        tampered = events.copy()
+        in_val = tampered["decision_at"] >= fold.val_start
+        tampered.loc[in_val, "label_end_at"] = date(2027, 1, 1)
+        train_after, _ = validation.split_events(tampered, fold)
+        after = validation.training_weights(train_after)
+
+        assert list(train["event_id"]) == list(train_after["event_id"])
+        assert before == pytest.approx(after)
+
+    def test_empty_training_set_gives_empty_weights(self):
+        empty = _daily_events(["7203"], date(2026, 1, 5), 10, holding=0).iloc[0:0]
+        assert len(validation.training_weights(empty)) == 0
