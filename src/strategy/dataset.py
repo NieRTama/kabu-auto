@@ -17,6 +17,7 @@ max_holding に満たない末尾のイベントにも最終リターンの符�
 import hashlib
 import json
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -480,3 +481,43 @@ def save_dataset_meta(events: pd.DataFrame, dataset_id: str, path,
         session.add(row)
         session.commit()
         return row.id
+
+
+def uniqueness_weights(events: pd.DataFrame) -> np.ndarray:
+    """イベント期間の重なりに基づく一意性重み（López de Prado の average uniqueness）。
+
+    **この関数は fold ごとに、purge 後の学習イベント集合に対して呼ぶこと。**
+    イベント表全体で一度だけ計算した値を各foldへ流すと、検証側イベントの
+    終了時点が学習側の重みへ影響する（spec §7）。そのため重みは列として
+    保存せず、必要なときにこの関数で計算する。
+
+    重なりは entry_at 〜 label_end_at を暦日で数える。全イベントが同じ暦を
+    共有するため相対的な重なりは保たれる。決着していない（label_end_at が無い）
+    イベントは重み0にして学習に効かせない。
+    """
+    n = len(events)
+    if n == 0:
+        return np.zeros(0)
+
+    spans = []
+    for _, row in events.iterrows():
+        entry, end = row.get("entry_at"), row.get("label_end_at")
+        if entry is None or end is None or pd.isna(entry) or pd.isna(end):
+            spans.append(None)
+            continue
+        spans.append((pd.Timestamp(entry), pd.Timestamp(end)))
+
+    concurrency = Counter()
+    for span in spans:
+        if span is None:
+            continue
+        for day in pd.date_range(span[0], span[1], freq="D"):
+            concurrency[day] += 1
+
+    weights = np.zeros(n)
+    for k, span in enumerate(spans):
+        if span is None:
+            continue
+        days = pd.date_range(span[0], span[1], freq="D")
+        weights[k] = float(np.mean([1.0 / concurrency[d] for d in days]))
+    return weights

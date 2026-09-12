@@ -621,3 +621,79 @@ class TestSaveDatasetMeta:
             row = session.scalar(select(db.Dataset))
         expected = int((events["status"] == dataset.STATUS_RESOLVED).sum())
         assert row.n_resolved == expected
+
+
+def _events_with_spans(spans: list[tuple]) -> pd.DataFrame:
+    """(entry_at, label_end_at) の並びから最小のイベント表を作る"""
+    rows = []
+    for k, (entry, end) in enumerate(spans):
+        rows.append({
+            "event_id": f"X:{k}",
+            "symbol": "7203",
+            "entry_at": entry,
+            "label_end_at": end,
+            "status": dataset.STATUS_RESOLVED if end is not None else dataset.STATUS_IMMATURE,
+        })
+    return pd.DataFrame(rows)
+
+
+class TestUniquenessWeights:
+    def test_isolated_events_get_weight_one(self):
+        """重ならないイベントは重み1"""
+        events = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 2)),
+            (date(2026, 9, 10), date(2026, 9, 11)),
+        ])
+        w = dataset.uniqueness_weights(events)
+        assert w == pytest.approx([1.0, 1.0])
+
+    def test_fully_overlapping_events_get_half(self):
+        """完全に重なる2件はそれぞれ重み0.5"""
+        events = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 3)),
+            (date(2026, 9, 1), date(2026, 9, 3)),
+        ])
+        w = dataset.uniqueness_weights(events)
+        assert w == pytest.approx([0.5, 0.5])
+
+    def test_partial_overlap_is_between(self):
+        """一部だけ重なるイベントの重みは0.5と1.0の間"""
+        events = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 4)),
+            (date(2026, 9, 3), date(2026, 9, 6)),
+        ])
+        w = dataset.uniqueness_weights(events)
+        assert all(0.5 < x < 1.0 for x in w)
+
+    def test_unresolved_events_get_zero(self):
+        """決着していないイベントは重み0（学習に効かせない）"""
+        events = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 3)),
+            (date(2026, 9, 1), None),
+        ])
+        w = dataset.uniqueness_weights(events)
+        assert w[1] == pytest.approx(0.0)
+
+    def test_length_matches_input(self):
+        events = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 3)),
+            (date(2026, 9, 2), date(2026, 9, 5)),
+            (date(2026, 9, 9), None),
+        ])
+        assert len(dataset.uniqueness_weights(events)) == 3
+
+    def test_removing_an_event_changes_remaining_weights(self):
+        """fold内で再計算する意味があること＝集合が変われば重みも変わる（spec §7）"""
+        full = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 3)),
+            (date(2026, 9, 1), date(2026, 9, 3)),
+        ])
+        subset = _events_with_spans([
+            (date(2026, 9, 1), date(2026, 9, 3)),
+        ])
+        assert dataset.uniqueness_weights(full)[0] != pytest.approx(
+            dataset.uniqueness_weights(subset)[0])
+
+    def test_empty_input_returns_empty(self):
+        empty = pd.DataFrame(columns=["entry_at", "label_end_at", "status"])
+        assert len(dataset.uniqueness_weights(empty)) == 0
