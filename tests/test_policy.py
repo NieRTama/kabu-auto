@@ -102,3 +102,93 @@ class TestConfigFromSettings:
         assert conf.trailing_stop_pct == trading["trailing_stop_pct"]
         assert conf.sell_threshold == strategy["sell_threshold"]
         assert conf.max_holding_sessions == strategy["tb_max_holding"]
+
+
+def _obs(session=date(2026, 9, 2), o=1000.0, h=1010.0, l=990.0, c=1005.0,
+         score=None) -> policy.Observation:
+    return policy.Observation(session=session, open=o, high=h, low=l, close=c, score=score)
+
+
+class TestStepStopTriggers:
+    def test_no_exit_when_low_stays_above_line(self):
+        """安値が基準線を割らなければ退出しない"""
+        state = _state(avg_cost=1000.0, peak=1000.0)
+        nxt, intent = policy.step(state, _obs(l=950.0), _conf())
+        assert intent is None
+        assert nxt.sessions_held == 1
+
+    def test_stop_line_reason_before_arming(self):
+        """未発動で基準線に到達したら STOP_LINE"""
+        state = _state(avg_cost=1000.0, peak=1000.0)
+        nxt, intent = policy.step(state, _obs(l=920.0), _conf())
+        assert intent is not None
+        assert intent.reason == policy.STOP_LINE
+        assert intent.order_type == "STOP"
+        assert intent.trigger_price == pytest.approx(930.0)
+
+    def test_trailing_reason_after_arming(self):
+        """発動後に基準線へ到達したら TRAILING"""
+        state = _state(avg_cost=1000.0, peak=1100.0)  # armed、線は1056
+        nxt, intent = policy.step(state, _obs(h=1100.0, l=1050.0), _conf())
+        assert intent is not None
+        assert intent.reason == policy.TRAILING
+        assert intent.trigger_price == pytest.approx(1056.0)
+
+    def test_signal_sell_is_market_order(self):
+        """売りシグナルは翌営業日の寄りで成行（trigger_priceを持たない）"""
+        state = _state(avg_cost=1000.0, peak=1000.0)
+        nxt, intent = policy.step(state, _obs(l=990.0, score=-0.30), _conf())
+        assert intent is not None
+        assert intent.reason == policy.SIGNAL_SELL
+        assert intent.order_type == "MARKET"
+        assert intent.trigger_price is None
+
+    def test_stop_takes_precedence_over_signal_sell(self):
+        """同じ日に基準線到達と売りシグナルが揃ったら、基準線を優先する（不利側）"""
+        state = _state(avg_cost=1000.0, peak=1000.0)
+        nxt, intent = policy.step(state, _obs(l=920.0, score=-0.30), _conf())
+        assert intent.reason == policy.STOP_LINE
+
+    def test_time_limit_at_max_holding(self):
+        """最大保有営業日数に達したら TIME_LIMIT（翌営業日の寄りで成行）"""
+        state = _state(avg_cost=1000.0, peak=1000.0, sessions_held=9)
+        nxt, intent = policy.step(state, _obs(l=990.0), _conf(max_holding=10))
+        assert intent is not None
+        assert intent.reason == policy.TIME_LIMIT
+        assert intent.order_type == "MARKET"
+        assert nxt.sessions_held == 10
+
+    def test_no_time_limit_before_max_holding(self):
+        state = _state(avg_cost=1000.0, peak=1000.0, sessions_held=8)
+        nxt, intent = policy.step(state, _obs(l=990.0), _conf(max_holding=10))
+        assert intent is None
+
+
+class TestStepPeakOrdering:
+    def test_same_session_high_does_not_raise_todays_line(self):
+        """当日の高値でピークが更新されても、当日の基準線は前営業日ピークで固定する。
+
+        未来（当日の高値）を遡ってストップへ使わないための規約。
+        ピーク1000（未発動、線=930）の日に高値1100・安値1050が出た場合、
+        同日にトレーリング線1056へ引き上げて安値1050で退出、とはしない。
+        """
+        state = _state(avg_cost=1000.0, peak=1000.0)
+        nxt, intent = policy.step(state, _obs(h=1100.0, l=1050.0), _conf())
+        assert intent is None                       # 当日は退出しない
+        assert nxt.peak_price == pytest.approx(1100.0)  # ピークは当日終了後に反映
+
+    def test_raised_line_applies_from_next_session(self):
+        """引き上がった線は翌営業日から効く"""
+        state = _state(avg_cost=1000.0, peak=1000.0)
+        after_day1, _ = policy.step(state, _obs(h=1100.0, l=1050.0), _conf())
+        # 翌日は peak=1100 に基づく線1056が有効
+        _, intent = policy.step(after_day1, _obs(session=date(2026, 9, 3), h=1060.0, l=1050.0), _conf())
+        assert intent is not None
+        assert intent.reason == policy.TRAILING
+        assert intent.trigger_price == pytest.approx(1056.0)
+
+    def test_peak_never_decreases(self):
+        """安値だけの日でもピークは下がらない"""
+        state = _state(avg_cost=1000.0, peak=1100.0)
+        nxt, _ = policy.step(state, _obs(h=1020.0, l=1010.0), _conf())
+        assert nxt.peak_price == pytest.approx(1100.0)

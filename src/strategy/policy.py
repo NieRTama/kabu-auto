@@ -135,3 +135,54 @@ def stop_line(state: HoldingState, conf: PolicyConfig) -> float:
         if conf.trailing_stop_pct > 0:
             line = max(line, state.peak_price * (1 - conf.trailing_stop_pct))
     return line
+
+
+def step(state: HoldingState, obs: Observation, conf: PolicyConfig, *,
+         peak_basis: str = PEAK_BASIS_PREVIOUS) -> tuple[HoldingState, Optional[ExitIntent]]:
+    """1営業日ぶん状態を進め、退出意図があれば返す。
+
+    戻り値: (次の状態, ExitIntent または None)
+
+    その時点までに観測できた情報だけを受け取り、将来の足はまとめて受け取らない。
+    そのため実運用でもそのまま呼べる。
+
+    **日足内の順序について。** トレーリングには日足では解けない順序問題がある。
+    ある日の高値がピークを更新して基準線を引き上げ、同じ日の安値がその引き上がった
+    線に触れる場合、どちらが先に起きたかを日足から復元できない。
+    既定（peak_basis="previous"）では当日の基準線を**前営業日終了時点のピーク**で
+    固定し、当日の高値によるピーク更新は判定後に反映する。これで未来のピークを
+    遡ってストップへ使うことがなくなる。
+    peak_basis="same_session" は当日の高値を即座に反映する楽観仮定で、
+    両者の差を測って結果に記録するために用意している（差が大きい戦略は
+    日中データを持つまで採用しない）。
+
+    判定の順序は不利側を優先する。同じ日に基準線到達と売りシグナルが揃った
+    場合は基準線を採る。
+    """
+    if peak_basis == PEAK_BASIS_PREVIOUS:
+        judged = state
+    elif peak_basis == PEAK_BASIS_SAME_SESSION:
+        judged = replace(state, peak_price=max(state.peak_price, obs.high))
+    else:
+        raise ValueError(
+            f"peak_basis は '{PEAK_BASIS_PREVIOUS}' か '{PEAK_BASIS_SAME_SESSION}': {peak_basis}"
+        )
+
+    next_state = replace(
+        state,
+        peak_price=max(state.peak_price, obs.high),
+        sessions_held=state.sessions_held + 1,
+    )
+
+    line = stop_line(judged, conf)
+    if obs.low <= line:
+        reason = TRAILING if is_armed(judged, conf) else STOP_LINE
+        return next_state, ExitIntent(reason=reason, trigger_price=line, order_type="STOP")
+
+    if obs.score is not None and obs.score <= conf.sell_threshold:
+        return next_state, ExitIntent(reason=SIGNAL_SELL, trigger_price=None, order_type="MARKET")
+
+    if next_state.sessions_held >= conf.max_holding_sessions:
+        return next_state, ExitIntent(reason=TIME_LIMIT, trigger_price=None, order_type="MARKET")
+
+    return next_state, None
