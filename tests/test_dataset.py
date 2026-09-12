@@ -4,7 +4,7 @@
 使わない＝循環を断つ）、退出はpolicy、約定とコストはexecutionに委ねる。
 未成熟・未約定・欠損は別ステータスにして学習対象から外す（spec §6）。
 """
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -116,3 +116,79 @@ class TestLabelContractId:
         import inspect
         params = set(inspect.signature(dataset.make_label_contract_id).parameters)
         assert params == {"policy_conf", "costs", "peak_basis"}
+
+
+def _ohlcv(n: int, start_price: float = 1000.0) -> pd.DataFrame:
+    """日付インデックス・昇順・重複なしの単一銘柄OHLCVを作る"""
+    start = date(2025, 1, 6)
+    rows = []
+    price = start_price
+    for i in range(n):
+        price *= 1 + 0.002 * ((i % 7) - 3)
+        rows.append({
+            "date": start + timedelta(days=i),
+            "open": price, "high": price * 1.01, "low": price * 0.99,
+            "close": price, "volume": 100000,
+        })
+    df = pd.DataFrame(rows).set_index("date")
+    df.index = pd.to_datetime(df.index)
+    return df
+
+
+class TestRuleScores:
+    def test_returns_one_score_per_session(self):
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        scores = dataset.rule_scores(feat)
+        assert len(scores) == len(feat)
+        assert list(scores.index) == list(feat.index)
+
+    def test_scores_are_within_rule_range(self):
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        scores = dataset.rule_scores(feat).dropna()
+        assert ((scores >= -1.0) & (scores <= 1.0)).all()
+
+    def test_matches_signal_module_for_a_single_session(self):
+        """既存の compute_rule_score と同じ値になる（ルールを二重に書いていない）"""
+        from src.strategy import signal as signal_mod
+
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        scores = dataset.rule_scores(feat)
+        i = 100
+        expected = signal_mod.compute_rule_score(feat.iloc[i - 1:i + 1])
+        assert scores.iloc[i] == pytest.approx(expected)
+
+    def test_first_session_has_no_score(self):
+        """前日が無い先頭セッションはスコアを出さない（compute_rule_scoreが2行必要）"""
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        scores = dataset.rule_scores(feat)
+        assert pd.isna(scores.iloc[0])
+
+
+class TestFindCandidates:
+    def test_selects_sessions_at_or_above_threshold(self, monkeypatch):
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        fake = pd.Series([np.nan] * len(feat), index=feat.index)
+        fake.iloc[74] = 0.30
+        fake.iloc[80] = 0.20
+        fake.iloc[90] = 0.25
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        got = dataset.find_candidates(feat, buy_threshold=0.25)
+        assert got == [74, 90]
+
+    def test_excludes_sessions_with_invalid_features(self, monkeypatch):
+        """特徴量が揃っていないセッションは候補にしない"""
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        fake = pd.Series([0.99] * len(feat), index=feat.index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        got = dataset.find_candidates(feat, buy_threshold=0.25)
+        valid_positions = [i for i, v in enumerate(feat["feature_valid"]) if bool(v)]
+        assert got == valid_positions
+
+    def test_returns_empty_when_nothing_reaches_threshold(self, monkeypatch):
+        feat = indicators.build_feature_frame(_ohlcv(120))
+        fake = pd.Series([0.01] * len(feat), index=feat.index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        assert dataset.find_candidates(feat, buy_threshold=0.25) == []

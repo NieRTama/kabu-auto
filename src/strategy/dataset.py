@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from src.strategy.indicators import FEATURE_COLS
+from src.strategy.signal import compute_rule_score
 
 # ─── 状態区分 ──────────────────────────────────────────────────────────
 # 未成熟・未約定・欠損を「損失0」に潰さないため、ラベルとは別に持つ。
@@ -116,3 +117,36 @@ def make_label_contract_id(policy_conf: "policy.PolicyConfig",
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def rule_scores(feat: pd.DataFrame) -> pd.Series:
+    """各セッションのルールスコアを返す（feat の index を保持する）。
+
+    signal.compute_rule_score() は df.iloc[-1] と df.iloc[-2] しか見ないため、
+    2行の窓を渡せばそのセッションのスコアが求まる。ルールを二重に書かず
+    既存実装をそのまま再利用する。前日が無い先頭セッションは NaN。
+    """
+    values = [float("nan")]
+    for i in range(1, len(feat)):
+        values.append(compute_rule_score(feat.iloc[i - 1:i + 1]))
+    return pd.Series(values, index=feat.index, name="rule_score")
+
+
+def find_candidates(feat: pd.DataFrame, buy_threshold: float) -> list[int]:
+    """買い候補となるセッションの位置インデックスを返す。
+
+    **MLの予測を使わない。** ラベルを作るためにMLの予測が要る循環を断つため、
+    候補生成はバージョン固定のルールだけで行う（spec §6）。
+    特徴量が揃っていないセッションは候補にしない。
+    """
+    scores = rule_scores(feat)
+    valid = feat["feature_valid"] if "feature_valid" in feat.columns else pd.Series(
+        True, index=feat.index)
+    out = []
+    for i in range(len(feat)):
+        score = scores.iloc[i]
+        if pd.isna(score) or not bool(valid.iloc[i]):
+            continue
+        if score >= buy_threshold:
+            out.append(i)
+    return out
