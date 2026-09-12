@@ -14,6 +14,8 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from src.strategy.dataset import STATUS_RESOLVED
+
 
 @dataclass(frozen=True)
 class Fold:
@@ -92,3 +94,71 @@ def calendar_folds(events: pd.DataFrame, n_splits: int = 5) -> list:
             val_end=sessions[val_hi - 1],
         ))
     return folds
+
+
+def _resolved(events: pd.DataFrame) -> pd.DataFrame:
+    """ラベルが確定したイベントだけを残す。
+
+    未成熟・未約定・欠損はラベルが無く指標も計算できないため、学習にも
+    検証にも使わない（損失0として扱わないのと同じ理由）。
+    """
+    return events[events["status"] == STATUS_RESOLVED]
+
+
+def split_events(events: pd.DataFrame, fold: Fold, *,
+                 embargo_sessions: int = 0) -> tuple:
+    """fold を適用して (学習イベント, 検証イベント) を返す。
+
+    **purge**: 学習側から `label_end_at > fold.train_end` のイベントを除外する。
+
+    `train_end` は学習締切＝この分割で学習を実行する時点である。判断日だけを
+    締切で切ると、「判断は締切前だがラベルの確定は締切後」というイベントが
+    学習に入る。それは学習実行時点では観測できない情報であり、
+    walk-forward が答えようとしている「その時点で何を知り得たか」を壊す。
+
+    `train_end < val_start` を Fold が保証しているので、この条件は
+    「ラベルが検証期間へ食い込む学習イベントを落とす」という従来の purge
+    （spec §7 の `label_end_at >= val_start` を除外）を必ず含む。厳しいほうを採る。
+
+    **embargo**: 既定で無効。有効にすると `val_start` の**直前** embargo_sessions
+    セッションぶんの判断日を学習側から外す。purge を通した後でも、検証開始の
+    直前にある学習イベントは系列相関で検証期間の結果と相関するため、
+    境界に空白セッションを置きたい場合に使う。
+
+    片方向walk-forwardでは `val_end` より後の判断日が学習側に入ることは
+    構造的に無いので、「検証期間の後ろを外す」向きの embargo は実装しない
+    （到達不能なコードになる）。両側を学習に使う分割を将来採用するなら、
+    purge の契約から分けて設計し直すこと。
+    """
+    resolved = _resolved(events)
+
+    val = resolved[
+        (resolved["decision_at"] >= fold.val_start)
+        & (resolved["decision_at"] <= fold.val_end)
+    ]
+
+    train = resolved[
+        (resolved["decision_at"] >= fold.train_start)
+        & (resolved["decision_at"] <= fold.train_end)
+    ]
+    # purge = 学習締切での実現可能性。
+    # decision_at だけを train_end で切ると、判断は締切前でもラベルが締切後に
+    # 確定するイベントが学習に入る。例: train_end=1/5, val_start=1/12 のとき、
+    # 1/5判断・1/8確定のラベルは「1/5時点では誰も知り得ない」のに通ってしまう
+    # （外部レビューR06）。学習締切とは学習を実行する時点のことなので、
+    # ラベル確定日も同じ締切で切る。
+    #
+    # train_end < val_start が Fold で保証されているため、この条件は
+    # 従来の purge（label_end_at < val_start）を必ず含む。より厳しいほうだけ残す。
+    train = train[train["label_end_at"] <= fold.train_end]
+
+    if embargo_sessions > 0:
+        # 検証開始の直前セッションを学習側から落とす（前方ギャップ）。
+        # 特徴量の系列相関は purge を通した後でも残るため、境界に空白を置く。
+        sessions = sessions_of(resolved)
+        before = [s for s in sessions if s < fold.val_start]
+        embargoed = set(before[-embargo_sessions:])
+        if embargoed:
+            train = train[~train["decision_at"].isin(embargoed)]
+
+    return train.reset_index(drop=True), val.reset_index(drop=True)
