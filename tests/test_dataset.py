@@ -5,7 +5,6 @@
 未成熟・未約定・欠損は別ステータスにして学習対象から外す（spec §6）。
 """
 from datetime import date, timedelta
-import time
 
 import numpy as np
 import pandas as pd
@@ -592,7 +591,6 @@ class TestSaveDatasetMeta:
         input_hash = dataset.input_ohlcv_hash({"7203": _ohlcv(120)})
 
         dataset.save_dataset_meta(events, did, path, input_hash)
-        time.sleep(1)  # 異なる秒でのタイムスタンプを確保
         dataset.save_dataset_meta(events, did, path, input_hash)
 
         with get_session() as session:

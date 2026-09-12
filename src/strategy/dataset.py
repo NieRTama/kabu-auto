@@ -16,6 +16,7 @@ max_holding に満たない末尾のイベントにも最終リターンの符�
 """
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -449,7 +450,12 @@ def save_dataset_meta(events: pd.DataFrame, dataset_id: str, path,
     from src.data.database import Dataset, get_session
 
     if collection_id is None:
-        collection_id = f"{clock.now():%Y%m%dT%H%M%S}-{dataset_id}"
+        # 時刻だけでは一意性を保証できない。Windowsのシステムクロックは
+        # 実解像度が約15.6msしかなく、短時間に複数回呼ばれると衝突する
+        # （バッチでのデータセット変種生成やリトライ処理で起こりうる）。
+        # マイクロ秒精度へ変えるだけでは直らない（クロック自体が進まないため）。
+        # 乱数成分を足して衝突耐性を時刻の解像度に依存させない。
+        collection_id = f"{clock.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}-{dataset_id}"
 
     symbols = sorted(events["symbol"].unique().tolist()) if len(events) else []
     period_start = events["decision_at"].min() if len(events) else None
