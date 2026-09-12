@@ -579,6 +579,13 @@ class TestTrainingInputs:
         assert windowed.preprocessor.n_fitted == len(windowed.events)
         assert windowed.preprocessor.means["f1"] != pytest.approx(
             full.preprocessor.means["f1"])
+        # 重みも窓で絞った後の集合に対して計算されていること。
+        # 窓適用前の集合に対して計算していると長さが合わない。
+        assert len(windowed.weights) == len(windowed.events)
+        # 窓で絞ると重なり相手の集合が変わるため、全期間の重みとは
+        # 値も変わる（training_weights()がfull.eventsではなくwindowed.events
+        # を見ていることの直接証拠）
+        assert list(windowed.weights) != pytest.approx(list(full.weights[:len(windowed.weights)]))
 
 
 class TestOuterFoldIsUntouchable:
