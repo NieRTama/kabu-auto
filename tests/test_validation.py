@@ -505,3 +505,43 @@ class TestPreprocessor:
             events[col] = 1.0
         pre = validation.fit_preprocessor(events)
         assert list(pre.means.index) == list(indicators.FEATURE_COLS)
+
+
+class TestTrainingWindow:
+    def _train(self):
+        events = _daily_events(["7203", "9984"], date(2026, 1, 5), 80, holding=1)
+        fold = validation.calendar_folds(events, n_splits=5)[4]
+        train, _ = validation.split_events(events, fold)
+        return train
+
+    def test_none_keeps_everything_expanding_window(self):
+        train = self._train()
+        out = validation.apply_training_window(train, None)
+        assert list(out["event_id"]) == list(train["event_id"])
+
+    def test_rolling_window_keeps_only_recent_sessions(self):
+        train = self._train()
+        out = validation.apply_training_window(train, window_sessions=10)
+        assert len(validation.sessions_of(out)) == 10
+        assert out["decision_at"].max() == train["decision_at"].max()
+
+    def test_rolling_window_drops_the_oldest_sessions(self):
+        train = self._train()
+        out = validation.apply_training_window(train, window_sessions=10)
+        assert out["decision_at"].min() > train["decision_at"].min()
+
+    def test_keeps_all_symbols_within_the_window(self):
+        """窓はセッションで切る。銘柄を落とさない"""
+        train = self._train()
+        out = validation.apply_training_window(train, window_sessions=10)
+        assert set(out["symbol"]) == set(train["symbol"])
+
+    def test_window_larger_than_history_keeps_everything(self):
+        train = self._train()
+        out = validation.apply_training_window(train, window_sessions=100000)
+        assert list(out["event_id"]) == list(train["event_id"])
+
+    def test_rejects_non_positive_window(self):
+        train = self._train()
+        with pytest.raises(ValueError, match="window_sessions"):
+            validation.apply_training_window(train, window_sessions=0)

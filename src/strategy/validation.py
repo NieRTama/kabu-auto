@@ -234,3 +234,29 @@ def apply_preprocessor(pre: Preprocessor, events: pd.DataFrame,
     X = events.reindex(columns=cols).astype("float64")
     X = X.fillna(pre.means)
     return (X - pre.means) / pre.stds
+
+
+def apply_training_window(train_events: pd.DataFrame,
+                          window_sessions: Optional[int] = None) -> pd.DataFrame:
+    """学習窓を適用する。None なら拡大窓、整数なら直近 N セッションの移動窓。
+
+    現行の週次学習は load_ohlcv(sym) の既定値そのままで直近500行だけを読んでおり、
+    **意図した選択ではない**（レビューF07）。窓を明示パラメータにして、
+    拡大窓と移動窓を内側foldで比較して選べるようにする。
+
+    窓は**セッション（暦日）で切る**。行数で切ると、1日あたりの候補数が
+    銘柄数や相場つきで変わったときに実期間が動いてしまう。
+    """
+    if window_sessions is None:
+        return train_events.reset_index(drop=True)
+    if window_sessions <= 0:
+        raise ValueError(f"window_sessions は正の整数: {window_sessions}")
+
+    sessions = sessions_of(train_events)
+    if len(sessions) <= window_sessions:
+        return train_events.reset_index(drop=True)
+
+    cutoff = sessions[-window_sessions]
+    return train_events[
+        train_events["decision_at"] >= cutoff
+    ].reset_index(drop=True)
