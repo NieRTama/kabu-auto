@@ -192,3 +192,59 @@ class TestStepPeakOrdering:
         state = _state(avg_cost=1000.0, peak=1100.0)
         nxt, _ = policy.step(state, _obs(h=1020.0, l=1010.0), _conf())
         assert nxt.peak_price == pytest.approx(1100.0)
+
+
+class TestRunSessionSeries:
+    def _series(self):
+        """1日目に高値1100・安値1050、2日目に安値1050の観測列"""
+        return [
+            _obs(session=date(2026, 9, 2), o=1000.0, h=1100.0, l=1050.0, c=1090.0),
+            _obs(session=date(2026, 9, 3), o=1090.0, h=1095.0, l=1050.0, c=1055.0),
+        ]
+
+    def test_pessimistic_exits_on_second_session(self):
+        """既定（previous）: 1日目は線が引き上がらず退出せず、2日目に退出する"""
+        final, intent, at = policy.run_session_series(
+            _state(avg_cost=1000.0, peak=1000.0), self._series(), _conf())
+        assert intent is not None
+        assert intent.reason == policy.TRAILING
+        assert at.session == date(2026, 9, 3)
+
+    def test_optimistic_exits_on_first_session(self):
+        """same_session: 1日目の高値で線が1056へ上がり、同じ日の安値1050で退出する"""
+        final, intent, at = policy.run_session_series(
+            _state(avg_cost=1000.0, peak=1000.0), self._series(), _conf(),
+            peak_basis=policy.PEAK_BASIS_SAME_SESSION)
+        assert intent is not None
+        assert intent.reason == policy.TRAILING
+        assert at.session == date(2026, 9, 2)
+
+    def test_difference_between_bases_is_measurable(self):
+        """2つの仮定の差（退出日）を測れる＝曖昧性を結果に記録できる"""
+        pess = policy.run_session_series(
+            _state(avg_cost=1000.0, peak=1000.0), self._series(), _conf())
+        opt = policy.run_session_series(
+            _state(avg_cost=1000.0, peak=1000.0), self._series(), _conf(),
+            peak_basis=policy.PEAK_BASIS_SAME_SESSION)
+        assert pess[2].session != opt[2].session
+
+    def test_returns_none_intent_when_bars_run_out(self):
+        """足が尽きても決着しない場合は意図なしで返す（未成熟として扱えるように）"""
+        calm = [_obs(session=date(2026, 9, 2), h=1005.0, l=995.0)]
+        final, intent, at = policy.run_session_series(
+            _state(avg_cost=1000.0, peak=1000.0), calm, _conf(max_holding=10))
+        assert intent is None
+        assert at is None
+        assert final.sessions_held == 1
+
+    def test_stops_advancing_after_exit(self):
+        """退出した時点で止まる（それ以降の足を消費しない）"""
+        bars = [
+            _obs(session=date(2026, 9, 2), l=920.0),   # ここで損切り
+            _obs(session=date(2026, 9, 3), l=900.0),
+        ]
+        final, intent, at = policy.run_session_series(
+            _state(avg_cost=1000.0, peak=1000.0), bars, _conf())
+        assert intent.reason == policy.STOP_LINE
+        assert at.session == date(2026, 9, 2)
+        assert final.sessions_held == 1

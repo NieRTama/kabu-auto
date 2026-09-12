@@ -186,3 +186,29 @@ def step(state: HoldingState, obs: Observation, conf: PolicyConfig, *,
         return next_state, ExitIntent(reason=TIME_LIMIT, trigger_price=None, order_type="MARKET")
 
     return next_state, None
+
+
+def run_session_series(
+    state: HoldingState,
+    observations: list[Observation],
+    conf: PolicyConfig,
+    *,
+    peak_basis: str = PEAK_BASIS_PREVIOUS,
+) -> tuple[HoldingState, Optional[ExitIntent], Optional[Observation]]:
+    """観測列を、退出するか足が尽きるまで進める。
+
+    戻り値: (最終状態, 退出意図 or None, その意図が出た日の観測 or None)
+
+    足が尽きても決着しない場合は意図なしで返す。呼び出し側はこれを
+    「未成熟」として扱い、学習ラベルの対象から外す（spec §6）。
+
+    同じ観測列を peak_basis を変えて2回流すと、日足内の順序の仮定による
+    差を測れる。悲観側へ寄せるだけでは順序問題は解決しないため、
+    曖昧性を測って結果に記録する（spec §6）。
+    """
+    current = state
+    for obs in observations:
+        current, intent = step(current, obs, conf, peak_basis=peak_basis)
+        if intent is not None:
+            return current, intent, obs
+    return current, None, None
