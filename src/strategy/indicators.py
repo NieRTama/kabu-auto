@@ -75,13 +75,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """ML用の特徴量を作成して返す（ラベルは付与しない）。
-
-    ラベリングは labeling.py のトリプルバリア法で別途行う。
-    特徴量は過去データのみから計算されるため、最新行も保持される
-    （予測時に当日の特徴量を使えるよう dropna は特徴量列のみで行う）。
-    """
+def _add_feature_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """指標から派生する特徴量列を付加する（欠損行の扱いは呼び出し側が決める）。"""
     df = compute_indicators(df)
     conf = cfg.get_section("strategy")
     short = conf.get("ma_short", 5)
@@ -94,8 +89,35 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_pct"] = (df["close"] - df["bb_lower"]) / bb_width
     df["price_momentum_5"] = df["close"].pct_change(5, fill_method=None)
     df["price_momentum_20"] = df["close"].pct_change(20, fill_method=None)
+    return df
 
-    return df.dropna(subset=FEATURE_COLS)
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """ML用の特徴量を作成して返す（ラベルは付与しない）。
+
+    **挙動を変更しないこと。** legacy経路（src/backtest/engine.py・
+    src/strategy/signal.py）がこの戻り値に依存しており、特に engine.py は
+    「この関数が落とした行＝助走期間」という前提で
+    `if dt not in featured_df.index` により推論をスキップしている。
+    dropna をやめるとそのガードが無効化され、NaN行が推論へ流れる。
+
+    日付を保持したまま欠損をマスクで扱いたい場合は build_feature_frame() を使う。
+    """
+    return _add_feature_columns(df).dropna(subset=FEATURE_COLS)
+
+
+def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """特徴量を、日付インデックスを保持したまま返す（v2経路用）。
+
+    build_features() は欠損行を落として返すため、呼び出し側が
+    reset_index(drop=True) して行番号を「N営業日」として数えると、
+    途中に欠損があった分だけ実日数とずれる（レビューF06後半）。
+    本APIは行を落とさず、学習・判定に使ってよい行かを feature_valid 列で示す。
+    時間軸の連続性は市場系列側で保ち、採否はマスクで管理する。
+    """
+    out = _add_feature_columns(df)
+    out["feature_valid"] = out[FEATURE_COLS].notna().all(axis=1)
+    return out
 
 
 FEATURE_COLS = [

@@ -6,6 +6,7 @@
 import numpy as np
 import pandas as pd
 import pytest
+from datetime import date, timedelta
 
 from src.core import config as cfg
 from src.strategy import indicators
@@ -140,3 +141,79 @@ class TestRsiChangeAgainstThePreviousImplementation:
         rsi = indicators._rsi(s, 14).dropna()
         assert len(rsi) > 0
         assert ((rsi >= 0) & (rsi <= 100)).all()
+
+
+def _ohlcv(n: int, start_price: float = 1000.0) -> pd.DataFrame:
+    """日付インデックス・昇順・重複なしの単一銘柄OHLCVを作る"""
+    start = date(2025, 1, 6)  # 月曜
+    rows = []
+    price = start_price
+    for i in range(n):
+        price *= 1 + 0.002 * ((i % 7) - 3)
+        rows.append({
+            "date": start + timedelta(days=i),
+            "open": price, "high": price * 1.01, "low": price * 0.99,
+            "close": price, "volume": 100000,
+        })
+    df = pd.DataFrame(rows).set_index("date")
+    df.index = pd.to_datetime(df.index)
+    return df
+
+
+class TestBuildFeatureFrame:
+    def test_keeps_all_rows_and_dates(self):
+        """行を落とさず、日付インデックスをそのまま保持する"""
+        df = _ohlcv(120)
+        out = indicators.build_feature_frame(df)
+        assert len(out) == len(df)
+        assert list(out.index) == list(df.index)
+
+    def test_marks_warmup_rows_invalid(self):
+        """助走期間（指標が揃わない先頭）は feature_valid=False"""
+        df = _ohlcv(120)
+        out = indicators.build_feature_frame(df)
+        assert bool(out["feature_valid"].iloc[0]) is False
+        assert bool(out["feature_valid"].iloc[-1]) is True
+
+    def test_valid_mask_matches_feature_completeness(self):
+        """feature_valid は FEATURE_COLS が全て揃っている行と一致する"""
+        df = _ohlcv(120)
+        out = indicators.build_feature_frame(df)
+        expected = out[indicators.FEATURE_COLS].notna().all(axis=1)
+        assert (out["feature_valid"] == expected).all()
+
+    def test_appending_future_rows_does_not_change_past_features(self):
+        """将来の行を足しても、過去の行の特徴量は変わらない（spec §14 段階B完了条件）"""
+        df = _ohlcv(120)
+        base = indicators.build_feature_frame(df)
+
+        extended = _ohlcv(150)
+        after = indicators.build_feature_frame(extended)
+
+        common = base.index
+        for col in indicators.FEATURE_COLS:
+            pd.testing.assert_series_equal(
+                base.loc[common, col], after.loc[common, col],
+                check_names=False,
+            )
+
+
+class TestBuildFeaturesUnchanged:
+    def test_legacy_api_still_drops_invalid_rows(self):
+        """既存APIは従来どおり欠損行を落とす（legacy経路が依存している）"""
+        df = _ohlcv(120)
+        legacy = indicators.build_features(df)
+        assert legacy[indicators.FEATURE_COLS].notna().all().all()
+        assert len(legacy) < len(df)  # 助走期間ぶんは落ちている
+
+    def test_legacy_api_matches_valid_rows_of_new_api(self):
+        """既存APIの結果は、新APIの feature_valid=True の行と一致する"""
+        df = _ohlcv(120)
+        legacy = indicators.build_features(df)
+        framed = indicators.build_feature_frame(df)
+        valid = framed[framed["feature_valid"]]
+        assert list(legacy.index) == list(valid.index)
+        for col in indicators.FEATURE_COLS:
+            pd.testing.assert_series_equal(
+                legacy[col], valid[col], check_names=False,
+            )
