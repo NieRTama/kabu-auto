@@ -487,6 +487,24 @@ class TestDatasetId:
         assert len(did) == 16
         assert all(c in "0123456789abcdef" for c in did)
 
+    def test_id_is_deterministic_across_shuffles_with_mixed_label_contracts(self, monkeypatch):
+        """異なるlabel_contract_idの行が混在しても、並び順を変えたら同じIDになる
+
+        symbol+decision_atだけでは同値キーが生じ、並び替えが非決定的になる
+        （実測: 40通りのシャッフルで40通りの別IDが出た）。
+        """
+        events = _sample_events(monkeypatch)
+        # 同じ(symbol, decision_at)の組を持つ行を、別のlabel_contract_idで複製する
+        duplicated = events.copy()
+        duplicated["label_contract_id"] = "differentcontract"
+        combined = pd.concat([events, duplicated], ignore_index=True)
+
+        ids = set()
+        for seed in range(10):
+            shuffled = combined.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+            ids.add(dataset.compute_dataset_id(shuffled))
+        assert len(ids) == 1
+
     def test_label_dtype_does_not_change_id(self, monkeypatch):
         """欠損の有無でlabelのdtypeが変わってもIDは変わらない。
 
@@ -543,6 +561,15 @@ class TestSaveLoad:
         path = dataset.save_events(events, did, base_dir=str(tmp_path))
         assert path.name == f"{did}.csv.gz"
 
+    def test_roundtrip_preserves_numeric_looking_symbol(self, monkeypatch, tmp_path):
+        """'0000'のような数字だけの銘柄コードが、保存・読込後もintに化けない"""
+        events = _sample_events(monkeypatch, symbol="0000")
+        did = dataset.compute_dataset_id(events)
+        dataset.save_events(events, did, base_dir=str(tmp_path))
+        loaded = dataset.load_events(did, base_dir=str(tmp_path))
+        assert (loaded["symbol"] == "0000").all()
+        assert dataset.compute_dataset_id(loaded) == did
+
 
 @pytest.fixture
 def isolated_db(tmp_path):
@@ -598,6 +625,27 @@ class TestSaveDatasetMeta:
         assert len(rows) == 2
         assert rows[0].dataset_id == rows[1].dataset_id       # 内容は同じ
         assert rows[0].collection_id != rows[1].collection_id  # 採取は別
+
+    def test_records_version_from_the_events_frame_not_the_module_constant(
+            self, monkeypatch, isolated_db, tmp_path):
+        """版はモジュール定数ではなくイベント表自身から記録する
+
+        将来モジュール定数が上がった後に古い版のデータセットを再登録しても、
+        DB行の版が現在のコード版で上書きされてはならない
+        （コード変更による差とデータ改訂による差を分離するため）。
+        """
+        events = _sample_events(monkeypatch)
+        events["feature_version"] = "f0-old"  # モジュール定数(FEATURE_VERSION)とは別の値
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path / "ds"))
+        input_hash = dataset.input_ohlcv_hash({"7203": _ohlcv(120)})
+
+        dataset.save_dataset_meta(events, did, path, input_hash)
+
+        with get_session() as session:
+            row = session.scalar(select(db.Dataset))
+        assert row.feature_version == "f0-old"
+        assert row.feature_version != dataset.FEATURE_VERSION
 
     def test_records_period_and_symbols(self, monkeypatch, isolated_db, tmp_path):
         events = _sample_events(monkeypatch)

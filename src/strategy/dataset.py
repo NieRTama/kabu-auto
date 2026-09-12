@@ -357,9 +357,18 @@ def _normalized_frame(events: pd.DataFrame) -> pd.DataFrame:
 
     列順・並び順・日付表現・数値のdtypeを固定する。これをしないと、
     同じ内容でも生成の順序や dtype 推論の差で別のIDになる。
+
+    並び順のキーは (symbol, decision_at) だけでは足りない。異なる
+    label_contract_id のイベント表を連結すると同値キーが並び、
+    タイブレークが安定しないため dataset_id が非決定的になる
+    （実測: 同一内容の40通りのシャッフルが40通りの別IDを生んだ）。
+    event_id は銘柄+日付から決定的に作られる一意キーなので、
+    最後のタイブレークとして加える。
     """
     out = events.reindex(columns=EVENT_COLUMNS).copy()
-    out = out.sort_values(["symbol", "decision_at"]).reset_index(drop=True)
+    out = out.sort_values(
+        ["symbol", "decision_at", "label_contract_id", "event_id"]
+    ).reset_index(drop=True)
     for col in _DATE_COLUMNS:
         out[col] = out[col].map(
             lambda d: "" if pd.isna(d) else pd.Timestamp(d).strftime("%Y-%m-%d"))
@@ -411,7 +420,12 @@ def save_events(events: pd.DataFrame, dataset_id: str,
 def load_events(dataset_id: str, base_dir: str = "data/datasets") -> pd.DataFrame:
     """保存したイベント表を読み込む（日付列を date に戻す）。"""
     path = dataset_path(dataset_id, base_dir)
-    out = pd.read_csv(path, compression="gzip")
+    out = pd.read_csv(
+        path, compression="gzip",
+        dtype={"symbol": str, "event_id": str, "label_contract_id": str,
+              "status": str, "exit_reason": str, "feature_version": str,
+              "strategy_version": str, "execution_model_version": str},
+    )
     for col in _DATE_COLUMNS:
         out[col] = pd.to_datetime(out[col], errors="coerce").dt.date
         out[col] = out[col].where(out[col].notna(), None)
@@ -462,6 +476,19 @@ def save_dataset_meta(events: pd.DataFrame, dataset_id: str, path,
     period_start = events["decision_at"].min() if len(events) else None
     period_end = events["decision_at"].max() if len(events) else None
 
+    # 版はモジュール定数ではなくイベント表自身から取る。「コード変更による差」と
+    # 「データ改訂による差」を分離するのがこのテーブルの存在理由なので、
+    # モジュール定数（現在のコードバージョン）で上書きすると、過去に別の版で
+    # 作られたデータセットを再登録したときに来歴が嘘をつくことになる。
+    # 空のイベント表のときだけ、記録すべき版が無いのでモジュール定数へ逃がす。
+    feature_version = (
+        str(events["feature_version"].iloc[0]) if len(events) else FEATURE_VERSION)
+    strategy_version = (
+        str(events["strategy_version"].iloc[0]) if len(events) else STRATEGY_VERSION)
+    execution_model_version = (
+        str(events["execution_model_version"].iloc[0]) if len(events)
+        else EXECUTION_MODEL_VERSION)
+
     with get_session() as session:
         row = Dataset(
             dataset_id=dataset_id,
@@ -469,9 +496,9 @@ def save_dataset_meta(events: pd.DataFrame, dataset_id: str, path,
             symbols_json=json.dumps(symbols, ensure_ascii=False),
             period_start=period_start,
             period_end=period_end,
-            feature_version=FEATURE_VERSION,
-            strategy_version=STRATEGY_VERSION,
-            execution_model_version=EXECUTION_MODEL_VERSION,
+            feature_version=feature_version,
+            strategy_version=strategy_version,
+            execution_model_version=execution_model_version,
             file_path=str(path),
             file_sha256=file_sha256(Path(path)),
             input_ohlcv_sha256=input_hash,
