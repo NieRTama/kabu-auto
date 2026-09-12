@@ -15,7 +15,7 @@
 - 日時は **JST naive**。現在時刻は `src/core/clock.now()` / `clock.today()` を使い、`datetime.now()` を直接呼ばない。
 - **`policy.py` は設定ファイル・DB・ネットワークに直接触らない。** 設定は `PolicyConfig` として引数で受け取る。`config.yaml` からの読み出しは専用のファクトリ関数1つに閉じる。
 - **`policy.py` は将来の足をまとめて受け取らない。** 1営業日ぶんの観測を受け取って状態を進める逐次インターフェースにする。過去検証専用の関数にしないため。
-- **固定利確線は置かない。** 実運用（`src/risk/manager.py:511-560` の `evaluate_exit()`）に存在しないため。退出は損切り線・ブレークイーブン・トレーリング・売りシグナル・最大保有期間の5つだけ。
+- **固定利確線は置かない。** 実運用（`src/risk/manager.py:537-586` の `evaluate_exit()`）に存在しないため。退出は損切り線・ブレークイーブン・トレーリング・売りシグナル・最大保有期間の5つだけ。
 - **既存の公開関数の挙動を変えない。** `build_features()`・`build_training_set()`・`compute_indicators()` の戻り値は本計画の前後で同一であること。`src/backtest/engine.py` と `src/services/trading.py` は変更しない。
 - 新規モジュールは追加のみ。`config.yaml` への設定追加も行わない（既存キーだけを使う）。
 - ファイルは UTF-8 **BOM無し**・LF で保存する。作業ツリーは `core.autocrlf=true` で CRLF に見えるため、確認は `git show <rev>:<path>` でコミット済みblobに対して行う。
@@ -198,7 +198,7 @@ EOF
   - `build_feature_frame(df: pd.DataFrame) -> pd.DataFrame` — 行を落とさず、日付インデックスを保持し、`feature_valid: bool` 列を付けて返す（v2経路専用の新API）
   - `build_features(df: pd.DataFrame) -> pd.DataFrame` — **挙動不変**（従来どおり `dropna(subset=FEATURE_COLS)` した結果を返す）
 
-**背景:** 現在の `build_features()` は特徴量が欠損した行を落として返すため、呼び出し側が `reset_index(drop=True)` して行番号を「N営業日」として数えると、途中欠損があった分だけ実日数とずれる（レビューF06後半）。ただし `build_features()` は `engine.py:75` と `signal.py` が依存しており、挙動を変えると `engine.py:141` の助走期間ガードが無効化されてNaN行が推論へ流れる（spec §10）。そのため**既存APIは変えず、新APIを追加する**。
+**背景:** 現在の `build_features()` は特徴量が欠損した行を落として返すため、呼び出し側が `reset_index(drop=True)` して行番号を「N営業日」として数えると、途中欠損があった分だけ実日数とずれる（レビューF06後半）。ただし `build_features()` は `engine.py:75` と `signal.py` が依存しており、挙動を変えると `engine.py:136` の助走期間ガードが無効化されてNaN行が推論へ流れる（spec §10）。そのため**既存APIは変えず、新APIを追加する**。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -385,7 +385,7 @@ EOF
   - `is_armed(state: HoldingState, conf: PolicyConfig) -> bool`
   - `stop_line(state: HoldingState, conf: PolicyConfig) -> float`
 
-**設計上の注記（spec §6 からの意図的な差分）:** spec §6 の `HoldingState` は `armed: bool` を持つとしていたが、**フィールドとしては持たせない**。実運用の `src/risk/manager.py:548` は `armed` を永続化せず、その時点の `peak_price` から毎回導出している。保存すると `peak_price` と乖離しうるため、`is_armed()` として導出関数にする。single source of truth は `peak_price` に置く。
+**設計上の注記（spec §6 からの意図的な差分）:** spec §6 の `HoldingState` は `armed: bool` を持つとしていたが、**フィールドとしては持たせない**。実運用の `src/risk/manager.py:574` は `armed` を永続化せず、その時点の `peak_price` から毎回導出している。保存すると `peak_price` と乖離しうるため、`is_armed()` として導出関数にする。single source of truth は `peak_price` に置く。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -547,11 +547,11 @@ class HoldingState:
     """保有の状態。
 
     取得単価と数量だけでは、追加購入・部分決済・再起動を跨いだピーク価格や
-    ストップ発動状態を表せない。実運用は src/data/database.py:142 の
+    ストップ発動状態を表せない。実運用は src/data/database.py:162 の
     Position.peak_price としてまさにこの値を永続化している。
 
     `armed`（ブレークイーブン発動済みか）はフィールドとして持たない。
-    実運用（risk/manager.py:548）も永続化せず peak_price から毎回導出しており、
+    実運用（risk/manager.py:574）も永続化せず peak_price から毎回導出しており、
     保存すると乖離しうるため is_armed() で導出する。
     """
     symbol: str
@@ -634,7 +634,7 @@ def is_armed(state: HoldingState, conf: PolicyConfig) -> bool:
 def stop_line(state: HoldingState, conf: PolicyConfig) -> float:
     """この時点の基準線（損切り・ブレークイーブン・トレーリングの最も高い方）。
 
-    src/risk/manager.py:546-552 と同じ式:
+    src/risk/manager.py:572-578 と同じ式:
       1. 基準線 = 取得単価 × (1 + stop_loss_pct)
       2. ピーク時の含み益率が breakeven_trigger_pct 以上なら取得単価まで引き上げ
       3. さらに trailing_stop_pct > 0 なら ピーク×(1-trailing) とも比べて高い方
@@ -1020,7 +1020,7 @@ EOF
   - `sell_fill_price(price: float, costs: CostConfig) -> float`
   - `entry_fill(next_bar: Observation, quantity: int, costs: CostConfig) -> Fill`
 
-**背景:** spec §6 は「Tの引けで判断し、T+1の寄りで約定する」「満了日の終値で判断して同じ終値で約定する経路を作らない」としている（F04）。現行 `engine.py:113-190` は同じ `close_price` でスコア生成と約定を行っている。
+**背景:** spec §6 は「Tの引けで判断し、T+1の寄りで約定する」「満了日の終値で判断して同じ終値で約定する経路を作らない」としている（F04）。現行 `engine.py:111-188` は同じ `close_price` でスコア生成と約定を行っている。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -1108,7 +1108,7 @@ policy.py は「いつ・なぜ退出するか」までを決め、約定価格�
 本モジュールが、その意図と利用可能な日足から「いくらで約定したか」を
 仮定として決め、スリッページと手数料を**一元的に**控除する。
 
-Tの引けで判断し T+1 の寄りで約定する。現行 src/backtest/engine.py:113-190 は
+Tの引けで判断し T+1 の寄りで約定する。現行 src/backtest/engine.py:111-188 は
 同じ終値でスコア生成と約定を行っており、実運用（引け後スキャン→翌朝発注）と
 乖離していた（レビューF04）。
 
@@ -1228,7 +1228,7 @@ EOF
 | `TIME_LIMIT` / `SIGNAL_SELL` | 翌営業日の寄りで成行約定 |
 | 翌足が無い（足が尽きた） | 未約定（`None`） |
 
-現行エンジン（`engine.py:118-122`）は損切り線ちょうどで約定できる前提になっており、ギャップダウンに楽観的である。
+現行エンジン（`engine.py:119-123`）は損切り線ちょうどで約定できる前提になっており、ギャップダウンに楽観的である。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -1344,7 +1344,7 @@ def exit_fill(intent: ExitIntent, bar: Observation, next_bar: Optional[Observati
 
     STOP（基準線への到達）:
         通常は基準線で約定したとみなす。ただし**寄りが既に基準線を割っていたら
-        min(open, trigger_price) で約定する**。現行 engine.py:118-122 は
+        min(open, trigger_price) で約定する**。現行 engine.py:119-123 は
         基準線ちょうどで約定できる前提になっており、ギャップダウンに楽観的。
 
     MARKET（売りシグナル・満了）:

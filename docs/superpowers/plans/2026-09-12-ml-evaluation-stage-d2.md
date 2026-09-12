@@ -16,7 +16,7 @@
 
 - 日時は **JST naive**。現在時刻は `src/core/clock.now()` / `clock.today()` を使い、`datetime.now()` を直接呼ばない。
 - **Tの終値で判断した注文をTに約定させない。** 判断と執行のセッションが同じになる経路を作らない（レビューF04）。
-- **`src/backtest/engine.py` を変更しない。** 旧エンジンは `strategy.engine_version: legacy` の受け皿として無改造で残す（spec §10）。`engine.py:154-155` の `except Exception: pass` も削除しない。degraded の扱いは新エンジンに最初から持たせる。
+- **`src/backtest/engine.py` を変更しない。** 旧エンジンは `strategy.engine_version: legacy` の受け皿として無改造で残す（spec §10）。`engine.py:160-161` の `except Exception: pass` も削除しない。degraded の扱いは新エンジンに最初から持たせる。
 - **`src/risk/manager.py` / `src/strategy/ml_model.py` / `src/strategy/labeling.py` / `src/strategy/indicators.py` の既存公開関数を変更しない。**
 - 新規のDB列・テーブルはすべて nullable。`create_all` が新規テーブルを、`_migrate_add_missing_columns()` が既存テーブルへの列追加を自動で行う。
 - 推論の例外を握り潰さない。1件でも発生した実行には `degraded=True` を立て、比較とモデル昇格から除外できるようにする。
@@ -964,7 +964,7 @@ EOF
   - `RunModelUsage` モデル: `run_id` / `model_id` / `from_session` / `to_session` / `n_train_events`
   - `run_walkforward(..., retrain=None, train_model=None)` — 再学習の結線
 
-**背景（spec §7 経路4）:** バックテスト中の週次再学習にも、段階Cと**同じ締切**を適用する。その再学習時点までにラベルが観測可能になったイベントだけを使う。外側 fold 開始時に一度 purge するだけでは足りない。現行 `engine.py:79-94` は開始前に一度だけ学習し、テスト期間中は再学習しない。
+**背景（spec §7 経路4）:** バックテスト中の週次再学習にも、段階Cと**同じ締切**を適用する。その再学習時点までにラベルが観測可能になったイベントだけを使う。外側 fold 開始時に一度 purge するだけでは足りない。現行 `engine.py:82-97` は開始前に一度だけ学習し、テスト期間中は再学習しない。
 
 **`train_model` の契約:** `train_model(as_of: date) -> tuple[object, int]` — その時点までに確定した情報だけで学習し、`(モデル, 学習イベント数)` を返す。締切の適用は呼び出し側（この関数の実装者）の責任で、`validation.training_inputs()` を通す。
 
@@ -1208,7 +1208,7 @@ EOF
 
 **背景（spec §8）:** 現行 `BacktestRun` は完全な実行設定・モデル・入力データの来歴を持たない。`config_hash` は同一性の確認に使えるが復元には使えないため、**設定JSONの実体も保存する**。推論例外が1件でも発生した実行には `degraded=True` を立て、比較とモデル昇格から除外できるようにする。
 
-**注意:** `engine.py:154-155` の `except Exception: pass` は削除しない。degraded は新エンジンに最初から持たせる（spec §10 の互換方針）。
+**注意:** `engine.py:160-161` の `except Exception: pass` は削除しない。degraded は新エンジンに最初から持たせる（spec §10 の互換方針）。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -1546,7 +1546,7 @@ EOF
 
 **背景（spec §8 / F08）:** **同じイベント表・同じラベルの上で、判断規則だけを変えて**3案を比較する。まず試すのは3（ルールで候補を作り、MLで買う・見送るの順位を決める）。全日付を機械的に買い・売りへ変換せず、現行ルールへの追加効果を測定しやすいため。
 
-モデル失敗時の動作は**設定として明示する**。現行 `signal.py:78` は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって同じ閾値でも売買判断が変わってしまう。
+モデル失敗時の動作は**設定として明示する**。現行 `signal.py:90` は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって同じ閾値でも売買判断が変わってしまう。
 
 **`score_fn` の契約:** 3案とも `score_fn(symbol, row) -> tuple[float, Optional[float]]`（ルールスコア, ML確率 or None）を引数に取る。walk-forward の外から与えることで、指標計算とモデル推論を判断規則から切り離す。
 
@@ -1697,7 +1697,7 @@ class StrategyConfig:
     """判断規則の設定。
 
     on_model_failure は「MLが無い・推論に失敗したとき」の動作を**明示する**。
-    現行 signal.py:78 は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって
+    現行 signal.py:90 は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって
     同じ閾値でも売買判断が変わっていた（レビューF08）。
     """
     buy_threshold: float
@@ -1806,7 +1806,7 @@ EOF
   - `TradingServices._paper_uses_v2_execution() -> bool`
   - `stop_loss_check` と `signal_scan` の paper 経路が `v2` のときだけ挙動を変える
 
-**背景（spec §8・§10）:** `stop_loss_check`（`src/services/trading.py:311-314`）は paper モードで日足終値を使って損切りを判定している。F04（同一終値での判断・約定）はバックテストだけでなく paper 運用にも及んでいる。
+**背景（spec §8・§10）:** `stop_loss_check`（`src/services/trading.py:362-365`）は paper モードで日足終値を使って損切りを判定している。F04（同一終値での判断・約定）はバックテストだけでなく paper 運用にも及んでいる。
 
 **過去の日足を再生する paper と、現在の市場を観測する paper は入力契約が違う。** 前者は日足による約定の近似であり、既存の翌朝9:05運用と同じ約定モデルとしては表示しない。
 

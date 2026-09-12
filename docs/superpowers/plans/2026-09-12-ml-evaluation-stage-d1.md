@@ -57,7 +57,7 @@
   - `nav(pf: Portfolio, prices: dict) -> float`
   - `held_value(pf: Portfolio, symbol: str, price: float) -> float`
 
-**注意:** 価格が取れない銘柄は `avg_cost`（取得平均単価）で代用する。`src/risk/manager.py:514` の `closes.get(p.symbol) or p.avg_cost` と同じ規約。
+**注意:** 価格が取れない銘柄は `avg_cost`（取得平均単価）で代用する。`src/risk/manager.py:518` の `closes.get(p.symbol) or p.avg_cost` と同じ規約。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -199,7 +199,7 @@ def empty_portfolio(cash: float) -> Portfolio:
 def _price_of(h: Holding, prices: dict) -> float:
     """評価に使う価格。取れない銘柄は取得単価で代用する。
 
-    src/risk/manager.py:514 の `closes.get(p.symbol) or p.avg_cost` と同じ規約。
+    src/risk/manager.py:518 の `closes.get(p.symbol) or p.avg_cost` と同じ規約。
     """
     return prices.get(h.symbol) or h.avg_cost
 
@@ -782,7 +782,7 @@ class TestCheckSectorConcentration:
         assert with_price[0] == without_price[0]
 
     def test_matches_production_formula(self):
-        """src/risk/manager.py:510-535 と同じ式であること"""
+        """src/risk/manager.py:511-536 と同じ式であること"""
         cash, qty, price, candidate = 600_000.0, 100, 3000.0, 200_000.0
         positions_value = qty * price
         same_sector_value = positions_value + candidate

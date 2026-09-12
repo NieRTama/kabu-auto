@@ -9,15 +9,15 @@
 
 外部レビューの指摘のうち、実コードで裏が取れたものを反映した。主要な変更は3点である。
 
-1. **実運用に固定利確線は存在しない。** `src/risk/manager.py:511-560` の `evaluate_exit()` は
+1. **実運用に固定利確線は存在しない。** `src/risk/manager.py:537-586` の `evaluate_exit()` は
    損切り線・ブレークイーブン・トレーリングストップと売りシグナルだけで退出を決める。
    第1版の悲観規約「同一日に損切り線と利確線の両方へ到達したら損切りを採る」は
    運用に無いバリア構造を前提にしていた。§6を書き直した。
 2. **`ExitPolicy` が約定価格まで決める設計は層が混ざっていた。** 判断・過去検証の約定・
    実運用の約定を3層に分けた。あわせて、保有状態が取得単価と数量だけでは足りないことを
-   `Position.peak_price`（`src/data/database.py:142`）の存在から確認し、状態型を定義した。
+   `Position.peak_price`（`src/data/database.py:162`）の存在から確認し、状態型を定義した。
 3. **`engine.py` を無改造で残しても `legacy` の動作は維持されない。**
-   `engine.py:75` が `build_features()` を呼び、`engine.py:141` の
+   `engine.py:75` が `build_features()` を呼び、`engine.py:136` の
    `if dt not in featured_df.index` で助走期間を弾いているため、`dropna` を外すと
    このガードが無効化されNaN行が推論へ流れる。§10に互換ラッパーの方針を追加した。
 
@@ -39,25 +39,29 @@
 
 ## 2. 精査結果
 
-レビューはzipスナップショットを対象としていたが、現行リポジトリ（`main` @ 932f50f）と
-突き合わせた結果、**F01〜F09は全て現存する**。以後のコミットは発注系の修正が中心で、
-本設計の対象領域には及んでいない。
+レビューはzipスナップショットを対象としていたが、**本設計を書いた2026-09-10時点の**
+リポジトリ（`main` @ 932f50f）と突き合わせた結果、**F01〜F09は全て現存していた**。
+以後のコミットは発注系の修正が中心で、本設計の対象領域には及んでいなかった。
 
-| ID | 現行コードでの確認箇所 |
-|---|---|
-| F01 | `src/data/market_data.py:87-90` `end = date.today()` を排他境界のまま `yf.download` へ渡す。`src/services/trading.py:346` `signal_scan` は最終足の日付を検査しない |
-| F02 | `src/strategy/ml_model.py:117-140` `pd.concat(..., ignore_index=True)` 後に `TimeSeriesSplit` |
-| F03 | purge/embargo はリポジトリ全体に実装が無い |
-| F04 | `src/backtest/engine.py:113-190` 同一の `close_price` でスコア生成と約定を行う |
-| F05 | `src/strategy/labeling.py:55-75` `end = min(i+max_holding, n-1)` により未成熟イベントにもラベルが付く |
-| F06 | `src/strategy/indicators.py:11-16` `loss.replace(0, nan)` で単調上昇時にRSIがNaN。`indicators.py:83` の `dropna` 後に行番号で保有期間を数える |
-| F07 | `src/services/trading.py:181` `load_ohlcv(sym)` は既定500行 |
-| F08 | `src/strategy/signal.py:78` ML欠落時にルール重みがそのまま残る |
-| F09 | `src/services/trading.py:189` `self.model = train_multi(...)` の直接代入 |
+> **実装状況（2026-09-12更新）:** **F01 は段階Aで解消済み**。以下の表と §5 の記述は
+> 「設計を書いた時点の問題」であり、現在のコードではない。F02〜F09 は未着手のまま。
+> 行番号は 2026-09-12 時点の現行コードに合わせて更新してある。
+
+| ID | 問題（設計時点） | 状況 |
+|---|---|---|
+| F01 | `end = date.today()` を排他境界のまま `yf.download` へ渡す。`signal_scan` が最終足の日付を検査しない | **解消済み**（段階A：取得境界の一元化・`BarStatus` による確定足判定・鮮度ゲート・`Signal.data_as_of`・生値と調整値の分離・`CorporateAction`） |
+| F02 | `src/strategy/ml_model.py:118-141` `pd.concat(..., ignore_index=True)` 後に `TimeSeriesSplit` | 未着手（段階C前半） |
+| F03 | purge/embargo はリポジトリ全体に実装が無い | 未着手（段階C前半） |
+| F04 | `src/backtest/engine.py:111-188` 同一の `close_price` でスコア生成と約定を行う | 未着手（段階B前半・D後半） |
+| F05 | `src/strategy/labeling.py:55-75` `end = min(i+max_holding, n-1)` により未成熟イベントにもラベルが付く | 未着手（段階B後半） |
+| F06 | `src/strategy/indicators.py:11-17` `loss.replace(0, nan)` で単調上昇時にRSIがNaN。`indicators.py:83` の `dropna` 後に行番号で保有期間を数える | 未着手（段階B前半） |
+| F07 | `src/services/trading.py:229` `load_ohlcv(sym)` は既定500行 | 未着手（段階C前半） |
+| F08 | `src/strategy/signal.py:90` ML欠落時にルール重みがそのまま残る | 未着手（段階D後半） |
+| F09 | `src/services/trading.py:237` `self.model = train_multi(...)` の直接代入 | 未着手（段階E・F） |
 
 ### レビュー記述の補正
 
-1. **F02は既知の負債である。** `ml_model.py:127-133` のdocstring自身が
+1. **F02は既知の負債である。** `ml_model.py:128-134` のdocstring自身が
    「全体としての時系列順序は厳密ではない（略）将来の改善課題とする」と明記している。
    新規発見ではなく、明示的に先送りされた負債の回収として扱う。
 2. **F10とpaperの位置づけ。** 前回レビューはリアルタイム価格優先を認識した上で
@@ -65,7 +69,7 @@
    本設計はこれらを「前回の指摘の再掲」として扱い、新規差分とは呼ばない。
    F10は別プラン、paperの執行仮定は段階Dのスコープに含める。
 3. **`BacktestRun` の不足は「完全な実行設定・モデル・入力データの来歴が無い」ことである。**
-   既存スキーマには期間・資金・成績等はある（`src/data/database.py:177` 以降）。
+   既存スキーマには期間・資金・成績等はある（`src/data/database.py:201` 以降）。
    閾値とコストしか持たない、という表現は不正確なので改めた。
 
 ### テスト網羅の確認方法と結果
@@ -84,7 +88,7 @@
 
 ### レビューに無い追加の指摘
 
-`src/services/trading.py:311-314` の `stop_loss_check` は paper モードで日足終値を用いて
+`src/services/trading.py:362-365` の `stop_loss_check` は paper モードで日足終値を用いて
 損切りを判定している。F04（同一終値での判断・約定）は**バックテストだけでなく
 paper運用にも及んでいる**ため、段階Dの是正範囲に paper 経路を含める。
 
@@ -150,6 +154,11 @@ src/data/
 
 ## 5. 段階A: データ土台（F01・R4・R5）
 
+> **実装済み（2026-09-12）。** 本節は設計時点の記述であり、以下の「現行実装は〜」
+> という指摘は**すべて段階Aで解消されている**。実装は
+> `docs/superpowers/plans/2026-09-10-ml-evaluation-stage-a.md` と、
+> `feature/ml-eval-stage-a` をマージしたコミット群（`5e85976`〜`e9b1999`）を参照。
+
 ### 取得境界
 
 `fetch_ohlcv` に渡す `end` を `end + 1日` にする。yfinance公式仕様の `end` は排他境界であり、
@@ -162,7 +171,7 @@ src/data/
 ### 生値と調整値の分離（R4）
 
 `ohlcv` テーブルは既に `close` と `adjusted_close` の2列を持つが、
-現在は `auto_adjust=True` で取得した調整値を両方へ書いている（`market_data.py:66,78`）。
+設計時点では `auto_adjust=True` で取得した調整値を両方へ書いていた。
 
 取得を `auto_adjust=False` に変え、**生のOHLCを `open/high/low/close` へ、
 調整済み終値を `adjusted_close` へ**入れる。スキーマ変更は不要である。
@@ -229,7 +238,7 @@ class BarStatus:
 ### 保有状態
 
 取得単価と数量だけでは、追加購入・部分決済・再起動を跨いだピーク価格・
-ストップ発動状態を表せない。`Position.peak_price`（`src/data/database.py:142`）が
+ストップ発動状態を表せない。`Position.peak_price`（`src/data/database.py:162`）が
 まさにその永続状態である。
 
 ```python
@@ -258,7 +267,7 @@ class ExitIntent:
 **その時点までに観測できた情報だけ**を受け取り、逐次的に状態を進める。
 将来の足はまとめて受け取らない。
 
-退出条件は `src/risk/manager.py:511-560` の `evaluate_exit()` と同じ構造にする。
+退出条件は `src/risk/manager.py:537-586` の `evaluate_exit()` と同じ構造にする。
 
 1. 基準線 = `avg_cost × (1 + stop_loss_pct)`
 2. ピーク時の含み益率が `breakeven_trigger_pct` 以上に達したら発動（`armed = True`）、
@@ -443,7 +452,7 @@ purge以外にも学習側へ未来が入る経路があるため、次の4つ�
 
 複数銘柄の資金競合、セクター上限、未約定、部分約定、出来高制約。
 運用と同じ週次再学習スケジュールを再現する（§7の締切規約を適用する）。
-現行は開始前に一度だけ学習し、テスト期間中は再学習しない（`engine.py:79-94`）。
+現行は開始前に一度だけ学習し、テスト期間中は再学習しない（`engine.py:82-97`）。
 
 ### 実行条件のスナップショット
 
@@ -459,7 +468,7 @@ code_version / execution_model_version` を保存する。
 推論例外が1件でも発生した実行には `degraded=true` を立て、比較とモデル昇格から除外する。
 
 **これはv2の `walkforward.py` に最初からその挙動を持たせることで実現し、
-`engine.py:154-155` の `except Exception: pass` は削除しない。**
+`engine.py:160-161` の `except Exception: pass` は削除しない。**
 旧エンジンの結果は§10のとおり旧エンジン由来として隔離され、比較にも昇格にも使わないため、
 そこを直す必要が無い。旧エンジンに手を入れないという互換方針を優先する。
 
@@ -483,7 +492,7 @@ code_version / execution_model_version` を保存する。
 
 ### paper経路の是正
 
-paperは `stop_loss_check`（`src/services/trading.py:311-314`）だけでなく、
+paperは `stop_loss_check`（`src/services/trading.py:362-365`）だけでなく、
 スキャン中の終値即時売買・時刻・注文の繰越を含めて設計する。
 
 **過去の日足を再生するpaperと、現在の市場を観測するpaperは入力契約が違う。**
@@ -535,7 +544,7 @@ v2では特徴量とラベルの契約が変わるため、旧モデルをv2の�
 `config.yaml` に `strategy.engine_version: legacy | v2` を追加する。**既定は `legacy`**。
 
 **ファイルを変更しなくても、依存先が変われば旧動作は維持されない。**
-`engine.py:75` が `build_features()` を呼び、`engine.py:141` の
+`engine.py:75` が `build_features()` を呼び、`engine.py:136` の
 `if dt not in featured_df.index` が助走期間の除外を担っているため、
 `build_features()` から `dropna` を外すとこのガードが無効化され、
 NaN行が `compute_rule_score` と `predict_proba` へ流れる。
@@ -546,6 +555,18 @@ NaN行が `compute_rule_score` と `predict_proba` へ流れる。
 - **既存の公開関数（`build_features()` / `build_training_set()`）は現在の挙動のまま残す**
 - 日付保持・マスク付きの**新しいAPIを追加**し、v2経路だけがそれを使う
 - 新APIを使う呼び出し側は `feature_valid == False` の行を明示的に扱う
+
+### `engine_version` が切り替える3経路
+
+| 対象 | `legacy` | `v2` |
+|---|---|---|
+| バックテストの実行主体 | `backtest/engine.py` | `backtest/walkforward.py` |
+| 学習データの生成元 | `labeling.build_training_set` | `dataset.build_events` |
+| CV分割 | `ml_model` 内の `TimeSeriesSplit` | `validation.calendar_folds` |
+
+paper経路の執行仮定もこの設定で切り替わる（段階D後半）。
+**この3経路の結線そのものは段階Fで行う。** 段階A〜Eは新しい経路を作るところまでで、
+どちらを使うかを実運用へ繋ぐのは別の変更である。
 
 ### 変更の適用範囲
 
@@ -584,7 +605,7 @@ NaN行が `compute_rule_score` と `predict_proba` へ流れる。
 | 新テーブル `ModelPromotion` | `model_id` / 評価記録ID / 判断者 / 理由 / 旧`model_id` / 切替日時 | 加算のみ |
 | `BacktestRun` に列追加 | `strategy_version` / `config_hash` / 設定JSON実体 / `dataset_id` / `code_version` / `execution_model_version` / `degraded` | 全てnullable |
 | `Signal` に列追加 | `data_as_of` | nullable |
-| `ModelMetrics` に列追加 | `model_id` / `positive_rate` / `training_window_sessions` | 全てnullable |
+| `ModelMetrics` に列追加 | `model_id` / `positive_rate` / `training_window_sessions` | 全てnullable。**段階Fで追加する**（`ml_model.py` の改修と同時。段階A〜Eは `ml_model.py` を触らないため） |
 
 予測と実績を分けたのは、shadowでは予測時点に実績が存在しないためである。
 

@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-ml-evaluation-foundation-design.md`（§5・§10・§12・§14）
 
+> **実装済み（2026-09-12）。** 本計画は完了し、`feature/ml-eval-stage-a` を
+> `docs/ml-evaluation-foundation-plan` へマージ済み（コミット `5e85976`〜`e9b1999`）。
+> 最終レビューで見つかった4件の修正も反映してある（`49370a7`・`e9b1999`）。
+> 以下の「現行は〜」という記述は着手時点のものであり、現在のコードではない。
+
 ## Global Constraints
 
 - 日時は **JST naive**（tzinfo を持たない日本時間の datetime）で統一する。現在時刻は必ず `src/core/clock.now()` / `clock.today()` を使い、`datetime.now()` を直接呼ばない。
@@ -227,7 +232,7 @@ git commit -m "feat(data): 日足の確定判定モジュールを追加"
 ## Task 2: 取得境界を「終了日を含む」に一元化
 
 **Files:**
-- Modify: `src/data/market_data.py:23-46`（`fetch_ohlcv`）
+- Modify: `src/data/market_data.py:26-49`（`fetch_ohlcv`）
 - Test: `tests/test_market_data_freshness.py`
 
 **Interfaces:**
@@ -638,7 +643,7 @@ Expected: FAIL — `AttributeError: module 'src.data.market_data' has no attribu
 
 - [ ] **Step 3: モデルを追加**
 
-`src/data/database.py` の `class OHLCV` の直後（`src/data/database.py:36` の後）に追加する。
+`src/data/database.py` の `class OHLCV` の直後（`src/data/database.py:35` の後）に追加する。
 
 ```python
 class CorporateAction(Base):
@@ -754,7 +759,7 @@ git commit -m "feat(data): 分割イベントの保存と分割比率の集計�
 ## Task 5: update_symbol が最終足の状態を返す
 
 **Files:**
-- Modify: `src/data/market_data.py:87-93`（`update_symbol`）
+- Modify: `src/data/market_data.py:174-180`（`update_symbol`）
 - Test: `tests/test_market_data_freshness.py`
 
 **Interfaces:**
@@ -881,8 +886,8 @@ git commit -m "feat(data): データ更新が最終足の確定状態を返す�
 ## Task 6: Signal に data_as_of を追加
 
 **Files:**
-- Modify: `src/data/database.py:150-158`（`Signal`）
-- Modify: `src/services/trading.py:137-146`（`_save_signal`）
+- Modify: `src/data/database.py:170-178`（`Signal`）
+- Modify: `src/services/trading.py:140-149`（`_save_signal`）
 - Test: `tests/test_signal_freshness_gate.py`
 
 **Interfaces:**
@@ -1008,7 +1013,7 @@ git commit -m "feat(data): シグナルにデータ基準日を記録し生成�
 ## Task 7: signal_scan の鮮度ゲート
 
 **Files:**
-- Modify: `src/services/trading.py:162-170`（`data_update`）、`src/services/trading.py:346-370`（`signal_scan`）
+- Modify: `src/services/trading.py:174-182`（`data_update`）、`src/services/trading.py:394-418`（`signal_scan`）
 - Test: `tests/test_signal_freshness_gate.py`
 
 **Interfaces:**
@@ -1106,7 +1111,7 @@ Expected: FAIL — `AttributeError: 'TradingServices' object has no attribute '_
 
 - [ ] **Step 3: 実装を修正**
 
-`src/services/trading.py` の `TradingServices.__init__` の末尾（`src/services/trading.py:157` の後）に1行足す。
+`src/services/trading.py` の `TradingServices.__init__` の末尾（`src/services/trading.py:163` の後）に1行足す。
 
 ```python
         # 直近の data_update で得た銘柄ごとの最終足状態。signal_scan が新規候補の
