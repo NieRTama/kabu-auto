@@ -5,13 +5,17 @@
 未成熟・未約定・欠損は別ステータスにして学習対象から外す（spec §6）。
 """
 from datetime import date, timedelta
+import time
 
 import numpy as np
 import pandas as pd
 import pytest
+from sqlalchemy import select
 
 from src.backtest import execution
 from src.core import config as cfg
+from src.data import database as db
+from src.data.database import get_session
 from src.strategy import dataset
 from src.strategy import indicators
 from src.strategy import policy
@@ -539,3 +543,83 @@ class TestSaveLoad:
         did = dataset.compute_dataset_id(events)
         path = dataset.save_events(events, did, base_dir=str(tmp_path))
         assert path.name == f"{did}.csv.gz"
+
+
+@pytest.fixture
+def isolated_db(tmp_path):
+    cfg.load("config.yaml")
+    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+    db.init()
+    return tmp_path
+
+
+class TestInputOhlcvHash:
+    def test_same_input_gives_same_hash(self):
+        a = {"7203": _ohlcv(50)}
+        b = {"7203": _ohlcv(50)}
+        assert dataset.input_ohlcv_hash(a) == dataset.input_ohlcv_hash(b)
+
+    def test_different_input_gives_different_hash(self):
+        a = {"7203": _ohlcv(50)}
+        b = {"7203": _ohlcv(51)}
+        assert dataset.input_ohlcv_hash(a) != dataset.input_ohlcv_hash(b)
+
+
+class TestSaveDatasetMeta:
+    def test_records_identity_and_provenance(self, monkeypatch, isolated_db, tmp_path):
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path / "ds"))
+        input_hash = dataset.input_ohlcv_hash({"7203": _ohlcv(120)})
+
+        dataset.save_dataset_meta(events, did, path, input_hash)
+
+        with get_session() as session:
+            row = session.scalar(select(db.Dataset))
+        assert row.dataset_id == did
+        assert row.file_sha256 == dataset.file_sha256(path)
+        assert row.input_ohlcv_sha256 == input_hash
+        assert row.n_events == len(events)
+        assert row.feature_version == dataset.FEATURE_VERSION
+        assert row.strategy_version == dataset.STRATEGY_VERSION
+        assert row.execution_model_version == dataset.EXECUTION_MODEL_VERSION
+
+    def test_collection_id_differs_between_runs(self, monkeypatch, isolated_db, tmp_path):
+        """内容が同じでも採取履歴IDは実行ごとに変わる（dataset_idとは別物）"""
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path / "ds"))
+        input_hash = dataset.input_ohlcv_hash({"7203": _ohlcv(120)})
+
+        dataset.save_dataset_meta(events, did, path, input_hash)
+        time.sleep(1)  # 異なる秒でのタイムスタンプを確保
+        dataset.save_dataset_meta(events, did, path, input_hash)
+
+        with get_session() as session:
+            rows = list(session.scalars(select(db.Dataset)).all())
+        assert len(rows) == 2
+        assert rows[0].dataset_id == rows[1].dataset_id       # 内容は同じ
+        assert rows[0].collection_id != rows[1].collection_id  # 採取は別
+
+    def test_records_period_and_symbols(self, monkeypatch, isolated_db, tmp_path):
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path / "ds"))
+        dataset.save_dataset_meta(events, did, path, "x")
+
+        with get_session() as session:
+            row = session.scalar(select(db.Dataset))
+        assert row.period_start == events["decision_at"].min()
+        assert row.period_end == events["decision_at"].max()
+        assert "7203" in row.symbols_json
+
+    def test_counts_resolved_events(self, monkeypatch, isolated_db, tmp_path):
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path / "ds"))
+        dataset.save_dataset_meta(events, did, path, "x")
+
+        with get_session() as session:
+            row = session.scalar(select(db.Dataset))
+        expected = int((events["status"] == dataset.STATUS_RESOLVED).sum())
+        assert row.n_resolved == expected

@@ -26,6 +26,7 @@ import pandas as pd
 from loguru import logger
 
 from src.backtest import execution
+from src.core import clock
 from src.core import config as cfg
 from src.strategy import policy
 from src.strategy.indicators import FEATURE_COLS, build_feature_frame
@@ -422,3 +423,54 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def input_ohlcv_hash(ohlcv_by_symbol: dict) -> str:
+    """入力OHLCVの内容ハッシュ。
+
+    dataset_id だけでは「その時点の入力値」を復元できない。どのOHLCVから
+    作ったかをこのハッシュで固定しておくと、データ改訂の有無を後から判別できる。
+    """
+    h = hashlib.sha256()
+    for symbol in sorted(ohlcv_by_symbol):
+        df = ohlcv_by_symbol[symbol]
+        h.update(symbol.encode("utf-8"))
+        cols = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
+        normalized = df[cols].copy()
+        normalized.index = pd.to_datetime(normalized.index).strftime("%Y-%m-%d")
+        h.update(normalized.to_csv(float_format=_FLOAT_FORMAT,
+                                   lineterminator="\n").encode("utf-8"))
+    return h.hexdigest()
+
+
+def save_dataset_meta(events: pd.DataFrame, dataset_id: str, path,
+                      input_hash: str, *, collection_id: Optional[str] = None) -> int:
+    """Dataset テーブルにメタ情報を1行書く。書いた行のidを返す。"""
+    from src.data.database import Dataset, get_session
+
+    if collection_id is None:
+        collection_id = f"{clock.now():%Y%m%dT%H%M%S}-{dataset_id}"
+
+    symbols = sorted(events["symbol"].unique().tolist()) if len(events) else []
+    period_start = events["decision_at"].min() if len(events) else None
+    period_end = events["decision_at"].max() if len(events) else None
+
+    with get_session() as session:
+        row = Dataset(
+            dataset_id=dataset_id,
+            collection_id=collection_id,
+            symbols_json=json.dumps(symbols, ensure_ascii=False),
+            period_start=period_start,
+            period_end=period_end,
+            feature_version=FEATURE_VERSION,
+            strategy_version=STRATEGY_VERSION,
+            execution_model_version=EXECUTION_MODEL_VERSION,
+            file_path=str(path),
+            file_sha256=file_sha256(Path(path)),
+            input_ohlcv_sha256=input_hash,
+            n_events=len(events),
+            n_resolved=int((events["status"] == STATUS_RESOLVED).sum()) if len(events) else 0,
+        )
+        session.add(row)
+        session.commit()
+        return row.id

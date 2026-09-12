@@ -55,6 +55,36 @@ class CorporateAction(Base):
     )
 
 
+class Dataset(Base):
+    """イベント表（学習データ）のメタ情報。
+
+    イベントの実体はDBに入れず data/datasets/<dataset_id>.csv.gz に置く。
+    ここが持つのは「どの入力から・いつ・どの版で作ったか」だけ。
+
+    dataset_id は**正規化した内容のハッシュ**で、同一内容なら同じ値になる。
+    「いつ取ったか」は collection_id が別に持つ。こう分けておくと、
+    コード変更による成績差とデータ改訂による成績差を分離できる。
+    """
+    __tablename__ = "datasets"
+    id = Column(Integer, primary_key=True)
+    dataset_id = Column(String(64), nullable=False)   # 内容ハッシュ
+    collection_id = Column(String(64))                # 採取履歴ID（実行ごとに変わる）
+    generated_at = Column(DateTime, default=clock.now)
+    symbols_json = Column(Text)
+    period_start = Column(Date)
+    period_end = Column(Date)
+    feature_version = Column(String(32))
+    strategy_version = Column(String(32))
+    execution_model_version = Column(String(32))
+    file_path = Column(String(255))
+    file_sha256 = Column(String(64))
+    input_ohlcv_sha256 = Column(String(64))           # 入力OHLCVの内容ハッシュ
+    n_events = Column(Integer)
+    n_resolved = Column(Integer)
+
+    __table_args__ = (Index("ix_datasets_dataset_id", "dataset_id"),)
+
+
 class OrderIntent(Base):
     """発注の「意図」（Phase 5 / 4.2）。
 
