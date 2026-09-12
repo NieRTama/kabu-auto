@@ -9,11 +9,26 @@ def _sma(series: pd.Series, length: int) -> pd.Series:
 
 
 def _rsi(series: pd.Series, length: int) -> pd.Series:
+    """RSI。端点（片側の変動が0の場合）を仕様として明示する。
+
+    従来は loss を NaN に置換していたため、単調上昇の系列で末尾RSIが
+    NaN になり、build_features() の dropna で行ごと落ちていた（レビューF06）。
+    端点は次のとおり定義する。
+
+      loss == 0 かつ gain > 0 … 100（下げが一度も無い）
+      gain == 0 かつ loss > 0 … 0  （上げが一度も無い）
+      両方 0                 … 50 （まったく動いていない＝中立）
+
+    助走期間（ewm の min_periods 未満）は NaN のままにする。
+    """
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(com=length - 1, min_periods=length).mean()
     loss = (-delta.clip(upper=0)).ewm(com=length - 1, min_periods=length).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
+    # loss==0 かつ gain>0 なら rs=inf となり 100-(100/inf)=100 に落ちる。
+    # 両方0のときだけ 0/0=NaN になるので、中立の50で明示的に埋める。
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.mask((gain == 0) & (loss == 0), 50.0)
 
 
 def _bbands(series: pd.Series, length: int, std: float):
