@@ -165,6 +165,17 @@ class TestExitFillRejectsUnknownOrderType:
         with pytest.raises(ValueError, match="未知の order_type"):
             execution.exit_fill(bad_intent, bar, next_bar, quantity=100, costs=_costs())
 
+    def test_raises_even_when_no_next_bar(self):
+        """足が尽きた場合（next_bar=None）でも、不正なorder_typeは黙って未約定にしない。
+
+        検証チェックがnext_bar=Noneの早期returnより後にあると、この組み合わせ
+        だけ例外を素通りして誤ってNoneを返してしまう（最終レビュー指摘）。
+        """
+        bar = _bar(session=date(2026, 9, 2), c=1005.0)
+        bad_intent = policy.ExitIntent(reason="X", trigger_price=None, order_type="LIMIT")
+        with pytest.raises(ValueError, match="未知の order_type"):
+            execution.exit_fill(bad_intent, bar, None, quantity=100, costs=_costs())
+
 
 class TestNetReturnRejectsInvalidInput:
     def test_raises_on_quantity_mismatch(self):

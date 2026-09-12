@@ -102,11 +102,11 @@ def exit_fill(intent: ExitIntent, bar: Observation, next_bar: Optional[Observati
             reason=intent.reason,
         )
 
+    if intent.order_type != ORDER_TYPE_MARKET:
+        raise ValueError(f"未知の order_type です: {intent.order_type}")
     if next_bar is None:
         # 足が尽きた＝この意図は約定していない。呼び出し側は未成熟として扱う
         return None
-    if intent.order_type != ORDER_TYPE_MARKET:
-        raise ValueError(f"未知の order_type です: {intent.order_type}")
     return Fill(
         at=next_bar.session,
         price=sell_fill_price(next_bar.open, costs),
