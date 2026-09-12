@@ -192,3 +192,140 @@ class TestFindCandidates:
         monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
 
         assert dataset.find_candidates(feat, buy_threshold=0.25) == []
+
+
+def _policy_conf(stop=-0.07, breakeven=0.02, trailing=0.04,
+                 sell_thr=-0.25, max_holding=10):
+    return policy.PolicyConfig(
+        stop_loss_pct=stop, breakeven_trigger_pct=breakeven,
+        trailing_stop_pct=trailing, sell_threshold=sell_thr,
+        max_holding_sessions=max_holding,
+    )
+
+
+def _costs(slip=0.0, comm=0.0):
+    return execution.CostConfig(slippage_pct=slip, commission_pct=comm)
+
+
+def _frame(bars: list[dict]) -> pd.DataFrame:
+    """simulate_event に渡す最小のフレーム（日付index・OHLC・feature_valid）"""
+    df = pd.DataFrame(bars).set_index("date")
+    df.index = pd.to_datetime(df.index)
+    df["feature_valid"] = True
+    return df
+
+
+class TestSimulateEvent:
+    def test_stop_loss_gives_label_zero(self):
+        """損切りで終わった候補は label=0、純収益は負"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1005, "low": 900, "close": 910},
+        ]
+        out = dataset.simulate_event(_frame(bars), 0, _policy_conf(), _costs())
+        assert out.status == dataset.STATUS_RESOLVED
+        assert out.entry_at == date(2026, 9, 2)
+        assert out.label_end_at == date(2026, 9, 2)
+        assert out.exit_reason == policy.STOP_LINE
+        assert out.entry_price == pytest.approx(1000.0)
+        assert out.exit_price == pytest.approx(930.0)   # 基準線 1000*0.93
+        assert out.net_return == pytest.approx(-0.07)
+        assert out.label == 0
+
+    def test_zero_net_return_is_label_zero(self):
+        """純収益0は label=0 に含める（境界の明示）"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 3), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+        ]
+        # max_holding=1 で満了 → 翌営業日(9/3)の寄り1000で退出。入りも1000なので0%
+        out = dataset.simulate_event(
+            _frame(bars), 0, _policy_conf(max_holding=1), _costs())
+        assert out.status == dataset.STATUS_RESOLVED
+        assert out.exit_reason == policy.TIME_LIMIT
+        assert out.net_return == pytest.approx(0.0)
+        assert out.label == 0
+
+    def test_profitable_exit_gives_label_one(self):
+        """トレーリングで利益が残れば label=1"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1200, "low": 1150, "close": 1190},
+            {"date": date(2026, 9, 3), "open": 1190, "high": 1195, "low": 1100, "close": 1110},
+        ]
+        out = dataset.simulate_event(_frame(bars), 0, _policy_conf(), _costs())
+        assert out.status == dataset.STATUS_RESOLVED
+        assert out.exit_reason == policy.TRAILING
+        assert out.label_end_at == date(2026, 9, 3)
+        assert out.exit_price == pytest.approx(1152.0)  # ピーク1200 * 0.96
+        assert out.net_return == pytest.approx(0.152)
+        assert out.label == 1
+
+    def test_immature_when_bars_run_out(self):
+        """最大保有期間まで足が届かない候補は未成熟。ラベルを付けない"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+        ]
+        out = dataset.simulate_event(
+            _frame(bars), 0, _policy_conf(max_holding=10), _costs())
+        assert out.status == dataset.STATUS_IMMATURE
+        assert out.label is None
+        assert out.net_return is None
+        assert out.label_end_at is None
+
+    def test_unfilled_when_no_entry_bar(self):
+        """翌営業日の足が無ければエントリーできない（未約定）"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+        ]
+        out = dataset.simulate_event(_frame(bars), 0, _policy_conf(), _costs())
+        assert out.status == dataset.STATUS_UNFILLED
+        assert out.label is None
+        assert out.entry_at is None
+
+    def test_unfilled_when_market_exit_has_no_next_bar(self):
+        """満了の成行退出に必要な翌営業日の足が無ければ未約定"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+        ]
+        # max_holding=1 → 9/2 に満了意図が出るが、翌足が無い
+        out = dataset.simulate_event(
+            _frame(bars), 0, _policy_conf(max_holding=1), _costs())
+        assert out.status == dataset.STATUS_UNFILLED
+        assert out.label is None
+
+    def test_invalid_features_are_not_simulated(self):
+        """特徴量が揃っていない判断セッションはシミュレートしない"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1005, "low": 900, "close": 910},
+        ]
+        feat = _frame(bars)
+        feat.iloc[0, feat.columns.get_loc("feature_valid")] = False
+        out = dataset.simulate_event(feat, 0, _policy_conf(), _costs())
+        assert out.status == dataset.STATUS_INVALID_FEATURES
+        assert out.label is None
+
+    def test_entry_uses_next_open_not_decision_close(self):
+        """判断した日の終値では約定しない（F04の回帰防止）"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1005},
+            {"date": date(2026, 9, 2), "open": 980, "high": 1005, "low": 900, "close": 910},
+        ]
+        out = dataset.simulate_event(_frame(bars), 0, _policy_conf(), _costs())
+        assert out.entry_price == pytest.approx(980.0)   # 翌日の寄り
+        assert out.entry_price != pytest.approx(1005.0)  # 判断日の終値ではない
+
+    def test_costs_are_reflected_in_net_return(self):
+        """スリッページと手数料が純収益に反映される"""
+        bars = [
+            {"date": date(2026, 9, 1), "open": 1000, "high": 1005, "low": 995, "close": 1000},
+            {"date": date(2026, 9, 2), "open": 1000, "high": 1005, "low": 900, "close": 910},
+        ]
+        free = dataset.simulate_event(_frame(bars), 0, _policy_conf(), _costs())
+        charged = dataset.simulate_event(
+            _frame(bars), 0, _policy_conf(), _costs(slip=0.001, comm=0.001))
+        assert charged.net_return < free.net_return

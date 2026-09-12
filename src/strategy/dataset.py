@@ -23,6 +23,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from src.backtest import execution
+from src.strategy import policy
 from src.strategy.indicators import FEATURE_COLS
 from src.strategy.signal import compute_rule_score
 
@@ -150,3 +152,107 @@ def find_candidates(feat: pd.DataFrame, buy_threshold: float) -> list[int]:
         if score >= buy_threshold:
             out.append(i)
     return out
+
+
+@dataclass(frozen=True)
+class EventOutcome:
+    """1候補をシミュレートした結果。
+
+    label は status == STATUS_RESOLVED のときだけ 0/1 を持つ。
+    未成熟・未約定・欠損では None にして、損失0として扱わない（spec §6）。
+    """
+    status: str
+    entry_at: Optional[date]
+    label_end_at: Optional[date]
+    label: Optional[int]
+    net_return: Optional[float]
+    exit_reason: Optional[str]
+    entry_price: Optional[float]
+    exit_price: Optional[float]
+    sessions_held: int
+
+
+def _observation(feat: pd.DataFrame, i: int) -> policy.Observation:
+    row = feat.iloc[i]
+    return policy.Observation(
+        session=feat.index[i].date(),
+        open=float(row["open"]),
+        high=float(row["high"]),
+        low=float(row["low"]),
+        close=float(row["close"]),
+        score=None,  # 退出の売りシグナルは段階Dで結線する（ラベルは執行と退出だけで決める）
+    )
+
+
+def _unresolved(status: str, entry_at: Optional[date] = None,
+                sessions_held: int = 0) -> EventOutcome:
+    return EventOutcome(
+        status=status, entry_at=entry_at, label_end_at=None, label=None,
+        net_return=None, exit_reason=None, entry_price=None, exit_price=None,
+        sessions_held=sessions_held,
+    )
+
+
+def simulate_event(feat: pd.DataFrame, i: int,
+                   policy_conf: policy.PolicyConfig,
+                   costs: execution.CostConfig, *,
+                   peak_basis: str = policy.PEAK_BASIS_PREVIOUS) -> EventOutcome:
+    """位置 i のセッションを判断時点として、執行から退出までをシミュレートする。
+
+    並びは「i の引けで判断 → i+1 の寄りで約定 → i+1 以降の足へ退出ポリシーを
+    逐次適用」。エントリー当日（i+1）も退出判定の対象にする。実運用も朝に買った
+    その日のうちに損切り監視が走るため。
+
+    ラベルは**コスト控除後の純収益が正なら1、それ以外は0**とする。
+    0は0側に含める。決着しなかった候補にはラベルを付けず、別ステータスにする。
+    """
+    if "feature_valid" in feat.columns and not bool(feat["feature_valid"].iloc[i]):
+        return _unresolved(STATUS_INVALID_FEATURES)
+
+    entry_idx = i + 1
+    if entry_idx >= len(feat):
+        return _unresolved(STATUS_UNFILLED)
+
+    entry_bar = _observation(feat, entry_idx)
+    entry = execution.entry_fill(entry_bar, NOMINAL_QUANTITY, costs)
+
+    state = policy.HoldingState(
+        symbol=str(feat.attrs.get("symbol", "")),
+        entry_at=entry.at,
+        avg_cost=entry.price,
+        quantity=entry.quantity,
+        peak_price=entry.price,
+        sessions_held=0,
+    )
+    observations = [_observation(feat, k) for k in range(entry_idx, len(feat))]
+    final, intent, _ = policy.run_session_series(
+        state, observations, policy_conf, peak_basis=peak_basis)
+
+    if intent is None:
+        # 足が尽きて決着しなかった。未来1行しかないサンプルにラベルを付けない
+        return _unresolved(STATUS_IMMATURE, entry_at=entry.at,
+                           sessions_held=final.sessions_held)
+
+    # 意図が出たのは entry_idx から数えて sessions_held 本目の足
+    intent_idx = entry_idx + final.sessions_held - 1
+    next_idx = intent_idx + 1
+    exit_bar = _observation(feat, intent_idx)
+    next_bar = _observation(feat, next_idx) if next_idx < len(feat) else None
+
+    fill = execution.exit_fill(intent, exit_bar, next_bar, NOMINAL_QUANTITY, costs)
+    if fill is None:
+        return _unresolved(STATUS_UNFILLED, entry_at=entry.at,
+                           sessions_held=final.sessions_held)
+
+    ret = execution.net_return(entry, fill, costs)
+    return EventOutcome(
+        status=STATUS_RESOLVED,
+        entry_at=entry.at,
+        label_end_at=fill.at,
+        label=1 if ret > 0 else 0,
+        net_return=ret,
+        exit_reason=intent.reason,
+        entry_price=entry.price,
+        exit_price=fill.price,
+        sessions_held=final.sessions_held,
+    )
