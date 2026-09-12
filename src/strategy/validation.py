@@ -162,3 +162,17 @@ def split_events(events: pd.DataFrame, fold: Fold, *,
             train = train[~train["decision_at"].isin(embargoed)]
 
     return train.reset_index(drop=True), val.reset_index(drop=True)
+
+
+def inner_folds(train_events: pd.DataFrame, n_splits: int = 3) -> list:
+    """外側foldの学習側をさらに分割した内側foldを作る。
+
+    **外側foldは最終評価専用で一切触らない。** early stopping・閾値選択・
+    確率校正・学習窓選択・戦略選択はすべてこの内側foldで行う。
+    現行は early stopping に使った検証データでそのままCV指標を出しており、
+    報告値が楽観に寄っている（ml_model.py:147-160）。
+
+    引数は split_events() が返した学習イベントであること。外側の検証期間は
+    そこに含まれていないため、内側foldがそれに触れることは構造的にない。
+    """
+    return calendar_folds(train_events, n_splits=n_splits)

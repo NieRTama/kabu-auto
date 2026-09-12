@@ -307,3 +307,45 @@ class TestEmbargo:
         _, val_off = validation.split_events(events, fold)
         _, val_on = validation.split_events(events, fold, embargo_sessions=2)
         assert list(val_off["event_id"]) == list(val_on["event_id"])
+
+
+class TestInnerFolds:
+    def _outer(self):
+        events = _daily_events(["7203"], date(2026, 1, 5), 120, holding=1)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        train, val = validation.split_events(events, fold)
+        return events, fold, train, val
+
+    def test_inner_folds_live_inside_outer_training(self):
+        """内側foldは外側の学習期間の中だけで完結する"""
+        _, outer, train, _ = self._outer()
+        for inner in validation.inner_folds(train, n_splits=3):
+            assert inner.train_start >= train["decision_at"].min()
+            assert inner.val_end <= train["decision_at"].max()
+            assert inner.val_end < outer.val_start
+
+    def test_inner_folds_never_touch_outer_validation(self):
+        """内側foldのどの期間も外側の検証期間に重ならない（外側は最終評価専用）"""
+        _, outer, train, _ = self._outer()
+        for inner in validation.inner_folds(train, n_splits=3):
+            assert inner.val_start < outer.val_start
+            assert inner.train_end < outer.val_start
+
+    def test_inner_folds_are_forward_only(self):
+        _, _, train, _ = self._outer()
+        for inner in validation.inner_folds(train, n_splits=3):
+            assert inner.train_end < inner.val_start
+
+    def test_purge_applies_inside_inner_folds_too(self):
+        """内側foldにも同じpurgeが効く"""
+        _, _, train, _ = self._outer()
+        for inner in validation.inner_folds(train, n_splits=3):
+            inner_train, _ = validation.split_events(train, inner)
+            if len(inner_train) == 0:
+                continue
+            assert (inner_train["label_end_at"] < inner.val_start).all()
+
+    def test_raises_when_training_too_short(self):
+        short = _daily_events(["7203"], date(2026, 1, 5), 2, holding=0)
+        with pytest.raises(ValueError, match="セッション"):
+            validation.inner_folds(short, n_splits=3)
