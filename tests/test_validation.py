@@ -419,3 +419,89 @@ class TestTrainingWeights:
     def test_empty_training_set_gives_empty_weights(self):
         empty = _daily_events(["7203"], date(2026, 1, 5), 10, holding=0).iloc[0:0]
         assert len(validation.training_weights(empty)) == 0
+
+
+class TestPreprocessor:
+    def _split(self):
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=1)
+        # 特徴量に学習側と検証側で異なる水準を与える
+        events["f1"] = np.arange(len(events), dtype=float)
+        events["f2"] = np.arange(len(events), dtype=float) * 3.0
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        train, val = validation.split_events(events, fold)
+        return events, fold, train, val
+
+    def test_statistics_come_from_training_only(self):
+        _, _, train, _ = self._split()
+        pre = validation.fit_preprocessor(train, feature_cols=["f1", "f2"])
+        assert pre.means["f1"] == pytest.approx(train["f1"].mean())
+        assert pre.stds["f1"] == pytest.approx(train["f1"].std(ddof=0))
+        assert pre.n_fitted == len(train)
+
+    def test_positive_rate_comes_from_training_only(self):
+        _, _, train, _ = self._split()
+        pre = validation.fit_preprocessor(train, feature_cols=["f1", "f2"])
+        assert pre.positive_rate == pytest.approx(train["label"].mean())
+
+    def test_changing_validation_values_does_not_change_the_fit(self):
+        """検証側の特徴量を書き換えても前処理の統計量は変わらない（spec §7）"""
+        events, fold, train, _ = self._split()
+        pre_before = validation.fit_preprocessor(train, feature_cols=["f1", "f2"])
+
+        tampered = events.copy()
+        in_val = tampered["decision_at"] >= fold.val_start
+        tampered.loc[in_val, "f1"] = 99999.0
+        tampered.loc[in_val, "f2"] = -99999.0
+        train_after, _ = validation.split_events(tampered, fold)
+        pre_after = validation.fit_preprocessor(train_after, feature_cols=["f1", "f2"])
+
+        assert pre_before.means["f1"] == pytest.approx(pre_after.means["f1"])
+        assert pre_before.stds["f1"] == pytest.approx(pre_after.stds["f1"])
+        assert pre_before.positive_rate == pytest.approx(pre_after.positive_rate)
+
+    def test_applying_to_training_gives_zero_mean(self):
+        _, _, train, _ = self._split()
+        pre = validation.fit_preprocessor(train, feature_cols=["f1", "f2"])
+        out = validation.apply_preprocessor(pre, train, feature_cols=["f1", "f2"])
+        assert out["f1"].mean() == pytest.approx(0.0, abs=1e-9)
+        assert out["f1"].std(ddof=0) == pytest.approx(1.0)
+
+    def test_validation_is_transformed_with_training_statistics(self):
+        """検証側は学習側の統計量で変換する（検証側で fit し直さない）"""
+        _, _, train, val = self._split()
+        pre = validation.fit_preprocessor(train, feature_cols=["f1", "f2"])
+        out = validation.apply_preprocessor(pre, val, feature_cols=["f1", "f2"])
+        expected = (val["f1"].iloc[0] - pre.means["f1"]) / pre.stds["f1"]
+        assert out["f1"].iloc[0] == pytest.approx(expected)
+        # 学習期間より後なので中心はずれる＝検証側で fit し直していない証拠
+        assert out["f1"].mean() != pytest.approx(0.0, abs=1e-6)
+
+    def test_missing_values_are_filled_with_training_mean(self):
+        _, _, train, val = self._split()
+        pre = validation.fit_preprocessor(train, feature_cols=["f1", "f2"])
+        holed = val.copy()
+        holed.loc[holed.index[0], "f1"] = np.nan
+        out = validation.apply_preprocessor(pre, holed, feature_cols=["f1", "f2"])
+        assert out["f1"].iloc[0] == pytest.approx(0.0)  # 平均で埋める＝標準化後は0
+        assert out["f1"].notna().all()
+
+    def test_zero_variance_column_does_not_divide_by_zero(self):
+        _, _, train, _ = self._split()
+        flat = train.copy()
+        flat["f1"] = 5.0
+        pre = validation.fit_preprocessor(flat, feature_cols=["f1", "f2"])
+        out = validation.apply_preprocessor(pre, flat, feature_cols=["f1", "f2"])
+        assert out["f1"].notna().all()
+        assert np.isfinite(out["f1"]).all()
+
+    def test_defaults_to_indicator_feature_columns(self):
+        """feature_cols を省略すると indicators.FEATURE_COLS を使う"""
+        from src.strategy import indicators
+
+        rows = [{"symbol": "7203", "decision_at": date(2026, 1, 5),
+                 "label_end_at": date(2026, 1, 5), "label": 1}]
+        events = _events(rows)
+        for col in indicators.FEATURE_COLS:
+            events[col] = 1.0
+        pre = validation.fit_preprocessor(events)
+        assert list(pre.means.index) == list(indicators.FEATURE_COLS)

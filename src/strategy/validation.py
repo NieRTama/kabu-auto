@@ -10,11 +10,13 @@
 """
 from dataclasses import dataclass
 from datetime import date
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 from src.strategy.dataset import STATUS_RESOLVED, uniqueness_weights
+from src.strategy.indicators import FEATURE_COLS
 
 
 @dataclass(frozen=True)
@@ -187,3 +189,48 @@ def training_weights(train_events: pd.DataFrame) -> np.ndarray:
     ここが正しい呼び出し口になる。
     """
     return uniqueness_weights(train_events)
+
+
+@dataclass(frozen=True)
+class Preprocessor:
+    """学習側だけで求めた前処理の統計量。
+
+    検証側・本番側はこの統計量で変換するだけで、自分では fit し直さない。
+    分割器だけを直しても全データで fit すればリークは残る（spec §7 経路3）。
+    """
+    means: pd.Series
+    stds: pd.Series
+    positive_rate: float
+    n_fitted: int
+
+
+def fit_preprocessor(train_events: pd.DataFrame,
+                     feature_cols: Optional[list] = None) -> Preprocessor:
+    """**学習イベントだけ**から前処理の統計量を求める。
+
+    標準化の平均・標準偏差、欠損補完に使う平均、クラス比率をここで固定する。
+    検証側の値は一切見ない。閾値選択と確率校正も段階C後半で同じ規約に従う。
+    """
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    X = train_events.reindex(columns=cols).astype("float64")
+    means = X.mean()
+    stds = X.std(ddof=0)
+    # 分散0の列はゼロ除算になるため1として扱う（変換後は全て0になる）
+    stds = stds.mask((stds == 0) | stds.isna(), 1.0)
+    labels = pd.to_numeric(train_events.get("label"), errors="coerce")
+    positive_rate = float(labels.mean()) if labels is not None and len(labels) else 0.0
+    return Preprocessor(
+        means=means.fillna(0.0),
+        stds=stds,
+        positive_rate=positive_rate,
+        n_fitted=len(train_events),
+    )
+
+
+def apply_preprocessor(pre: Preprocessor, events: pd.DataFrame,
+                       feature_cols: Optional[list] = None) -> pd.DataFrame:
+    """学習側の統計量で変換する（欠損は学習側の平均で埋める）。"""
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    X = events.reindex(columns=cols).astype("float64")
+    X = X.fillna(pre.means)
+    return (X - pre.means) / pre.stds
