@@ -22,10 +22,12 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 
 from src.backtest import execution
+from src.core import config as cfg
 from src.strategy import policy
-from src.strategy.indicators import FEATURE_COLS
+from src.strategy.indicators import FEATURE_COLS, build_feature_frame
 from src.strategy.signal import compute_rule_score
 
 # ─── 状態区分 ──────────────────────────────────────────────────────────
@@ -256,3 +258,83 @@ def simulate_event(feat: pd.DataFrame, i: int,
         exit_price=fill.price,
         sessions_held=final.sessions_held,
     )
+
+
+def build_events(symbol: str, ohlcv: pd.DataFrame,
+                 policy_conf: policy.PolicyConfig,
+                 costs: execution.CostConfig, *,
+                 buy_threshold: Optional[float] = None,
+                 peak_basis: str = policy.PEAK_BASIS_PREVIOUS) -> pd.DataFrame:
+    """単一銘柄のOHLCVからイベント表を作る（1行=1候補）。
+
+    ohlcv は単一銘柄の時系列（日付インデックス・重複なし・昇順）であること。
+    複数銘柄は build_events_multi() を使う。
+    """
+    if buy_threshold is None:
+        buy_threshold = cfg.get_section("strategy").get("buy_threshold", 0.25)
+
+    feat = build_feature_frame(ohlcv)
+    feat.attrs["symbol"] = symbol
+    scores = rule_scores(feat)
+    candidates = find_candidates(feat, buy_threshold)
+
+    # ラベル契約IDは銘柄・日付に依存しないので、ループの外で一度だけ作る
+    label_contract_id = make_label_contract_id(
+        policy_conf, costs, peak_basis=peak_basis)
+
+    rows = []
+    for i in candidates:
+        outcome = simulate_event(feat, i, policy_conf, costs, peak_basis=peak_basis)
+        decision_at = feat.index[i].date()
+        row = {
+            "event_id": make_event_id(symbol, decision_at),
+            "label_contract_id": label_contract_id,
+            "symbol": symbol,
+            "decision_at": decision_at,
+            # 特徴量は判断セッションまでの情報だけで作られるため同じ時点になる
+            "feature_as_of": decision_at,
+            "entry_at": outcome.entry_at,
+            "label_end_at": outcome.label_end_at,
+            "status": outcome.status,
+            "label": outcome.label,
+            "net_return": outcome.net_return,
+            "exit_reason": outcome.exit_reason,
+            "entry_price": outcome.entry_price,
+            "exit_price": outcome.exit_price,
+            "sessions_held": outcome.sessions_held,
+            "rule_score": float(scores.iloc[i]),
+            "feature_version": FEATURE_VERSION,
+            "strategy_version": STRATEGY_VERSION,
+            "execution_model_version": EXECUTION_MODEL_VERSION,
+        }
+        for col in FEATURE_COLS:
+            row[col] = float(feat[col].iloc[i])
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=EVENT_COLUMNS)
+    return pd.DataFrame(rows)[EVENT_COLUMNS]
+
+
+def build_events_multi(ohlcv_by_symbol: dict, policy_conf: policy.PolicyConfig,
+                       costs: execution.CostConfig, **kwargs) -> pd.DataFrame:
+    """複数銘柄のイベント表を作って連結する。
+
+    **銘柄ごとに build_events() を呼んでから連結する。** 生のOHLCVを連結して
+    から処理すると、移動平均・RSI・退出判定が銘柄境界をまたいで壊れる
+    （ml_model.train_multi() と同じ理由）。
+    データ不足などで失敗した銘柄はスキップし、他の銘柄を止めない。
+    """
+    parts = []
+    for symbol, ohlcv in ohlcv_by_symbol.items():
+        try:
+            events = build_events(symbol, ohlcv, policy_conf, costs, **kwargs)
+        except Exception as e:
+            logger.warning(f"イベント表の生成をスキップ: {symbol} {e}")
+            continue
+        if len(events) > 0:
+            parts.append(events)
+
+    if not parts:
+        return pd.DataFrame(columns=EVENT_COLUMNS)
+    return pd.concat(parts, ignore_index=True)[EVENT_COLUMNS]

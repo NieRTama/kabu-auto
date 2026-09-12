@@ -329,3 +329,108 @@ class TestSimulateEvent:
         charged = dataset.simulate_event(
             _frame(bars), 0, _policy_conf(), _costs(slip=0.001, comm=0.001))
         assert charged.net_return < free.net_return
+
+
+class TestBuildEvents:
+    def test_columns_and_order_are_fixed(self, monkeypatch):
+        feat_len = 120
+        ohlcv = _ohlcv(feat_len)
+        fake = pd.Series([0.99] * feat_len, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events("7203", ohlcv, _policy_conf(), _costs())
+        assert list(events.columns) == dataset.EVENT_COLUMNS
+
+    def test_every_row_carries_identity_and_versions(self, monkeypatch):
+        ohlcv = _ohlcv(120)
+        fake = pd.Series([0.99] * 120, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events("7203", ohlcv, _policy_conf(), _costs())
+        assert len(events) > 0
+        assert (events["symbol"] == "7203").all()
+        assert (events["feature_version"] == dataset.FEATURE_VERSION).all()
+        assert (events["strategy_version"] == dataset.STRATEGY_VERSION).all()
+        assert (events["execution_model_version"] == dataset.EXECUTION_MODEL_VERSION).all()
+        assert events["event_id"].is_unique
+
+    def test_decision_at_precedes_entry_at(self, monkeypatch):
+        """判断は執行より前。同じセッションで判断して約定しない（F04）"""
+        ohlcv = _ohlcv(120)
+        fake = pd.Series([0.99] * 120, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events("7203", ohlcv, _policy_conf(), _costs())
+        filled = events[events["entry_at"].notna()]
+        assert len(filled) > 0
+        assert (filled["decision_at"] < filled["entry_at"]).all()
+
+    def test_label_end_at_is_not_before_entry_at(self, monkeypatch):
+        ohlcv = _ohlcv(120)
+        fake = pd.Series([0.99] * 120, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events("7203", ohlcv, _policy_conf(), _costs())
+        resolved = events[events["status"] == dataset.STATUS_RESOLVED]
+        assert len(resolved) > 0
+        assert (resolved["label_end_at"] >= resolved["entry_at"]).all()
+
+    def test_only_resolved_rows_have_labels(self, monkeypatch):
+        """未成熟・未約定にラベルが付いていない（spec §14 段階B完了条件）"""
+        ohlcv = _ohlcv(120)
+        fake = pd.Series([0.99] * 120, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events("7203", ohlcv, _policy_conf(), _costs())
+        unresolved = events[events["status"] != dataset.STATUS_RESOLVED]
+        assert unresolved["label"].isna().all()
+        resolved = events[events["status"] == dataset.STATUS_RESOLVED]
+        assert resolved["label"].notna().all()
+        assert set(resolved["label"].unique()) <= {0, 1}
+
+    def test_tail_sessions_are_not_labelled(self, monkeypatch):
+        """末尾の候補は決着に必要な足が無いのでラベルが付かない。
+
+        足の残り本数により immature（決着しなかった）にも unfilled（約定
+        できなかった）にもなり得るが、いずれもラベルは付けない。
+        """
+        ohlcv = _ohlcv(120)
+        fake = pd.Series([0.99] * 120, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events(
+            "7203", ohlcv, _policy_conf(max_holding=10), _costs())
+        last = events.sort_values("decision_at").iloc[-1]
+        assert last["status"] != dataset.STATUS_RESOLVED
+        assert pd.isna(last["label"])
+
+    def test_features_are_carried_on_each_row(self, monkeypatch):
+        ohlcv = _ohlcv(120)
+        fake = pd.Series([0.99] * 120, index=indicators.build_feature_frame(ohlcv).index)
+        monkeypatch.setattr(dataset, "rule_scores", lambda _f: fake)
+
+        events = dataset.build_events("7203", ohlcv, _policy_conf(), _costs())
+        assert events[list(indicators.FEATURE_COLS)].notna().all().all()
+
+
+class TestBuildEventsMulti:
+    def test_concatenates_per_symbol(self, monkeypatch):
+        ohlcv_a, ohlcv_b = _ohlcv(120), _ohlcv(120, start_price=500.0)
+        monkeypatch.setattr(
+            dataset, "rule_scores",
+            lambda f: pd.Series([0.99] * len(f), index=f.index))
+
+        events = dataset.build_events_multi(
+            {"7203": ohlcv_a, "9984": ohlcv_b}, _policy_conf(), _costs())
+        assert set(events["symbol"].unique()) == {"7203", "9984"}
+        assert events["event_id"].is_unique
+
+    def test_skips_symbols_with_insufficient_data(self, monkeypatch):
+        """データが足りない銘柄は黙ってスキップし、他の銘柄を止めない"""
+        monkeypatch.setattr(
+            dataset, "rule_scores",
+            lambda f: pd.Series([0.99] * len(f), index=f.index))
+
+        events = dataset.build_events_multi(
+            {"7203": _ohlcv(120), "0000": _ohlcv(5)}, _policy_conf(), _costs())
+        assert set(events["symbol"].unique()) == {"7203"}
