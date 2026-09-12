@@ -13,9 +13,10 @@ Tの引けで判断し T+1 の寄りで約定する。現行 src/backtest/engine
 """
 from dataclasses import dataclass
 from datetime import date
+from typing import Optional
 
 from src.core import config as cfg
-from src.strategy.policy import Observation
+from src.strategy.policy import ExitIntent, Observation
 
 
 @dataclass(frozen=True)
@@ -75,3 +76,54 @@ def entry_fill(next_bar: Observation, quantity: int, costs: CostConfig) -> Fill:
         quantity=quantity,
         reason="ENTRY",
     )
+
+
+def exit_fill(intent: ExitIntent, bar: Observation, next_bar: Optional[Observation],
+              quantity: int, costs: CostConfig) -> Optional[Fill]:
+    """退出意図を約定へ変換する。約定できなければ None を返す。
+
+    STOP（基準線への到達）:
+        通常は基準線で約定したとみなす。ただし**寄りが既に基準線を割っていたら
+        min(open, trigger_price) で約定する**。現行 engine.py:119-123 は
+        基準線ちょうどで約定できる前提になっており、ギャップダウンに楽観的。
+
+    MARKET（売りシグナル・満了）:
+        翌営業日の寄りで成行約定する。満了日の終値で判断して同じ終値で約定する
+        経路を作らない（レビューF04）。翌足が無ければ未約定。
+    """
+    if intent.order_type == "STOP":
+        if intent.trigger_price is None:
+            raise ValueError("STOP の意図には trigger_price が必要です")
+        raw = min(bar.open, intent.trigger_price)
+        return Fill(
+            at=bar.session,
+            price=sell_fill_price(raw, costs),
+            quantity=quantity,
+            reason=intent.reason,
+        )
+
+    if next_bar is None:
+        # 足が尽きた＝この意図は約定していない。呼び出し側は未成熟として扱う
+        return None
+    return Fill(
+        at=next_bar.session,
+        price=sell_fill_price(next_bar.open, costs),
+        quantity=quantity,
+        reason=intent.reason,
+    )
+
+
+def net_return(entry: Fill, exit_: Fill, costs: CostConfig) -> float:
+    """コスト控除後の純収益率。
+
+    スリッページは entry_fill / exit_fill の約定価格に既に織り込まれているため、
+    ここで二重に引かない。手数料だけを売買それぞれの約定代金に対して控除する。
+    控除の責務をこのモジュールに閉じることで、期待値の式（spec §8）の末尾で
+    コストを再度引く二重計上を防ぐ。
+    """
+    buy_amount = entry.price * entry.quantity
+    if buy_amount <= 0:
+        return 0.0
+    sell_amount = exit_.price * exit_.quantity
+    commission = (buy_amount + sell_amount) * costs.commission_pct
+    return (sell_amount - buy_amount - commission) / buy_amount
