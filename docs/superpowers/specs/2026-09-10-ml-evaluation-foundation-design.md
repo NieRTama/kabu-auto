@@ -116,8 +116,13 @@ src/strategy/
   validation.py  新規  カレンダー分割 + purge/embargo + 入れ子CV
   indicators.py  改修  端点を仕様化。日付保持版APIを追加（既存APIは互換維持）
   labeling.py    改修  policy.py と過去検証アダプタを呼ぶ薄い層に縮小
-  ml_model.py    改修  validation.py を使う。候補保存と昇格の分離
-  signal.py      改修  strategy_version を明示
+  ml_model.py    据置  旧学習経路。legacy の受け皿として無改造で残す（下記の注記）
+  v2_training.py 新規  v2の学習経路（段階F）。ml_model.py に触らず別経路として置く
+  model_store.py 新規  候補モデルの保存と現行参照の原子的な切替（段階E）
+  promotion.py   新規  昇格の契約（段階E）
+  shadow.py      新規  現行と候補の並行記録（段階E）
+  evaluation.py  新規  比較対象5モデルの学習・評価・予測明細（段階C後半）
+  signal.py      据置  発注経路は変更しないため触らない（下記の注記）
 src/backtest/
   engine.py      据置  旧単一銘柄エンジン。互換ラッパー経由で旧動作を維持する
   execution.py   新規  過去検証アダプタ（約定仮定・未約定・部分約定・コスト）
@@ -126,6 +131,19 @@ src/backtest/
 src/data/
   market_data.py 改修  取得境界・確定足判定・生値と調整値の分離
 ```
+
+> **構造表の改訂（2026-09-12）。** 第2版では `ml_model.py` と `signal.py` を「改修」と
+> していたが、実装計画を書く過程で**どちらも触らない**方針へ変えた。
+>
+> - `ml_model.py` — legacy の学習経路そのもの。`engine_version: legacy` でいつでも
+>   戻せることが段階投入の前提（§10）なので、中身を変えずに残す。v2 の学習は
+>   `v2_training.py` として別経路に置き、呼び出し側（`ml_retrain`）で分岐する
+> - `signal.py` — `strategy_version` を明示するには発注経路のスコアリングに触る必要が
+>   あるが、§10 は「発注経路は変更しない」と定めている。戦略バージョンは
+>   `walkforward.py` の判断規則として実装し、v2 が運用へ昇格するまで `signal.py` は保留する
+>
+> `labeling.py` も同じ理由で縮小せず、モジュールdocstringに legacy 専用である旨を
+> 追記するに留める。
 
 ### 3層の責務
 
@@ -605,7 +623,7 @@ paper経路の執行仮定もこの設定で切り替わる（段階D後半）�
 | 新テーブル `ModelPromotion` | `model_id` / 評価記録ID / 判断者 / 理由 / 旧`model_id` / 切替日時 | 加算のみ |
 | `BacktestRun` に列追加 | `strategy_version` / `config_hash` / 設定JSON実体 / `dataset_id` / `code_version` / `execution_model_version` / `degraded` | 全てnullable |
 | `Signal` に列追加 | `data_as_of` | nullable |
-| `ModelMetrics` に列追加 | `model_id` / `positive_rate` / `training_window_sessions` | 全てnullable。**段階Fで追加する**（`ml_model.py` の改修と同時。段階A〜Eは `ml_model.py` を触らないため） |
+| `ModelMetrics` に列追加 | `model_id` / `positive_rate` / `training_window_sessions` / `engine_version` | 全てnullable。**段階Fで追加する**。同じテーブルに legacy と v2 の記録が混ざるため `engine_version` も足す |
 
 予測と実績を分けたのは、shadowでは予測時点に実績が存在しないためである。
 
