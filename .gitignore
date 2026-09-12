@@ -46,5 +46,5 @@ watchlist.json
 # OS
 .DS_Store
 
-# git worktree（Claude Code の実装作業用の隔離ワークスペース）
+# git worktree（superpowers:using-git-worktrees 用の作業ディレクトリ）
 .worktrees/

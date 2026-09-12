@@ -95,6 +95,13 @@ class TestSlowCommands:
         assert "launch" in ds._SLOW_COMMANDS
         assert "reconnect" in ds._SLOW_COMMANDS
 
+    def test_full_login_is_deferred(self):
+        """full_login は broker_full_login_timeout_seconds（既定180秒）まで
+        ブロックしうる、Bot全体で唯一3秒制約を大きく超える設計のコマンドなので、
+        defer対象から漏れると応答なしのまま失敗扱いになる（最重要の回帰防止）。
+        """
+        assert "full_login" in ds._SLOW_COMMANDS
+
     def test_read_only_commands_are_not_deferred(self):
         """DB照会は速いので即応答（defer すると2通に分かれて見づらい）"""
         for name in ("status", "positions", "pnl", "orders", "today"):

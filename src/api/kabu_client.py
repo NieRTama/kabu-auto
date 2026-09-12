@@ -22,6 +22,14 @@ class KabuClient:
     _WS_LOG_FIRST_N = 3
     _WS_LOG_INTERVAL_SEC = 300
 
+    # 429（Code=4001006 API実行回数エラー）のリトライ設定。
+    # 2026-09-11実例: ダッシュボードのポーリングと売買判定ループが同時にAPIを叩き、
+    # 実行回数制限に達して15分で495件の警告が発生、一部は「後場買い発注失敗」として
+    # 発注機会そのものを失っていた。429は一時的な輻輳とみなし、短いバックオフで
+    # 数回だけリトライする（401/500など429以外は原因が別なのでリトライしない）。
+    _RATE_LIMIT_MAX_RETRIES = 3
+    _RATE_LIMIT_BACKOFF_BASE_SEC = 0.5
+
     def __init__(self):
         conf = cfg.get_section("kabu_station")
         self._base_url = conf.get("base_url", "http://localhost:18080/kabusapi")
@@ -63,9 +71,21 @@ class KabuClient:
         以後497回の401を出しながら誰も認証切れと認識せず、9:05の売り注文が失敗した。
         ログインしても復帰せず、プロセス再起動でしか直せない状態だった。
         """
-        resp = requests.request(
-            method, f"{self._base_url}{path}", headers=self._headers, timeout=10, **kwargs
-        )
+        attempt = 0
+        while True:
+            resp = requests.request(
+                method, f"{self._base_url}{path}", headers=self._headers, timeout=10, **kwargs
+            )
+            if resp.status_code == 429 and attempt < self._RATE_LIMIT_MAX_RETRIES:
+                attempt += 1
+                wait = self._RATE_LIMIT_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+                logger.warning(
+                    f"API実行回数制限（429）: {method} {path} 、{wait:.1f}秒後にリトライ"
+                    f"（{attempt}/{self._RATE_LIMIT_MAX_RETRIES}）"
+                )
+                time.sleep(wait)
+                continue
+            break
         if resp.status_code == 401:
             broker_auth.mark_expired(f"{method} {path} が401を返しました")
         if resp.status_code >= 400:
