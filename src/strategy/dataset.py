@@ -18,6 +18,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -338,3 +339,86 @@ def build_events_multi(ohlcv_by_symbol: dict, policy_conf: policy.PolicyConfig,
     if not parts:
         return pd.DataFrame(columns=EVENT_COLUMNS)
     return pd.concat(parts, ignore_index=True)[EVENT_COLUMNS]
+
+
+_DATE_COLUMNS = ("decision_at", "feature_as_of", "entry_at", "label_end_at")
+_FLOAT_FORMAT = "%.10f"
+# 浮動小数点として書き出す列。dtype推論に任せると、たまたま欠損が無い回だけ
+# int64 になって "1" と書かれ、欠損がある回の "1.0000000000" と別のハッシュに
+# なってしまう。明示的に float へ寄せて表現を固定する。
+_FLOAT_COLUMNS = ("label", "net_return", "entry_price", "exit_price", "rule_score")
+
+
+def _normalized_frame(events: pd.DataFrame) -> pd.DataFrame:
+    """ハッシュ・保存の双方で使う正規化。
+
+    列順・並び順・日付表現・数値のdtypeを固定する。これをしないと、
+    同じ内容でも生成の順序や dtype 推論の差で別のIDになる。
+    """
+    out = events.reindex(columns=EVENT_COLUMNS).copy()
+    out = out.sort_values(["symbol", "decision_at"]).reset_index(drop=True)
+    for col in _DATE_COLUMNS:
+        out[col] = out[col].map(
+            lambda d: "" if pd.isna(d) else pd.Timestamp(d).strftime("%Y-%m-%d"))
+    for col in _FLOAT_COLUMNS:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+    for col in FEATURE_COLS:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+    return out
+
+
+def normalize_for_hash(events: pd.DataFrame) -> str:
+    """正規化したCSV文字列を返す（欠損は空文字、浮動小数点は固定精度）。"""
+    return _normalized_frame(events).to_csv(
+        index=False, float_format=_FLOAT_FORMAT, na_rep="", lineterminator="\n")
+
+
+def compute_dataset_id(events: pd.DataFrame) -> str:
+    """正規化した内容のSHA256（先頭16桁）。
+
+    **内容由来のIDであり、採取日時は含めない。** 同一内容なら同じIDになる。
+    「いつ取ったか」は Dataset テーブルの採取履歴ID（collection_id）が持つ。
+    こうしておくと「コード変更による成績差」と「データ改訂による成績差」を
+    分離できる（spec §5）。
+    """
+    return hashlib.sha256(normalize_for_hash(events).encode("utf-8")).hexdigest()[:16]
+
+
+def dataset_path(dataset_id: str, base_dir: str = "data/datasets") -> Path:
+    return Path(base_dir) / f"{dataset_id}.csv.gz"
+
+
+def save_events(events: pd.DataFrame, dataset_id: str,
+                base_dir: str = "data/datasets") -> Path:
+    """イベント表を data/datasets/<dataset_id>.csv.gz へ保存する。
+
+    pandas 標準で読み書きでき依存追加が要らないため csv.gz を採る
+    （requirements.txt に pyarrow が無いので parquet は採らない）。
+    gzip は既定で書き込み時刻をヘッダへ埋めるため、mtime=0 を指定して
+    同一内容なら同一バイト列になるようにする。
+    """
+    path = dataset_path(dataset_id, base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _normalized_frame(events).to_csv(
+        path, index=False, float_format=_FLOAT_FORMAT, na_rep="",
+        lineterminator="\n", compression={"method": "gzip", "mtime": 0})
+    return path
+
+
+def load_events(dataset_id: str, base_dir: str = "data/datasets") -> pd.DataFrame:
+    """保存したイベント表を読み込む（日付列を date に戻す）。"""
+    path = dataset_path(dataset_id, base_dir)
+    out = pd.read_csv(path, compression="gzip")
+    for col in _DATE_COLUMNS:
+        out[col] = pd.to_datetime(out[col], errors="coerce").dt.date
+        out[col] = out[col].where(out[col].notna(), None)
+    return out.reindex(columns=EVENT_COLUMNS)
+
+
+def file_sha256(path: Path) -> str:
+    """ファイルのSHA256（完全性の確認用。識別子は dataset_id を使う）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()

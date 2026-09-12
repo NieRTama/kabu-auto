@@ -451,3 +451,91 @@ class TestBuildEventsMulti:
         events = dataset.build_events_multi(
             {"7203": good, "0000": broken}, _policy_conf(), _costs())
         assert set(events["symbol"].unique()) == {"7203"}
+
+
+def _sample_events(monkeypatch, symbol="7203", n=120, start_price=1000.0):
+    ohlcv = _ohlcv(n, start_price=start_price)
+    monkeypatch.setattr(
+        dataset, "rule_scores",
+        lambda f: pd.Series([0.99] * len(f), index=f.index))
+    return dataset.build_events(symbol, ohlcv, _policy_conf(), _costs())
+
+
+class TestDatasetId:
+    def test_same_content_gives_same_id(self, monkeypatch):
+        """同一内容なら同じ dataset_id になる（spec §6）"""
+        a = _sample_events(monkeypatch)
+        b = _sample_events(monkeypatch)
+        assert dataset.compute_dataset_id(a) == dataset.compute_dataset_id(b)
+
+    def test_row_order_does_not_change_id(self, monkeypatch):
+        """並び順は正規化で固定されるのでIDに影響しない"""
+        events = _sample_events(monkeypatch)
+        shuffled = events.sample(frac=1.0, random_state=7).reset_index(drop=True)
+        assert dataset.compute_dataset_id(events) == dataset.compute_dataset_id(shuffled)
+
+    def test_different_content_gives_different_id(self, monkeypatch):
+        a = _sample_events(monkeypatch, symbol="7203")
+        b = _sample_events(monkeypatch, symbol="9984", start_price=500.0)
+        assert dataset.compute_dataset_id(a) != dataset.compute_dataset_id(b)
+
+    def test_id_is_short_hex(self, monkeypatch):
+        did = dataset.compute_dataset_id(_sample_events(monkeypatch))
+        assert len(did) == 16
+        assert all(c in "0123456789abcdef" for c in did)
+
+    def test_label_dtype_does_not_change_id(self, monkeypatch):
+        """欠損の有無でlabelのdtypeが変わってもIDは変わらない。
+
+        dtype推論に任せると、たまたま全件resolvedの回だけint64になって
+        "1"と書かれ、欠損がある回の"1.0000000000"と別のハッシュになる。
+        """
+        events = _sample_events(monkeypatch)
+        as_int = events.copy()
+        as_int["label"] = as_int["label"].astype("object")
+        as_float = events.copy()
+        as_float["label"] = as_float["label"].astype("float64")
+        assert dataset.compute_dataset_id(as_int) == dataset.compute_dataset_id(as_float)
+
+
+class TestSaveLoad:
+    def test_roundtrip_preserves_content_hash(self, monkeypatch, tmp_path):
+        """保存して読み直しても dataset_id が変わらない"""
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path))
+        assert path.exists()
+
+        loaded = dataset.load_events(did, base_dir=str(tmp_path))
+        assert dataset.compute_dataset_id(loaded) == did
+
+    def test_roundtrip_preserves_columns_and_row_count(self, monkeypatch, tmp_path):
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        dataset.save_events(events, did, base_dir=str(tmp_path))
+        loaded = dataset.load_events(did, base_dir=str(tmp_path))
+        assert list(loaded.columns) == dataset.EVENT_COLUMNS
+        assert len(loaded) == len(events)
+
+    def test_roundtrip_preserves_status_and_label_semantics(self, monkeypatch, tmp_path):
+        """読み直してもラベル無しのステータスにラベルが生えない"""
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        dataset.save_events(events, did, base_dir=str(tmp_path))
+        loaded = dataset.load_events(did, base_dir=str(tmp_path))
+        unresolved = loaded[loaded["status"] != dataset.STATUS_RESOLVED]
+        assert unresolved["label"].isna().all()
+
+    def test_written_bytes_are_deterministic(self, monkeypatch, tmp_path):
+        """同一内容なら書き出したバイト列も同じ（gzipのmtimeを固定している）"""
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        p1 = dataset.save_events(events, did, base_dir=str(tmp_path / "a"))
+        p2 = dataset.save_events(events, did, base_dir=str(tmp_path / "b"))
+        assert dataset.file_sha256(p1) == dataset.file_sha256(p2)
+
+    def test_file_name_is_the_dataset_id(self, monkeypatch, tmp_path):
+        events = _sample_events(monkeypatch)
+        did = dataset.compute_dataset_id(events)
+        path = dataset.save_events(events, did, base_dir=str(tmp_path))
+        assert path.name == f"{did}.csv.gz"
