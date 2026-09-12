@@ -1,0 +1,30 @@
+{
+  "verification": "Independent JavaScript arithmetic and predicate evaluation; not bot code or pytest execution",
+  "cases": [
+    {
+      "case": "D2 gap-up buy",
+      "remaining_cash": -900.8
+    },
+    {
+      "case": "D1 same-price round trip",
+      "cash_pnl": -200,
+      "recorded_pnl": -100
+    },
+    {
+      "case": "C1 post-cutoff resolved label",
+      "accepted_by_plan_predicate": true,
+      "label_after_train_end": true
+    },
+    {
+      "case": "C1 embargo test precondition",
+      "expected_by_test": true,
+      "accepted_by_plan_predicate": false
+    },
+    {
+      "case": "A mixed OHLC",
+      "low": 990,
+      "close": 502.5,
+      "low_exceeds_close": true
+    }
+  ]
+}

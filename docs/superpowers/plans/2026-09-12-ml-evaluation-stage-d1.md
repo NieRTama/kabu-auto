@@ -163,6 +163,15 @@ from typing import Optional
 LOT_SIZE = 100
 
 
+class InsufficientCash(ValueError):
+    """買付に必要な現金（代金＋手数料）が足りない。
+
+    数量は前日終値で決めるのに約定は翌朝の寄りなので、ギャップアップすると
+    必要額が枠を超える。呼び出し側が数量を縮めるか見送るかを決められるよう、
+    黙って現金を負にせず例外にする（外部レビューR08）。
+    """
+
+
 @dataclass(frozen=True)
 class Holding:
     """1銘柄の保有。
@@ -173,11 +182,16 @@ class Holding:
     """
     symbol: str
     quantity: int
-    avg_cost: float
+    avg_cost: float            # 約定価格だけの加重平均（退出ポリシーが見る）
     sector: str
     entry_at: date
     peak_price: float
     sessions_held: int
+    # 買付手数料まで含めた1株あたり原価。実現損益の計算はこちらを使う。
+    # avg_cost と分けるのは、退出ポリシー（policy.HoldingState）と実運用の
+    # risk/manager.py が「約定価格に対する騰落率」で損切り線を引いており、
+    # そこへ手数料を混ぜると本番と過去検証で損切り位置がずれるため。
+    avg_cost_with_fees: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -271,8 +285,11 @@ EOF
 **Interfaces:**
 - Consumes: Task 1
 - Produces:
-  - `apply_buy(pf: Portfolio, symbol: str, quantity: int, price: float, sector: str, at: date, commission_pct: float) -> Portfolio`
-  - `apply_sell(pf: Portfolio, symbol: str, quantity: int, price: float, commission_pct: float) -> tuple[Portfolio, float]` — `(次の状態, 実現損益)`
+  - `apply_buy(pf: Portfolio, symbol: str, quantity: int, price: float, sector: str, at: date, commission_pct: float) -> Portfolio` — 代金＋手数料が現金を超えるときは `InsufficientCash` を送出する
+  - `apply_sell(pf: Portfolio, symbol: str, quantity: int, price: float, commission_pct: float) -> tuple[Portfolio, float]` — `(次の状態, 実現損益)`。実現損益は**往復**の手数料控除後
+  - `InsufficientCash(ValueError)` — 買付の必要額が現金を超えた
+  - `Holding.avg_cost_with_fees: float` — 買付手数料まで含めた1株あたり原価。`avg_cost`（約定価格のみ）は退出ポリシーが見る値なので別に持つ
+  - `max_affordable_quantity(cash: float, price: float, commission_pct: float, lot: int) -> int` — 現金・手数料・単元を満たす最大数量（0 なら見送り）
   - `advance_session(pf: Portfolio, prices: dict) -> Portfolio` — 保有のピーク更新と経過営業日数の加算
 
 **注意:** 手数料は約定代金に対して掛かる（買いは現金をさらに減らし、売りは受取を減らす）。スリッページは `execution.py` の約定価格に織り込み済みなので、ここでは扱わない。
@@ -325,6 +342,69 @@ class TestApplyBuy:
             pf.apply_buy(pf.empty_portfolio(1_000_000.0), "7203", 0, 1000.0,
                          "自動車", date(2026, 9, 2), commission_pct=0.0)
 
+    def test_rejects_a_buy_that_would_make_cash_negative(self):
+        """必要額が現金を超える買いは成立させない
+
+        数量は前日終値で決めるのに約定は翌朝の寄り。ギャップアップすると
+        枠を超える。黙って現金を負にするとNAVも成績も意味を失う
+        （外部レビューR08）。
+        """
+        # 現金10万円、前日100円で枠いっぱいの900株を決めた後、
+        # 翌朝112円へギャップアップ。900 × 112 × 1.001 = 100,900.8円
+        start = pf.empty_portfolio(100_000.0)
+        with pytest.raises(pf.InsufficientCash):
+            pf.apply_buy(start, "7203", 900, 112.0, "自動車",
+                         date(2026, 9, 2), commission_pct=0.001)
+
+    def test_cash_never_goes_negative_at_the_exact_boundary(self):
+        """ちょうど買える数量は通り、1単元増やすと拒否される"""
+        start = pf.empty_portfolio(100_000.0)
+        qty = pf.max_affordable_quantity(100_000.0, 112.0, 0.001, lot=100)
+        assert qty > 0
+        after = pf.apply_buy(start, "7203", qty, 112.0, "自動車",
+                             date(2026, 9, 2), commission_pct=0.001)
+        assert after.cash >= 0.0
+        with pytest.raises(pf.InsufficientCash):
+            pf.apply_buy(start, "7203", qty + 100, 112.0, "自動車",
+                         date(2026, 9, 2), commission_pct=0.001)
+
+    def test_records_cost_basis_including_the_buy_commission(self):
+        p = pf.apply_buy(pf.empty_portfolio(1_000_000.0), "7203", 100, 1000.0,
+                         "自動車", date(2026, 9, 2), commission_pct=0.001)
+        h = p.holdings["7203"]
+        assert h.avg_cost == pytest.approx(1000.0)              # ポリシー用
+        assert h.avg_cost_with_fees == pytest.approx(1001.0)    # 損益計算用
+
+    def test_adding_to_holding_averages_the_fee_inclusive_basis_too(self):
+        p = pf.apply_buy(pf.empty_portfolio(1_000_000.0), "7203", 100, 1000.0,
+                         "自動車", date(2026, 9, 2), commission_pct=0.001)
+        p = pf.apply_buy(p, "7203", 100, 1200.0, "自動車", date(2026, 9, 3),
+                         commission_pct=0.001)
+        h = p.holdings["7203"]
+        assert h.avg_cost == pytest.approx(1100.0)
+        # (100,100 + 120,120) / 200 = 1,101.1
+        assert h.avg_cost_with_fees == pytest.approx(1101.1)
+
+
+class TestMaxAffordableQuantity:
+    def test_shrinks_to_what_the_cash_allows(self):
+        # 900株は買えないが、800株なら 800×112×1.001 = 89,689.6円で買える
+        assert pf.max_affordable_quantity(100_000.0, 112.0, 0.001, lot=100) == 800
+
+    def test_zero_when_one_lot_is_unaffordable(self):
+        assert pf.max_affordable_quantity(1_000.0, 112.0, 0.001, lot=100) == 0
+
+    def test_result_always_fits_in_cash(self):
+        for cash in (10_000.0, 100_000.0, 999_999.0):
+            for price in (37.0, 112.0, 1234.5):
+                qty = pf.max_affordable_quantity(cash, price, 0.001, lot=100)
+                assert price * qty * 1.001 <= cash + 1e-9
+
+    def test_rejects_bad_inputs(self):
+        assert pf.max_affordable_quantity(100_000.0, 0.0, 0.001) == 0
+        assert pf.max_affordable_quantity(0.0, 112.0, 0.001) == 0
+        assert pf.max_affordable_quantity(-1.0, 112.0, 0.001) == 0
+
 
 class TestApplySell:
     def _held(self):
@@ -362,6 +442,55 @@ class TestApplySell:
         with pytest.raises(ValueError, match="保有"):
             pf.apply_sell(pf.empty_portfolio(1_000_000.0), "7203", 100, 1200.0,
                           commission_pct=0.0)
+
+
+class TestRealizedPnlMatchesCash:
+    """全ポジション決済後の実現損益合計と現金増減が一致すること。
+
+    買付手数料を現金からだけ引いて原価に含めないと、同値往復で
+    現金 −200円・実現損益 −100円のようにずれる（外部レビューR20）。
+    """
+
+    COMM = 0.001
+
+    def test_round_trip_at_the_same_price(self):
+        start = pf.empty_portfolio(1_000_000.0)
+        p = pf.apply_buy(start, "7203", 100, 1000.0, "自動車",
+                         date(2026, 9, 2), commission_pct=self.COMM)
+        p, pnl = pf.apply_sell(p, "7203", 100, 1000.0, commission_pct=self.COMM)
+        assert p.cash - start.cash == pytest.approx(-200.0)
+        assert pnl == pytest.approx(-200.0)
+
+    def test_partial_sales_sum_to_the_cash_change(self):
+        start = pf.empty_portfolio(1_000_000.0)
+        p = pf.apply_buy(start, "7203", 100, 1000.0, "自動車",
+                         date(2026, 9, 2), commission_pct=self.COMM)
+        p, a = pf.apply_sell(p, "7203", 50, 1000.0, commission_pct=self.COMM)
+        p, b = pf.apply_sell(p, "7203", 50, 1000.0, commission_pct=self.COMM)
+        assert "7203" not in p.holdings
+        assert a + b == pytest.approx(p.cash - start.cash)
+        assert a + b == pytest.approx(-200.0)
+
+    def test_scaling_in_then_closing_out(self):
+        start = pf.empty_portfolio(1_000_000.0)
+        p = pf.apply_buy(start, "7203", 100, 1000.0, "自動車",
+                         date(2026, 9, 2), commission_pct=self.COMM)
+        p = pf.apply_buy(p, "7203", 100, 1200.0, "自動車",
+                         date(2026, 9, 3), commission_pct=self.COMM)
+        p, pnl = pf.apply_sell(p, "7203", 200, 1100.0, commission_pct=self.COMM)
+        assert "7203" not in p.holdings
+        # 現金: −100,100 −120,120 +219,780 = −440
+        assert p.cash - start.cash == pytest.approx(-440.0)
+        assert pnl == pytest.approx(-440.0)
+
+    def test_profitable_trade_also_reconciles(self):
+        start = pf.empty_portfolio(1_000_000.0)
+        p = pf.apply_buy(start, "7203", 100, 1000.0, "自動車",
+                         date(2026, 9, 2), commission_pct=self.COMM)
+        p, pnl = pf.apply_sell(p, "7203", 100, 1200.0, commission_pct=self.COMM)
+        assert p.cash - start.cash == pytest.approx(pnl)
+        # 20,000 − 100（買付） − 120（売付） = 19,780
+        assert pnl == pytest.approx(19_780.0)
 
 
 class TestAdvanceSession:
@@ -413,18 +542,35 @@ def apply_buy(pf: Portfolio, symbol: str, quantity: int, price: float,
     if quantity <= 0:
         raise ValueError(f"quantity は正の整数: {quantity}")
     amount = price * quantity
-    cash = pf.cash - amount - amount * commission_pct
+    commission = amount * commission_pct
+    outlay = amount + commission
+    cash = pf.cash - outlay
+
+    # 現金が足りない買いは成立させない。数量は前日終値で決めるのに約定は
+    # 翌朝の寄りなので、ギャップアップすると必要額が枠を超える。ここを
+    # 通すと現金が負のままバックテストが進み、NAVも成績も意味を失う
+    # （外部レビューR08）。縮小するか諦めるかは呼び出し側の判断なので、
+    # ここでは拒否だけする。
+    if cash < 0:
+        raise InsufficientCash(
+            f"現金が足りません: {symbol} {quantity}株 × {price} "
+            f"＋手数料{commission:,.1f} = {outlay:,.1f} > 現金{pf.cash:,.1f}")
 
     existing = pf.holdings.get(symbol)
     if existing is None:
         holding = Holding(
             symbol=symbol, quantity=quantity, avg_cost=price, sector=sector,
             entry_at=at, peak_price=price, sessions_held=0,
+            avg_cost_with_fees=outlay / quantity,
         )
     else:
         total_qty = existing.quantity + quantity
         avg_cost = (existing.avg_cost * existing.quantity + amount) / total_qty
-        holding = replace(existing, quantity=total_qty, avg_cost=avg_cost)
+        # 手数料込み原価も同じ加重平均で積む
+        avg_fees = (existing.avg_cost_with_fees * existing.quantity
+                    + outlay) / total_qty
+        holding = replace(existing, quantity=total_qty, avg_cost=avg_cost,
+                          avg_cost_with_fees=avg_fees)
 
     holdings = dict(pf.holdings)
     holdings[symbol] = holding
@@ -435,7 +581,17 @@ def apply_sell(pf: Portfolio, symbol: str, quantity: int, price: float,
                commission_pct: float) -> tuple:
     """売り約定を反映し、(次の状態, 実現損益) を返す。
 
-    実現損益は手数料控除後。部分決済では残りの取得単価を変えない。
+    実現損益は**往復の手数料控除後**。買付手数料は `avg_cost_with_fees`
+    （1株あたり原価）として保有に積んであり、売却数量ぶんを按分して引く。
+
+    買付手数料を現金からだけ引いて原価に含めないと、同値で往復したときに
+    現金は往復ぶん減るのに実現損益は片道ぶんしか減らない。10万円ぶんを
+    片道0.1%で往復すると、現金 −200円に対し実現損益 −100円になる
+    （外部レビューR20）。日次明細・取引明細にもこの値を書くので、
+    ここがずれると成績表が現金と合わなくなる。
+
+    部分決済では残りの取得単価（`avg_cost` も `avg_cost_with_fees` も）を
+    変えない。按分は数量比で行われる。
     """
     existing = pf.holdings.get(symbol)
     if existing is None or existing.quantity < quantity:
@@ -445,7 +601,7 @@ def apply_sell(pf: Portfolio, symbol: str, quantity: int, price: float,
     proceeds = price * quantity
     commission = proceeds * commission_pct
     cash = pf.cash + proceeds - commission
-    realized = (price - existing.avg_cost) * quantity - commission
+    realized = (price - existing.avg_cost_with_fees) * quantity - commission
 
     holdings = dict(pf.holdings)
     remaining = existing.quantity - quantity
@@ -642,12 +798,38 @@ def calc_quantity(pf: Portfolio, symbol: str, price: float,
     remaining = max(0.0, budget - held_value(pf, symbol, price))
     units = int(remaining / (price * LOT_SIZE))
     return units * LOT_SIZE
+
+
+def max_affordable_quantity(cash: float, price: float,
+                            commission_pct: float,
+                            lot: int = LOT_SIZE) -> int:
+    """現金・手数料・単元を満たす最大数量（買えないなら0）。
+
+    `calc_quantity()` は**前日終値**で枠を割り当てる。実際の約定は翌朝の
+    寄り値なので、ギャップアップすると枠どおりの株数が買えなくなる。
+    約定時点でこの関数を通し、買える株数まで縮めるか見送る
+    （外部レビューR08）。
+
+    必要額は `price * qty * (1 + commission_pct)` なので、
+    `qty <= cash / (price * (1 + commission_pct))` を単元へ切り捨てる。
+    浮動小数の丸めで1単元ぶん超過しないよう、切り捨て後に必要額を
+    もう一度検算してから返す。
+    """
+    if price <= 0 or cash <= 0 or lot <= 0:
+        return 0
+    unit_cost = price * lot * (1.0 + commission_pct)
+    if unit_cost <= 0:
+        return 0
+    units = int(cash / unit_cost)
+    while units > 0 and price * units * lot * (1.0 + commission_pct) > cash:
+        units -= 1
+    return units * lot
 ```
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_portfolio.py -v`
-Expected: PASS（34件）
+Expected: PASS（50件）
 
 - [ ] **Step 5: コミット**
 
@@ -1157,7 +1339,9 @@ EOF
 - Produces:
   - `FillResult`（frozen dataclass）: `fill: Optional[Fill]`, `requested_quantity: int`, `filled_quantity: int`, `unfilled_reason: Optional[str]`
   - `LiquidityConfig`（frozen dataclass）: `max_volume_share: float` — その日の出来高に対して約定できる最大の割合（0で無制限）
-  - `entry_fill_limited(next_bar, quantity, costs, liquidity) -> FillResult`
+  - `VolumeBudget(liquidity: LiquidityConfig)` — 1営業日ぶんの出来高枠を銘柄ごとに管理し、**買いと売りで共有**する。`allow(symbol, volume, quantity) -> int` / `remaining(symbol) -> Optional[int]` / `unlimited() -> bool`
+  - `exit_fill_limited(intent, bar, next_bar, quantity, costs, budget, *, symbol: str, volume: int) -> FillResult` — 売り側の出来高制限。売れ残りは呼び出し側が保有に残し翌営業日へ持ち越す
+  - `entry_fill_limited(next_bar, quantity, costs, liquidity, *, volume: int) -> FillResult`
 
 **背景（spec §8）:** 現行エンジンは「欲しい数量は必ず買える」前提である。薄商い銘柄では、その日の出来高の何割も自分で買うことはできない。**未約定と部分約定を明示的に表現する**ことで、成績が執行可能性を織り込んだものになる。
 
@@ -1273,6 +1457,92 @@ class TestBaseHelpersUnchanged:
         fill = execution.exit_fill(intent, _bar(o=1000.0, l=920.0), None, 100, _costs())
         assert fill is not None
         assert fill.quantity == 100
+
+
+class TestExitVolumeLimit:
+    """売りにも出来高の制限が掛かること（外部レビューR09）。
+
+    買いだけに掛けて売りを無制限にすると、900株保有・当日出来高1,000株・
+    参加率上限10%でも全量売れる計算になる。損切りを出しても売り切れない
+    状況こそが薄商い銘柄のリスクなので、そこを消してはいけない。
+    """
+
+    def _intent(self, order_type="MARKET", trigger=None):
+        return policy.ExitIntent(
+            reason="test", trigger_price=trigger, order_type=order_type)
+
+    def test_market_exit_is_capped_by_volume(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.1))
+        res = execution.exit_fill_limited(
+            self._intent(), _bar(), _bar(date(2026, 9, 3)), 900,
+            _costs(), budget, symbol="7203", volume=1_000)
+        # 1,000株の10% = 100株まで
+        assert res.filled_quantity == 100
+        assert res.requested_quantity == 900
+        assert res.unfilled_reason is not None
+        assert res.fill.quantity == 100
+
+    def test_stop_exit_is_capped_by_volume(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.1))
+        res = execution.exit_fill_limited(
+            self._intent("STOP", trigger=950.0), _bar(), None, 900,
+            _costs(), budget, symbol="7203", volume=1_000)
+        assert res.filled_quantity == 100
+        assert res.fill is not None
+
+    def test_unlimited_sells_everything(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.0))
+        res = execution.exit_fill_limited(
+            self._intent(), _bar(), _bar(date(2026, 9, 3)), 900,
+            _costs(), budget, symbol="7203", volume=10)
+        assert res.filled_quantity == 900
+        assert res.unfilled_reason is None
+
+    def test_returns_unfilled_when_below_one_lot(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.01))
+        res = execution.exit_fill_limited(
+            self._intent(), _bar(), _bar(date(2026, 9, 3)), 900,
+            _costs(), budget, symbol="7203", volume=1_000)
+        # 1,000の1% = 10株 → 単元(100株)未満
+        assert res.fill is None
+        assert res.filled_quantity == 0
+        assert "単元" in res.unfilled_reason
+
+    def test_market_exit_without_next_bar_is_unfilled(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.1))
+        res = execution.exit_fill_limited(
+            self._intent(), _bar(), None, 900,
+            _costs(), budget, symbol="7203", volume=10_000)
+        assert res.fill is None
+        assert res.filled_quantity == 0
+
+
+class TestVolumeBudgetIsSharedBetweenBuysAndSells:
+    """同じ営業日・同じ銘柄の枠は買いと売りで共有する（規約の固定）。"""
+
+    def test_a_sell_consumes_the_budget_a_later_sell_sees(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.1))
+        first = budget.allow("7203", 10_000, 600)
+        second = budget.allow("7203", 10_000, 600)
+        assert first == 600          # 枠1,000株のうち600株
+        assert second == 400         # 残り400株
+        assert budget.allow("7203", 10_000, 100) == 0   # 使い切り
+
+    def test_budgets_are_per_symbol(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.1))
+        assert budget.allow("7203", 10_000, 1_000) == 1_000
+        assert budget.allow("9984", 10_000, 1_000) == 1_000
+
+    def test_allowance_is_floored_to_lots(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.1))
+        # 1,550株の10% = 155株 → 単元切り捨てで100株
+        assert budget.allow("7203", 1_550, 1_000) == 100
+
+    def test_remaining_is_none_when_unlimited(self):
+        budget = execution.VolumeBudget(_liquidity(share=0.0))
+        assert budget.unlimited() is True
+        assert budget.remaining("7203") is None
+        assert budget.allow("7203", 1, 99_999) == 99_999
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -1354,12 +1624,114 @@ def entry_fill_limited(next_bar: Observation, quantity: int, costs: CostConfig,
         filled_quantity=fillable,
         unfilled_reason=reason,
     )
+
+
+class VolumeBudget:
+    """同じ営業日・同じ銘柄の出来高枠を、買いと売りで共有する台帳。
+
+    出来高の制約は「その日その銘柄で自分が動かせる株数の上限」であって、
+    買い専用の枠ではない。買いだけに掛けて売りを無制限にすると、
+    900株保有・当日出来高1,000株・参加率上限10%でも全量売れてしまう
+    （外部レビューR09）。
+
+    **共有の規約**: 枠は `int(volume * max_volume_share)` を単元へ切り捨てた
+    株数。walk-forward の1営業日の中で、操作が起きた順（退出→買い→
+    ストップ退出）に消費する。順序を決めておかないと、同じ入力で結果が
+    変わる。枠を使い切った後の注文は未約定として理由付きで記録し、
+    翌営業日へ持ち越す判断は呼び出し側が行う。
+
+    可変オブジェクトである点に注意。1営業日ぶんを1インスタンスで使い、
+    日をまたいで持ち回らない。
+    """
+
+    def __init__(self, liquidity: LiquidityConfig):
+        self._share = liquidity.max_volume_share
+        self._remaining: dict = {}
+
+    def unlimited(self) -> bool:
+        return self._share <= 0
+
+    def allow(self, symbol: str, volume: int, quantity: int) -> int:
+        """`symbol` で `quantity` 株のうち何株まで動かせるかを返し、枠を減らす。
+
+        単元未満は返さない（0 になる）。
+        """
+        if self.unlimited():
+            return quantity
+        if symbol not in self._remaining:
+            allowed = int(max(0, volume) * self._share)
+            self._remaining[symbol] = (allowed // LOT_SIZE) * LOT_SIZE
+        fillable = min(quantity, self._remaining[symbol])
+        fillable = (fillable // LOT_SIZE) * LOT_SIZE
+        if fillable < LOT_SIZE:
+            return 0
+        self._remaining[symbol] -= fillable
+        return fillable
+
+    def remaining(self, symbol: str) -> Optional[int]:
+        """残り枠（無制限なら None）。テストと明細の記録に使う。"""
+        if self.unlimited():
+            return None
+        return self._remaining.get(symbol)
+
+
+def exit_fill_limited(intent: ExitIntent, bar: Observation,
+                      next_bar: Optional[Observation], quantity: int,
+                      costs: CostConfig, budget: VolumeBudget, *,
+                      symbol: str, volume: int) -> FillResult:
+    """出来高の制約を織り込んで退出を約定させる。
+
+    約定価格の規約は exit_fill() と同じ（STOPは基準線とギャップの安いほう、
+    MARKETは翌寄り）。違うのは「いくつ売れたか」だけ。
+    段階B前半の exit_fill() は挙動を変えない（dataset.py が依存しているため）。
+
+    売れ残りは `requested_quantity - filled_quantity` として返す。
+    保有を減らさずに残し、退出意図を翌営業日へ持ち越すのは呼び出し側の仕事。
+    損切りを出しても全量は売れない状況を、黙って全量売却にしない
+    （外部レビューR09）。
+    """
+    # ExitIntent は銘柄を持たない（退出の意図だけを表す型）。枠は銘柄ごとなので
+    # 呼び出し側から symbol を受け取る。
+    fillable = budget.allow(symbol, volume, quantity)
+    if fillable < LOT_SIZE:
+        return FillResult(
+            fill=None,
+            requested_quantity=quantity,
+            filled_quantity=0,
+            unfilled_reason=(
+                f"出来高{volume:,}株の枠では単元({LOT_SIZE}株)に満たないため"
+                f"売却できません"
+            ),
+        )
+
+    fill = exit_fill(intent, bar, next_bar, fillable, costs)
+    if fill is None:
+        return FillResult(
+            fill=None, requested_quantity=quantity, filled_quantity=0,
+            unfilled_reason="翌営業日の足が無く成行退出を約定できません",
+        )
+
+    reason = None
+    if fillable < quantity:
+        reason = (
+            f"出来高の枠まで（{quantity:,}株のうち{fillable:,}株を売却）"
+        )
+    return FillResult(
+        fill=fill,
+        requested_quantity=quantity,
+        filled_quantity=fillable,
+        unfilled_reason=reason,
+    )
 ```
+
+`ExitIntent`（段階B前半）は `reason` / `trigger_price` / `order_type` だけを
+持ち、銘柄を持たない。出来高枠は銘柄ごとなので `symbol` はキーワード引数で
+受け取る。
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_execution_limits.py -v`
-Expected: PASS（11件）
+Expected: PASS（22件）
 
 - [ ] **Step 5: 段階B前半のテストが壊れていないことを確認**
 

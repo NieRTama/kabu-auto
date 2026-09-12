@@ -50,9 +50,14 @@
 **Interfaces:**
 - Consumes: `indicators.FEATURE_COLS`
 - Produces:
-  - `ModelMeta`（frozen dataclass）: `model_id` / `trained_at` / `training_window_sessions` / `symbols` / `label_definition` / `feature_cols` / `positive_rate` / `fold_results` / `code_version` / `lightgbm_version` / `dataset_id`
-  - `save_candidate(model, meta: ModelMeta, *, base_dir: str = "models") -> Path`
-  - `load_model(model_id: str, *, base_dir: str = "models") -> tuple[object, ModelMeta]`
+  - `ModelMeta`（frozen dataclass）: `model_id` / `trained_at` / `training_window_sessions` / `symbols` / `label_definition` / `feature_cols` / `positive_rate` / `fold_results` / `code_version` / `lightgbm_version` / `dataset_id` / `model_kind` / `label_contract_id`
+  - `KIND_BOOSTER = "lightgbm_booster"` / `KIND_CONSTANT = "constant"` — 保存形式
+  - `CandidateExists(FileExistsError)` — 既存 model_id への再保存
+  - `ConstantModel(probability)` — 単一クラス学習の結果。`predict(X)` を持つ
+  - `save_candidate(model, meta: ModelMeta, *, base_dir: str = "models") -> Path` — 既存IDは `CandidateExists`。一時ディレクトリへ全成果物を書き、読み直して検証してから `os.replace()` で公開する
+  - `load_model(model_id: str, *, base_dir: str = "models") -> tuple[object, ModelMeta]` — 戻り値のモデルは `lgb.Booster` か `ConstantModel`。どちらも `predict(X) -> 1次元配列`
+
+**保存できるモデル型（`_extract_artifact`）:** ①段階Cのラッパー（`is_constant` / `constant_probability` / `booster` を公開するもの）②`booster_` を持つ scikit-learn API のモデル ③`lgb.Booster`。それ以外は `TypeError`。**握り潰さない**（外部レビューR02）。
   - `read_meta(model_id: str, *, base_dir: str = "models") -> ModelMeta`
   - `candidate_dir(model_id, base_dir) -> Path` / `current_ref_path(base_dir) -> Path`
 
@@ -188,6 +193,138 @@ class TestLoadModel:
     def test_missing_model_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             ms.load_model("nope", base_dir=str(tmp_path))
+
+
+class TestSaveWrapperModels:
+    """段階Cのラッパー型がそのまま保存できること（外部レビューR02）。
+
+    `CurrentLightGBM` は `_model` と `predict_proba()` しか持たない。
+    `getattr(model, "booster_", model).save_model(...)` という書き方だと
+    AttributeError になり、それを握り潰した呼び出し側が
+    「保存できていないのに学習成功」と扱ってしまう。
+    """
+
+    def _wrapper(self, single_class=False):
+        from src.strategy.evaluation import CurrentLightGBM
+        rng = np.random.default_rng(1)
+        X = pd.DataFrame({"f1": rng.normal(0, 1, 200), "f2": rng.normal(0, 1, 200)})
+        y = pd.Series(np.ones(200, dtype=int) if single_class
+                      else (X["f1"] > 0).astype(int))
+        m = CurrentLightGBM()
+        m.fit(X, y, np.ones(len(X)))
+        return m, X
+
+    def test_saves_a_two_class_wrapper(self, tmp_path):
+        model, X = self._wrapper()
+        path = ms.save_candidate(model, _meta("w0001"), base_dir=str(tmp_path))
+        assert (path / "model.txt").exists()
+        meta = ms.read_meta("w0001", base_dir=str(tmp_path))
+        assert meta.model_kind == ms.KIND_BOOSTER
+
+    def test_wrapper_round_trip_preserves_predictions(self, tmp_path):
+        model, X = self._wrapper()
+        before = model.predict_proba(X)
+        ms.save_candidate(model, _meta("w0001"), base_dir=str(tmp_path))
+        loaded, _ = ms.load_model("w0001", base_dir=str(tmp_path))
+        assert np.allclose(before, loaded.predict(X), atol=1e-9)
+
+    def test_saves_a_constant_model_without_a_booster(self, tmp_path):
+        """単一クラスの学習結果には Booster が無い。定数として保存する"""
+        model, X = self._wrapper(single_class=True)
+        assert model.is_constant is True
+        path = ms.save_candidate(model, _meta("c0001"), base_dir=str(tmp_path))
+        assert (path / "constant.json").exists()
+        assert not (path / "model.txt").exists()
+        meta = ms.read_meta("c0001", base_dir=str(tmp_path))
+        assert meta.model_kind == ms.KIND_CONSTANT
+
+    def test_constant_model_round_trip_preserves_predictions(self, tmp_path):
+        model, X = self._wrapper(single_class=True)
+        before = model.predict_proba(X)
+        ms.save_candidate(model, _meta("c0001"), base_dir=str(tmp_path))
+        loaded, _ = ms.load_model("c0001", base_dir=str(tmp_path))
+        after = loaded.predict(X)
+        assert np.allclose(before, after, atol=1e-12)
+        assert len(after) == len(X)
+
+    def test_unsupported_type_raises_instead_of_silently_failing(self, tmp_path):
+        class NotAModel:
+            def predict_proba(self, X):
+                return None
+
+        with pytest.raises(TypeError, match="保存できないモデル型"):
+            ms.save_candidate(NotAModel(), _meta("x0001"), base_dir=str(tmp_path))
+        # 失敗したときにディレクトリを残さない
+        assert not (Path(tmp_path) / "candidates" / "x0001").exists()
+
+
+class TestCandidateDirectoriesAreImmutable:
+    """候補ディレクトリは不変であること（外部レビューR12）。
+
+    `exist_ok=True` で既存を受け入れて中身を上書きすると、そのIDを
+    current や rollback 先が指していた場合に**昇格操作なしで実体が
+    入れ替わる**。
+    """
+
+    def test_rejects_a_second_save_with_the_same_id(self, tmp_path):
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        with pytest.raises(ms.CandidateExists):
+            ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+
+    def test_the_original_files_are_untouched_after_a_rejected_save(self, tmp_path):
+        model, X = _trained_model()
+        path = ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        original = (path / "model.txt").read_bytes()
+
+        other, _ = _trained_model()
+        with pytest.raises(ms.CandidateExists):
+            ms.save_candidate(other, _meta("m0001"), base_dir=str(tmp_path))
+        assert (path / "model.txt").read_bytes() == original
+
+    def test_the_model_current_points_at_cannot_be_replaced(self, tmp_path):
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        before = ms.load_model("m0001", base_dir=str(tmp_path))[0].model_to_string()
+
+        with pytest.raises(ms.CandidateExists):
+            ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        after = ms.load_model("m0001", base_dir=str(tmp_path))[0].model_to_string()
+        assert before == after
+
+    def test_a_failure_after_writing_the_model_leaves_nothing_behind(self, tmp_path):
+        """モデル保存後にメタの書き込みが落ちても、公開されない"""
+        model, _ = _trained_model()
+        import src.strategy.model_store as mod
+
+        original = mod._meta_to_json
+
+        def boom(meta):
+            raise OSError("ディスクが一杯です")
+
+        mod._meta_to_json = boom
+        try:
+            with pytest.raises(OSError):
+                ms.save_candidate(model, _meta("m0009"), base_dir=str(tmp_path))
+        finally:
+            mod._meta_to_json = original
+
+        assert not (Path(tmp_path) / "candidates" / "m0009").exists()
+        # 一時ディレクトリも残さない
+        leftovers = list((Path(tmp_path) / "candidates").glob(".m0009.*"))
+        assert leftovers == []
+
+    def test_publishing_is_all_or_nothing(self, tmp_path):
+        """公開されたディレクトリには必ずメタと本体が揃っている"""
+        model, _ = _trained_model()
+        path = ms.save_candidate(model, _meta("m0010"), base_dir=str(tmp_path))
+        assert (path / "meta.json").exists()
+        assert (path / "model.txt").exists()
+        # 読み直せる（保存時に検証済み）
+        loaded, meta = ms.load_model("m0010", base_dir=str(tmp_path))
+        assert meta.model_id == "m0010"
+        assert loaded is not None
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -219,19 +356,27 @@ pickle は信頼できないデータのロードで任意コードを実行し�
 """
 import json
 import os
+import shutil
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import lightgbm as lgb
+import numpy as np
 from loguru import logger
 
 CURRENT_REF = "current.json"
 CANDIDATES_DIR = "candidates"
 MODEL_FILE = "model.txt"
 META_FILE = "meta.json"
+CONSTANT_FILE = "constant.json"
+
+# 保存形式。二値がそろったモデルと、単一クラス時の定数モデルを区別する
+# （定数モデルには Booster が存在しない・外部レビューR02）。
+KIND_BOOSTER = "lightgbm_booster"
+KIND_CONSTANT = "constant"
 
 
 @dataclass(frozen=True)
@@ -253,6 +398,11 @@ class ModelMeta:
     code_version: Optional[str] = None
     lightgbm_version: Optional[str] = None
     dataset_id: Optional[str] = None
+    # 保存形式。save_candidate() が書き込み時に確定させる
+    model_kind: str = KIND_BOOSTER
+    # ラベル契約ID（段階B後半 dataset.make_label_contract_id）。
+    # このモデルがどう作られたラベルで学習されたかを固定する
+    label_contract_id: Optional[str] = None
 
 
 def candidate_dir(model_id: str, base_dir: str = "models") -> Path:
@@ -275,21 +425,88 @@ def _meta_from_json(text: str) -> ModelMeta:
     return ModelMeta(**payload)
 
 
+class CandidateExists(FileExistsError):
+    """同じ model_id の候補が既に存在する。"""
+
+
+def _extract_artifact(model) -> tuple:
+    """モデルから保存形式を取り出す。`(kind, payload)` を返す。
+
+    段階Cの `_LightGbmBase` 系ラッパーは `_model` と `predict_proba()` しか
+    持たず、`booster_` も `save_model()` も無い。`getattr(model, "booster_",
+    model).save_model(...)` のような書き方は AttributeError になり、
+    それを握り潰すと**保存できていないのに学習成功として扱われる**
+    （外部レビューR02）。保存できる形は次の3つだけと決め、
+    それ以外は**その場で例外にする**。
+
+      1. 段階Cのラッパー … `is_constant` / `constant_probability` / `booster`
+      2. scikit-learn API の LGBMClassifier … `booster_`
+      3. `lgb.Booster` そのもの
+
+    単一クラスしか見なかった定数モデルには Booster が存在しない。
+    「二値がそろったモデル」と「定数モデル」で保存方式を分ける。
+    """
+    if hasattr(model, "is_constant"):
+        if model.is_constant:
+            return KIND_CONSTANT, float(model.constant_probability)
+        booster = model.booster
+        if booster is None:
+            raise TypeError(
+                "is_constant=False なのに booster が None です: "
+                f"{type(model).__name__}")
+        return KIND_BOOSTER, booster
+    if hasattr(model, "booster_"):
+        return KIND_BOOSTER, model.booster_
+    if isinstance(model, lgb.Booster):
+        return KIND_BOOSTER, model
+    raise TypeError(
+        f"保存できないモデル型です: {type(model).__name__}。"
+        "is_constant/constant_probability/booster を公開するか、"
+        "booster_ を持つか、lgb.Booster であること")
+
+
 def save_candidate(model, meta: ModelMeta, *, base_dir: str = "models") -> Path:
     """学習結果を**候補として**保存する。現行は一切触らない。
 
-    LightGBMネイティブ形式で書く。scikit-learn API のモデルは
-    `booster_` を取り出して保存する。
+    **既存の model_id へは書かない。** 候補ディレクトリは不変である。
+    `exist_ok=True` で受け入れて中身を上書きすると、その ID を current や
+    rollback 先が指していた場合に**昇格操作なしで実体が入れ替わる**
+    （外部レビューR12）。同じIDでの再保存は `CandidateExists` にする。
+
+    **全成果物を一時ディレクトリへ書き、読み直して検証してから公開する。**
+    モデルを書いた後にメタの保存が失敗すると、中途半端なディレクトリが
+    残って「保存済みだが読めない候補」になる。公開は `os.replace()` に
+    よるディレクトリの原子的な差し替えで行う。
     """
-    path = candidate_dir(meta.model_id, base_dir)
-    path.mkdir(parents=True, exist_ok=True)
+    final = candidate_dir(meta.model_id, base_dir)
+    if final.exists():
+        raise CandidateExists(
+            f"この model_id の候補は既に存在します: {meta.model_id}。"
+            "候補は不変です。学習し直したなら新しいIDを付けてください")
 
-    booster = getattr(model, "booster_", model)
-    booster.save_model(str(path / MODEL_FILE))
-    (path / META_FILE).write_text(_meta_to_json(meta), encoding="utf-8")
+    final.parent.mkdir(parents=True, exist_ok=True)
+    kind, payload = _extract_artifact(model)
 
-    logger.info(f"候補モデルを保存: {meta.model_id} → {path}")
-    return path
+    staging = Path(tempfile.mkdtemp(prefix=f".{meta.model_id}.", dir=str(final.parent)))
+    try:
+        if kind == KIND_BOOSTER:
+            payload.save_model(str(staging / MODEL_FILE))
+        else:
+            (staging / CONSTANT_FILE).write_text(
+                json.dumps({"probability": payload}), encoding="utf-8")
+        stored = replace(meta, model_kind=kind)
+        (staging / META_FILE).write_text(_meta_to_json(stored), encoding="utf-8")
+
+        # 公開前に読み直して、実際に復元できることを確かめる
+        _load_from_dir(staging)
+
+        os.replace(str(staging), str(final))
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    logger.info(f"候補モデルを保存: {meta.model_id} → {final}（{kind}）")
+    return final
 
 
 def read_meta(model_id: str, *, base_dir: str = "models") -> ModelMeta:
@@ -299,23 +516,53 @@ def read_meta(model_id: str, *, base_dir: str = "models") -> ModelMeta:
     return _meta_from_json(path.read_text(encoding="utf-8"))
 
 
-def load_model(model_id: str, *, base_dir: str = "models") -> tuple:
-    """候補モデルを読み込む。(Booster, ModelMeta) を返す。
+class ConstantModel:
+    """単一クラスしか見なかった学習の結果。常に同じ確率を返す。
 
-    Booster.predict() は正例確率の1次元配列を返す（scikit-learn APIの
-    predict_proba()[:, 1] と同じ値）。
+    Booster が存在しないので、読み出し側が `predict()` を一様に呼べるよう
+    最小の互換型を置く。`lgb.Booster.predict()` と同じく、正例確率の
+    1次元配列を返す（外部レビューR02）。
     """
-    path = candidate_dir(model_id, base_dir) / MODEL_FILE
+
+    def __init__(self, probability: float):
+        self.probability = float(probability)
+
+    def predict(self, X, **kwargs):
+        return np.full(len(X), self.probability, dtype=float)
+
+
+def _load_from_dir(path: Path) -> tuple:
+    """ディレクトリから (モデル, ModelMeta) を復元する。
+
+    保存直後の検証にも使うので、`candidate_dir()` ではなく実パスを取る。
+    """
+    meta = _meta_from_json((path / META_FILE).read_text(encoding="utf-8"))
+    if meta.model_kind == KIND_CONSTANT:
+        payload = json.loads((path / CONSTANT_FILE).read_text(encoding="utf-8"))
+        return ConstantModel(payload["probability"]), meta
+    model_path = path / MODEL_FILE
+    if not model_path.exists():
+        raise FileNotFoundError(f"モデルが見つかりません: {model_path}")
+    return lgb.Booster(model_file=str(model_path)), meta
+
+
+def load_model(model_id: str, *, base_dir: str = "models") -> tuple:
+    """候補モデルを読み込む。(モデル, ModelMeta) を返す。
+
+    モデルは `lgb.Booster` か `ConstantModel`。どちらも
+    `predict(X) -> 正例確率の1次元配列` を持つ（scikit-learn APIの
+    `predict_proba()[:, 1]` と同じ値）。読み出し側は型で分岐しない。
+    """
+    path = candidate_dir(model_id, base_dir)
     if not path.exists():
-        raise FileNotFoundError(f"モデルが見つかりません: {path}")
-    booster = lgb.Booster(model_file=str(path))
-    return booster, read_meta(model_id, base_dir=base_dir)
+        raise FileNotFoundError(f"候補が見つかりません: {path}")
+    return _load_from_dir(path)
 ```
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_model_store.py -v`
-Expected: PASS（9件）
+Expected: PASS（22件）
 
 - [ ] **Step 5: BOM確認とコミット**
 
@@ -619,10 +866,13 @@ EOF
 **Interfaces:**
 - Consumes: Task 1・2、`evaluation.load_prediction_details`
 - Produces:
-  - `ModelPromotion` モデル: `model_id` / `evaluation_run_id` / `decided_by` / `reason` / `previous_model_id` / `switched_at`
+  - `ModelPromotion` モデル: `model_id` / `evaluation_run_id` / `decided_by` / `reason` / `previous_model_id` / `state` / `switched_at`
+  - `PROMOTION_PENDING` / `PROMOTION_COMMITTED` / `PROMOTION_FAILED`
+  - `recover_promotions(*, base_dir="models") -> list` — 起動時に未決着の昇格を参照の実体と突き合わせて閉じる。**自動で参照は書き換えない**
+  - `promotion_history(*, limit=50) -> list`
   - `PromotionCheck`（frozen dataclass）: `ok: bool`, `blockers: list`
   - `check_promotable(model_id, *, evaluation_run_id, degraded, base_dir, expected_feature_cols) -> PromotionCheck`
-  - `promote(model_id, *, evaluation_run_id, decided_by, reason, degraded, base_dir, expected_feature_cols) -> int` — 昇格して `ModelPromotion.id` を返す
+  - `promote(model_id, *, evaluation_run_id, decided_by, reason, degraded, base_dir, expected_feature_cols) -> int` — **2段階で切り替える**（pending記録 → 参照切替 → committed確定）。切替に失敗したら failed で閉じて送出する。`ModelPromotion.id` を返す
 
 **昇格不可の条件（spec §9）:**
 
@@ -682,14 +932,48 @@ def _saved_model(tmp_path, model_id="m0001", feature_cols=("f1", "f2")):
     return model_id
 
 
-def _recorded_evaluation(run_id="run1", model_id="m0001"):
+_LC = "testcontract"
+
+
+def _recorded_evaluation(run_id="run1", model_id="m0001", *,
+                         resolved=True, purpose=None, degraded=False):
+    """評価実行を1件ぶん保存する。
+
+    **予測・実績・実行記録の3つを揃える。** 予測だけを保存した状態を
+    「評価済み」と呼ばないため（外部レビューR13）。
+    `resolved=False` で実績を保存しない状態を作れる。
+    """
+    from src.strategy.evaluation import (
+        PURPOSE_SHADOW, PURPOSE_VALIDATION, RunConfig, save_evaluation_run,
+        save_outcomes, save_predictions)
+
+    purpose = purpose or PURPOSE_VALIDATION
     preds = pd.DataFrame({
         "event_id": ["7203:20260105"],
+        "label_contract_id": [_LC],
         "raw_probability": [0.6],
         "calibrated_probability": [0.55],
-        "fold_index": [0],
+        "fold_index": [0 if purpose == PURPOSE_VALIDATION else -1],
     })
-    evaluation.save_predictions(preds, run_id, model_id)
+    save_predictions(preds, run_id, model_id, purpose=purpose)
+
+    if resolved:
+        events = pd.DataFrame({
+            "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
+            "status": ["resolved"],
+            "label": [1],
+            "net_return": [0.03],
+        })
+        save_outcomes(events)
+
+    save_evaluation_run(
+        run_id,
+        RunConfig(dataset_id="ds0001", label_contract_id=_LC,
+                  feature_version="f1", execution_model_version="t1_open_v1",
+                  code_version="abc1234", config_json="{}", config_hash="cfg1"),
+        purpose=purpose, model_id=model_id, n_folds=1, n_predictions=1,
+        degraded_reasons=(["推論に失敗しました"] if degraded else []))
 
 
 class TestPromotionBlockers:
@@ -828,6 +1112,184 @@ class TestPromote:
             promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
                               reason="", degraded=False, base_dir=str(tmp_path),
                               expected_feature_cols=["f1", "f2"])
+
+
+class TestUnresolvedEvaluationBlocksPromotion:
+    """予測だけでは「評価済み」にしない（外部レビューR13）。
+
+    `load_prediction_details()` は実績が無くても行を返す。行数だけを
+    見る条件では、ラベルが全て未確定の shadow 予測でも昇格できてしまう。
+    """
+
+    def test_predictions_without_outcomes_block_promotion(self, isolated_db, tmp_path):
+        _saved_model(tmp_path)
+        _recorded_evaluation(resolved=False)
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("実績が1件も確定していません" in b for b in got.blockers)
+
+    def test_shadow_only_blocks_promotion(self, isolated_db, tmp_path):
+        from src.strategy.evaluation import PURPOSE_SHADOW
+        _saved_model(tmp_path)
+        _recorded_evaluation(purpose=PURPOSE_SHADOW)
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("shadow" in b for b in got.blockers)
+
+    def test_stored_degraded_blocks_even_when_the_caller_says_otherwise(
+            self, isolated_db, tmp_path):
+        """呼び出し側の bool ではなく保存済みの実行記録を根拠にする"""
+        _saved_model(tmp_path)
+        _recorded_evaluation(degraded=True)
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,   # 嘘の申告
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("保存済みの実行記録が degraded" in b for b in got.blockers)
+
+    def test_missing_run_record_blocks_promotion(self, isolated_db, tmp_path):
+        """予測明細はあるが実行記録が無い → 何を測ったのか復元できない"""
+        from src.strategy.evaluation import save_predictions
+        _saved_model(tmp_path)
+        save_predictions(pd.DataFrame({
+            "event_id": ["7203:20260105"], "label_contract_id": [_LC],
+            "raw_probability": [0.6], "calibrated_probability": [0.55],
+            "fold_index": [0]}), "run1", "m0001")
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("評価実行の記録がありません" in b for b in got.blockers)
+
+    def test_run_for_a_different_model_blocks_promotion(self, isolated_db, tmp_path):
+        _saved_model(tmp_path, model_id="m0002")
+        _recorded_evaluation(model_id="m0001")
+        got = promotion.check_promotable(
+            "m0002", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("別のモデル" in b for b in got.blockers)
+
+    def test_a_fully_resolved_validation_run_is_promotable(self, isolated_db, tmp_path):
+        _saved_model(tmp_path)
+        _recorded_evaluation()
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is True, got.blockers
+
+
+class TestPromotionIsRecoverable:
+    """切替の途中で落ちても決着できること（外部レビューR11）。
+
+    参照ファイルの原子的置換は、DBを含む取引の原子性ではない。
+    「参照は新モデルなのに昇格記録が無い」状態を作らないため、
+    昇格の意図を先に永続化し、切替後に確定させる。
+    """
+
+    def _ready(self, tmp_path, model_id="m0001"):
+        _saved_model(tmp_path, model_id=model_id)
+        _recorded_evaluation(model_id=model_id)
+
+    def test_successful_promotion_is_committed(self, isolated_db, tmp_path):
+        self._ready(tmp_path)
+        pid = promotion.promote(
+            "m0001", evaluation_run_id="run1", decided_by="g", reason="ok",
+            degraded=False, base_dir=str(tmp_path),
+            expected_feature_cols=["f1", "f2"])
+        with get_session() as session:
+            row = session.get(db.ModelPromotion, pid)
+            assert row.state == promotion.PROMOTION_COMMITTED
+            assert row.switched_at is not None
+
+    def test_a_failed_switch_is_recorded_as_failed(self, isolated_db, tmp_path):
+        """参照の切替に失敗しても、記録だけが committed で残らない"""
+        self._ready(tmp_path)
+
+        def boom(*args, **kwargs):
+            raise OSError("参照ファイルを書けません")
+
+        original = ms.set_current
+        ms.set_current = boom
+        try:
+            with pytest.raises(OSError):
+                promotion.promote(
+                    "m0001", evaluation_run_id="run1", decided_by="g",
+                    reason="ok", degraded=False, base_dir=str(tmp_path),
+                    expected_feature_cols=["f1", "f2"])
+        finally:
+            ms.set_current = original
+
+        with get_session() as session:
+            row = session.scalar(select(db.ModelPromotion))
+        assert row.state == promotion.PROMOTION_FAILED
+        assert row.switched_at is None
+        # 現行は切り替わっていない
+        assert ms.read_current(base_dir=str(tmp_path)) is None
+
+    def test_recovery_commits_a_pending_row_whose_switch_actually_happened(
+            self, isolated_db, tmp_path):
+        """切替後・確定前に落ちた場合 → 実体に合わせて committed にする"""
+        self._ready(tmp_path)
+        with get_session() as session:
+            row = db.ModelPromotion(
+                model_id="m0001", evaluation_run_id="run1", decided_by="g",
+                reason="ok", previous_model_id=None,
+                state=promotion.PROMOTION_PENDING, switched_at=None)
+            session.add(row)
+            session.commit()
+            pid = row.id
+        ms.set_current("m0001", base_dir=str(tmp_path))   # 切替は完了していた
+
+        resolved = promotion.recover_promotions(base_dir=str(tmp_path))
+        assert len(resolved) == 1
+        assert resolved[0]["resolved_to"] == promotion.PROMOTION_COMMITTED
+        with get_session() as session:
+            assert session.get(db.ModelPromotion, pid).state == \
+                promotion.PROMOTION_COMMITTED
+
+    def test_recovery_fails_a_pending_row_whose_switch_never_happened(
+            self, isolated_db, tmp_path):
+        """切替前に落ちた場合 → failed にする。参照は触らない"""
+        self._ready(tmp_path)
+        with get_session() as session:
+            row = db.ModelPromotion(
+                model_id="m0001", evaluation_run_id="run1", decided_by="g",
+                reason="ok", previous_model_id=None,
+                state=promotion.PROMOTION_PENDING, switched_at=None)
+            session.add(row)
+            session.commit()
+            pid = row.id
+
+        resolved = promotion.recover_promotions(base_dir=str(tmp_path))
+        assert resolved[0]["resolved_to"] == promotion.PROMOTION_FAILED
+        with get_session() as session:
+            assert session.get(db.ModelPromotion, pid).state == \
+                promotion.PROMOTION_FAILED
+        # 参照は書き換えない（自動でやり直さない）
+        assert ms.read_current(base_dir=str(tmp_path)) is None
+
+    def test_recovery_is_idempotent(self, isolated_db, tmp_path):
+        self._ready(tmp_path)
+        promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+        assert promotion.recover_promotions(base_dir=str(tmp_path)) == []
+        assert promotion.recover_promotions(base_dir=str(tmp_path)) == []
+
+    def test_no_committed_row_without_a_switched_at(self, isolated_db, tmp_path):
+        """不変条件: committed なら切替時刻が必ずある"""
+        self._ready(tmp_path)
+        promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+        for row in promotion.promotion_history():
+            if row.state == promotion.PROMOTION_COMMITTED:
+                assert row.switched_at is not None
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -853,9 +1315,17 @@ class ModelPromotion(Base):
     decided_by = Column(String(64))
     reason = Column(Text)
     previous_model_id = Column(String(64))
-    switched_at = Column(DateTime, default=clock.now)
+    # 参照の切替が完了したか。pending / committed / failed。
+    # 参照ファイルとDBは別の永続化先なので、片方だけが進んだ状態が
+    # 起こりうる。それを検出して決着できるように持つ（外部レビューR11）。
+    state = Column(String(16), default="committed")
+    # 実際に切り替わった時刻。pending / failed では None
+    switched_at = Column(DateTime)
 
-    __table_args__ = (Index("ix_model_promotions_model_id", "model_id"),)
+    __table_args__ = (
+        Index("ix_model_promotions_model_id", "model_id"),
+        Index("ix_model_promotions_state", "state"),
+    )
 ```
 
 - [ ] **Step 4: 実装を書く**
@@ -894,13 +1364,25 @@ def check_promotable(model_id: str, *, evaluation_run_id: Optional[str],
                      expected_feature_cols: list) -> PromotionCheck:
     """昇格不可の条件を検査する（spec §9）。
 
-    - degraded な実行: 推論例外が起きた実行の成績は比較に使えない
+    - degraded な実行: 推論例外が起きた実行・再学習が結線されていない
+      診断実行の成績は比較に使えない。**呼び出し側の bool ではなく
+      保存済みの実行記録から読む**（外部レビューR13）
     - 未評価: 何を根拠に昇格するのかが残らない
+    - **実績が未確定**: 予測明細の行数だけでは「評価済み」と言えない。
+      `load_prediction_details()` は実績が無くても行を返すので、
+      ラベルが全て未確定の shadow 予測でも行数条件は通ってしまう
+    - **shadow だけ**: 並行記録は現行と候補の比較であって評価ではない
+    - 評価実行と候補モデルの食い違い、ラベル契約の食い違い
     - 特徴量定義の不一致: ラベルや特徴量が変わったモデルを黙って現行にすると、
       同じ数字が別の意味になる
-    """
-    from src.strategy.evaluation import load_prediction_details
 
+    引数の `degraded` は**補助的な早期拒否**としてのみ使う。保存状態と
+    食い違う場合は保存状態を優先する。
+    """
+    from src.strategy.evaluation import (
+        PURPOSE_SHADOW, load_evaluation_run, load_prediction_details)
+
+    _load_run = load_evaluation_run
     blockers: list = []
 
     try:
@@ -915,10 +1397,49 @@ def check_promotable(model_id: str, *, evaluation_run_id: Optional[str],
     if not evaluation_run_id:
         blockers.append("未評価です（evaluation_run_id がありません）")
     else:
+        # 保存済みの実行記録を根拠にする。呼び出し側が渡した degraded を
+        # そのまま信じない（外部レビューR13）
+        run = _load_run(evaluation_run_id)
+        if run is None:
+            blockers.append(
+                f"評価実行の記録がありません（evaluation_run_id={evaluation_run_id}）")
+        else:
+            if run.degraded:
+                blockers.append(
+                    "保存済みの実行記録が degraded です。その成績は昇格の根拠にできません")
+            if run.model_id and run.model_id != model_id:
+                blockers.append(
+                    f"評価実行が別のモデルのものです: 実行={run.model_id} 候補={model_id}")
+            if run.label_contract_id and meta.label_contract_id                     and run.label_contract_id != meta.label_contract_id:
+                blockers.append(
+                    "ラベル契約が一致しません: "
+                    f"実行={run.label_contract_id} モデル={meta.label_contract_id}")
+
         details = load_prediction_details(evaluation_run_id, model_id=model_id)
         if len(details) == 0:
             blockers.append(
                 f"予測明細がありません（evaluation_run_id={evaluation_run_id}）")
+        else:
+            # **行数だけでは「評価済み」と言えない。**
+            # load_prediction_details は実績が無くても行を返すので、
+            # ラベルが全て未確定の shadow 予測でもこの条件を通せてしまう
+            # （外部レビューR13）。実績の確定を根拠にする。
+            resolved = details["actual_label"].notna()
+            if not resolved.any():
+                blockers.append(
+                    "実績が1件も確定していません（予測だけでは成績を測れません）")
+
+            purposes = set(details["purpose"].dropna().astype(str))
+            if purposes and purposes <= {PURPOSE_SHADOW}:
+                blockers.append(
+                    "shadow記録だけでは昇格できません"
+                    "（並行記録は現行と候補の比較であって評価ではありません）")
+
+            unresolved = int((~resolved).sum())
+            if unresolved:
+                logger.info(
+                    f"昇格検査: 未確定の予測が{unresolved}件あります"
+                    f"（確定{int(resolved.sum())}件で判断します）")
 
     if list(meta.feature_cols) != list(expected_feature_cols):
         blockers.append(
@@ -927,6 +1448,89 @@ def check_promotable(model_id: str, *, evaluation_run_id: Optional[str],
         )
 
     return PromotionCheck(ok=not blockers, blockers=blockers)
+
+
+# 昇格の状態。参照の切替とDB記録は別の永続化先なので、片方だけが進んだ
+# 状態が起こりうる。それを**検出して決着できる**ようにする（外部レビューR11）。
+PROMOTION_PENDING = "pending"       # 記録済み。参照の切替はまだ
+PROMOTION_COMMITTED = "committed"   # 参照も切り替わった
+PROMOTION_FAILED = "failed"         # 切替に失敗。現行は前のまま
+
+
+def _close_promotion(promotion_id: int, state: str, *,
+                     switched_at: Optional[datetime]) -> None:
+    """昇格記録を確定させる。"""
+    from src.data.database import ModelPromotion, get_session
+
+    with get_session() as session:
+        row = session.get(ModelPromotion, promotion_id)
+        if row is None:
+            logger.error(f"昇格記録が見つかりません: id={promotion_id}")
+            return
+        row.state = state
+        row.switched_at = switched_at
+        session.commit()
+
+
+def recover_promotions(*, base_dir: str = "models") -> list:
+    """起動時に、決着していない昇格を実体と突き合わせて閉じる。
+
+    `promote()` は「記録(pending) → 参照切替 → 記録(committed)」の順で進む。
+    2と3の間でプロセスが落ちると pending が残る。このとき参照ファイルが
+    既に新モデルを指しているかどうかで、実際に切り替わったかが分かる。
+
+      - 参照が pending の model_id を指している → 切替は完了していた。committed
+      - 指していない → 切替前に落ちた。failed
+
+    **自動で参照を書き換えない。** 実体に合わせて記録のほうを直すだけである。
+    取引の履歴に関わる状態なので、勝手に「やり直す」ことはしない。
+    決着した件数と内容を返し、呼び出し側がユーザーへ報告する。
+
+    戻り値: `[{"promotion_id", "model_id", "resolved_to"}, ...]`
+    """
+    from src.data.database import ModelPromotion, get_session
+    from sqlalchemy import select as sa_select
+
+    ref = ms.read_current(base_dir=base_dir)
+    current_id = ref.model_id if ref else None
+
+    resolved = []
+    with get_session() as session:
+        rows = list(session.scalars(sa_select(ModelPromotion).where(
+            ModelPromotion.state == PROMOTION_PENDING)).all())
+        for row in rows:
+            if current_id == row.model_id:
+                row.state = PROMOTION_COMMITTED
+                row.switched_at = ref.switched_at
+                outcome = PROMOTION_COMMITTED
+            else:
+                row.state = PROMOTION_FAILED
+                row.switched_at = None
+                outcome = PROMOTION_FAILED
+            resolved.append({"promotion_id": row.id, "model_id": row.model_id,
+                             "resolved_to": outcome})
+        if rows:
+            session.commit()
+
+    for item in resolved:
+        logger.warning(
+            f"未決着の昇格を決着させました: {item['model_id']} "
+            f"→ {item['resolved_to']}（参照の実体に合わせました）")
+    return resolved
+
+
+def promotion_history(*, limit: int = 50) -> list:
+    """昇格履歴（新しい順）。pending が残っていれば混じる。"""
+    from src.data.database import ModelPromotion, get_session
+    from sqlalchemy import select as sa_select
+
+    with get_session() as session:
+        rows = list(session.scalars(
+            sa_select(ModelPromotion)
+            .order_by(ModelPromotion.id.desc()).limit(limit)).all())
+        for r in rows:
+            session.expunge(r)
+        return rows
 
 
 def promote(model_id: str, *, evaluation_run_id: Optional[str],
@@ -953,18 +1557,44 @@ def promote(model_id: str, *, evaluation_run_id: Optional[str],
     previous = ms.read_current(base_dir=base_dir)
     previous_id = previous.model_id if previous else None
 
-    # 参照の切替を先に行う。ここで落ちれば現行は前のまま残り、記録も残らない
-    ref = ms.set_current(model_id, base_dir=base_dir)
+    # ── 2段階で切り替える（外部レビューR11）──────────────────────────
+    #
+    # 参照の切替を先に行い、その後で履歴をcommitすると、DB書込みの失敗や
+    # 両処理の間でのプロセス停止によって「参照は新モデルなのに昇格記録が
+    # 無い」状態が残る。順序を逆にしても「記録はあるのに参照が古い」という
+    # 逆向きの不整合が残るだけで、解決しない。
+    #
+    # 参照ファイル単体の原子的置換（os.replace）は、DBを含む取引の
+    # 原子性ではない。**片方だけが進んだ状態を検出して決着できる**ように、
+    # 昇格の意図を先に永続化し、切替後に確定させる。
+    #
+    #   1. pending として記録（switched_at は None）
+    #   2. 参照を切り替える（os.replace）
+    #   3. committed へ更新
+    #
+    # 2と3の間で落ちた場合、起動時に pending が残る。
+    # `recover_promotions()` が参照の実体と突き合わせて決着させる。
 
     with get_session() as session:
         row = ModelPromotion(
             model_id=model_id, evaluation_run_id=evaluation_run_id,
             decided_by=decided_by, reason=reason,
-            previous_model_id=previous_id, switched_at=ref.switched_at,
+            previous_model_id=previous_id,
+            state=PROMOTION_PENDING, switched_at=None,
         )
         session.add(row)
         session.commit()
         promotion_id = row.id
+
+    try:
+        ref = ms.set_current(model_id, base_dir=base_dir)
+    except BaseException:
+        # 切替に失敗した。現行は前のまま。意図を失敗として閉じる
+        _close_promotion(promotion_id, PROMOTION_FAILED, switched_at=None)
+        raise
+
+    _close_promotion(promotion_id, PROMOTION_COMMITTED,
+                     switched_at=ref.switched_at)
 
     logger.warning(
         f"モデルを昇格: {previous_id} → {model_id}（判断者={decided_by}）")
@@ -1004,6 +1634,7 @@ EOF
 
 **Files:**
 - Create: `src/strategy/shadow.py`
+- Modify: `src/data/database.py`（`ShadowComparisonRow` を追加）
 - Test: `tests/test_shadow.py`
 
 **Interfaces:**
@@ -1011,12 +1642,52 @@ EOF
 - Produces:
   - `ShadowComparison`（frozen dataclass）: `event_id` / `current_probability` / `candidate_probability` / `current_takes` / `candidate_takes` / `agreement: str`
   - `compare(event_ids, features, *, current, candidate, threshold) -> list[ShadowComparison]`
-  - `record_shadow(comparisons, *, evaluation_run_id, candidate_model_id) -> int`
+  - `record_shadow(comparisons, *, evaluation_run_id, candidate_model_id, current_model_id, threshold, label_contract_id) -> int` — **比較そのもの**（両モデルID・両確率・閾値・採否・一致区分・ラベル契約）を保存する
+  - `load_shadow_comparisons(evaluation_run_id) -> pd.DataFrame` — 保存済みの比較を読み直す。ここから `disagreement_summary()` を再計算できることが並行記録の合格条件
+  - `ShadowComparisonRow` モデル: `evaluation_run_id` / `event_id` / `label_contract_id` / `current_model_id` / `candidate_model_id` / `current_probability` / `candidate_probability` / `threshold` / `current_takes` / `candidate_takes` / `agreement` / `recorded_at`
   - `disagreement_summary(comparisons) -> dict`
 
 **背景（spec §9）:** 同じ入力に対し現行と候補の判断を**並行記録する**。**候補は発注に繋がない。** 差が何によって生じたかを、見送った候補の結果も含めて記録する。
 
 **発注に繋がらないことの担保:** `shadow.py` は発注系モジュール（`src/execution/`）を import しない。これをテストで固定する。
+
+**保存先のテーブル。** `src/data/database.py` の `ModelPromotion` の直後に追加する。
+
+```python
+class ShadowComparisonRow(Base):
+    """shadow運用での「現行 vs 候補」の比較1件。
+
+    `Prediction` には候補の確率しか入らない。それだけでは再起動後に
+    「その時どちらを採り、なぜ見送ったか」を復元できない（外部レビューR21）。
+    **両モデルID・両確率・判断閾値・採否・一致区分**を同じ行に置く。
+
+    現行が未昇格のときも行は作る。`current_model_id` と
+    `current_probability` を NULL にして「現行が無かった」という状態を残す。
+    行ごと作らないと「比較しなかった」のか「現行が無かった」のかを
+    後から区別できない。
+    """
+    __tablename__ = "shadow_comparisons"
+    id = Column(Integer, primary_key=True)
+    evaluation_run_id = Column(String(64), nullable=False)
+    event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
+    current_model_id = Column(String(64))          # 未昇格なら NULL
+    candidate_model_id = Column(String(64), nullable=False)
+    current_probability = Column(Float)            # 未昇格なら NULL
+    candidate_probability = Column(Float, nullable=False)
+    threshold = Column(Float, nullable=False)
+    current_takes = Column(Integer, default=0)
+    candidate_takes = Column(Integer, default=0)
+    agreement = Column(String(24))
+    recorded_at = Column(DateTime, default=clock.now)
+
+    __table_args__ = (
+        Index("ix_shadow_comparisons_run", "evaluation_run_id"),
+        Index("ix_shadow_comparisons_event",
+              "evaluation_run_id", "label_contract_id", "event_id",
+              unique=True),
+    )
+```
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -1110,7 +1781,9 @@ class TestRecordShadow:
             current=_FixedModel([0.2]), candidate=_FixedModel([0.7]),
             threshold=0.5)
         n = shadow.record_shadow(comparisons, evaluation_run_id="shadow1",
-                                 candidate_model_id="m0002")
+                                 candidate_model_id="m0002",
+                                 current_model_id="m0001", threshold=0.5,
+                                 label_contract_id=_LC)
         assert n == 1
 
         with get_session() as session:
@@ -1126,7 +1799,9 @@ class TestRecordShadow:
             current=_FixedModel([0.2]), candidate=_FixedModel([0.7]),
             threshold=0.5)
         shadow.record_shadow(comparisons, evaluation_run_id="shadow1",
-                             candidate_model_id="m0002")
+                             candidate_model_id="m0002",
+                             current_model_id="m0001", threshold=0.5,
+                             label_contract_id=_LC)
         with get_session() as session:
             row = session.scalar(select(db.Prediction))
         assert row.fold_index == -1
@@ -1138,10 +1813,92 @@ class TestRecordShadow:
             current=_FixedModel([0.2]), candidate=_FixedModel([0.7]),
             threshold=0.5)
         shadow.record_shadow(comparisons, evaluation_run_id="shadow1",
-                             candidate_model_id="m0002")
+                             candidate_model_id="m0002",
+                             current_model_id="m0001", threshold=0.5,
+                             label_contract_id=_LC)
         with get_session() as session:
             outcomes = list(session.scalars(select(db.PredictionOutcome)).all())
         assert outcomes == []
+
+
+class TestShadowRecordsBothSides:
+    """比較そのものが保存されること（外部レビューR21）。
+
+    候補の確率だけを書くと、再起動後に「その時どちらを採り、なぜ見送ったか」
+    を復元できない。関数名や一時的な戻り値では並行記録にならない。
+    """
+
+    def _record(self, run_id="shadow1", current=_FixedModel([0.2]),
+                current_id="m0001"):
+        comparisons = shadow.compare(
+            ["a", "b"], _features(2),
+            current=current, candidate=_FixedModel([0.7, 0.3]),
+            threshold=0.5)
+        shadow.record_shadow(
+            comparisons, evaluation_run_id=run_id,
+            candidate_model_id="m0002", current_model_id=current_id,
+            threshold=0.5, label_contract_id=_LC)
+        return comparisons
+
+    def test_stores_both_model_ids_and_both_probabilities(self, isolated_db):
+        self._record(current=_FixedModel([0.2, 0.9]))
+        got = shadow.load_shadow_comparisons("shadow1")
+        assert len(got) == 2
+        assert set(got["current_model_id"]) == {"m0001"}
+        assert set(got["candidate_model_id"]) == {"m0002"}
+        assert got["current_probability"].notna().all()
+        assert got["candidate_probability"].notna().all()
+
+    def test_stores_the_threshold_and_the_decisions(self, isolated_db):
+        self._record(current=_FixedModel([0.2, 0.9]))
+        got = shadow.load_shadow_comparisons("shadow1").set_index("event_id")
+        assert set(got["threshold"]) == {0.5}
+        assert got.loc["a", "current_takes"] is False or             got.loc["a", "current_takes"] == False    # noqa: E712
+        assert got.loc["a", "candidate_takes"] == True   # noqa: E712
+        assert got.loc["b", "current_takes"] == True     # noqa: E712
+        assert got.loc["b", "candidate_takes"] == False  # noqa: E712
+
+    def test_the_summary_can_be_recomputed_from_the_database(self, isolated_db):
+        """再起動後に当時の比較内訳を復元できること（合格条件）"""
+        comparisons = self._record(current=_FixedModel([0.2, 0.9]))
+        expected = shadow.disagreement_summary(comparisons)
+
+        stored = shadow.load_shadow_comparisons("shadow1")
+        rebuilt = shadow.disagreement_summary([
+            shadow.ShadowComparison(
+                event_id=r["event_id"],
+                current_probability=r["current_probability"],
+                candidate_probability=r["candidate_probability"],
+                current_takes=bool(r["current_takes"]),
+                candidate_takes=bool(r["candidate_takes"]),
+                agreement=r["agreement"])
+            for _, r in stored.iterrows()])
+        assert rebuilt == expected
+
+    def test_records_the_unpromoted_current_as_its_own_state(self, isolated_db):
+        """現行が未昇格でも行は残す
+
+        行を作らないと「比較しなかった」のか「現行が無かった」のかを
+        後から区別できない。
+        """
+        self._record(current=None, current_id=None)
+        got = shadow.load_shadow_comparisons("shadow1")
+        assert len(got) == 2
+        assert got["current_model_id"].isna().all()
+        assert got["current_probability"].isna().all()
+        assert (~got["current_takes"]).all()
+
+    def test_stores_the_label_contract(self, isolated_db):
+        """どのラベル契約に対する比較かを残す（実績と結合するため）"""
+        self._record()
+        got = shadow.load_shadow_comparisons("shadow1")
+        assert set(got["label_contract_id"]) == {_LC}
+
+    def test_runs_are_isolated(self, isolated_db):
+        self._record(run_id="shadow1")
+        self._record(run_id="shadow2")
+        assert len(shadow.load_shadow_comparisons("shadow1")) == 2
+        assert len(shadow.load_shadow_comparisons("shadow2")) == 2
 
 
 class TestDisagreementSummary:
@@ -1292,25 +2049,89 @@ def compare(event_ids: list, features: pd.DataFrame, *,
 
 
 def record_shadow(comparisons: list, *, evaluation_run_id: str,
-                  candidate_model_id: str) -> int:
-    """候補の予測を shadow として保存する。保存件数を返す。
+                  candidate_model_id: str, current_model_id: Optional[str],
+                  threshold: float, label_contract_id: str) -> int:
+    """**比較そのもの**を保存する。保存件数を返す。
+
+    候補の確率だけを書くと、再起動後に「その時どちらを採り、なぜ見送ったか」
+    を復元できない（外部レビューR21）。並行記録と呼べるのは、
+    **両モデルID・両確率・判断閾値・採否・一致区分・入力契約**が
+    同じ行に揃っているときだけである。関数名や一時的な戻り値では満たさない。
+
+    現行が未昇格のときは `current_model_id=None` / `current_probability=None`
+    で保存し、「現行が無かった」という状態として残す。行を作らないと
+    「比較しなかった」のか「現行が無かった」のか後から区別できない。
 
     実績（PredictionOutcome）はここでは書かない。予測時点では確定して
-    いないため、満期後に別途関連付ける（spec §7）。
+    いないため、満期後に別途関連付ける（spec §7）。結合キーは
+    `(label_contract_id, event_id)`。
     """
+    from src.data.database import ShadowComparisonRow, get_session
+
     if not comparisons:
         return 0
+
+    # 候補の予測は従来どおり Prediction へ（指標の再計算に使う）
     preds = pd.DataFrame({
         "event_id": [c.event_id for c in comparisons],
+        "label_contract_id": [label_contract_id] * len(comparisons),
         "raw_probability": [c.candidate_probability for c in comparisons],
         "calibrated_probability": [c.candidate_probability for c in comparisons],
         "fold_index": [SHADOW_FOLD_INDEX] * len(comparisons),
     })
     n = save_predictions(preds, evaluation_run_id, candidate_model_id,
                          purpose=PURPOSE_SHADOW)
+
+    # 比較の内訳はこちらへ。これが「並行記録」の実体
+    now = clock.now()
+    with get_session() as session:
+        for c in comparisons:
+            session.add(ShadowComparisonRow(
+                evaluation_run_id=evaluation_run_id,
+                event_id=c.event_id,
+                label_contract_id=label_contract_id,
+                current_model_id=current_model_id,
+                candidate_model_id=candidate_model_id,
+                current_probability=c.current_probability,
+                candidate_probability=c.candidate_probability,
+                threshold=float(threshold),
+                current_takes=1 if c.current_takes else 0,
+                candidate_takes=1 if c.candidate_takes else 0,
+                agreement=c.agreement,
+                recorded_at=now,
+            ))
+        session.commit()
+
     logger.info(
-        f"shadow記録: run={evaluation_run_id} model={candidate_model_id} {n}件")
+        f"shadow記録: run={evaluation_run_id} 現行={current_model_id} "
+        f"候補={candidate_model_id} 閾値={threshold} {n}件")
     return n
+
+
+def load_shadow_comparisons(evaluation_run_id: str) -> pd.DataFrame:
+    """保存済みの比較を読み直す。
+
+    この出力から `disagreement_summary()` を再計算できること
+    （＝再起動後に当時の比較を復元できること）が並行記録の合格条件である。
+    """
+    from src.data.database import ShadowComparisonRow, get_session
+    from sqlalchemy import select as sa_select
+
+    with get_session() as session:
+        rows = list(session.scalars(sa_select(ShadowComparisonRow).where(
+            ShadowComparisonRow.evaluation_run_id == evaluation_run_id)).all())
+    return pd.DataFrame([{
+        "event_id": r.event_id,
+        "label_contract_id": r.label_contract_id,
+        "current_model_id": r.current_model_id,
+        "candidate_model_id": r.candidate_model_id,
+        "current_probability": r.current_probability,
+        "candidate_probability": r.candidate_probability,
+        "threshold": r.threshold,
+        "current_takes": bool(r.current_takes),
+        "candidate_takes": bool(r.candidate_takes),
+        "agreement": r.agreement,
+    } for r in rows])
 
 
 def disagreement_summary(comparisons: list) -> dict:

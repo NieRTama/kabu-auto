@@ -217,15 +217,38 @@ import pandas as pd
 class Fold:
     """1つの分割。境界は日付であり行番号ではない。
 
-    train_end は**学習締切**。この日までに判断されたイベントだけが学習候補になる。
-    val_start / val_end はこのfoldの検証期間。片方向walk-forwardのため
-    常に train_end < val_start が成り立つ。
+    train_end は**学習締切**＝この分割で学習を実行する時点である。
+    「この日までに判断されたイベント」ではなく
+    **「この日までに判断され、かつこの日までにラベルが確定したイベント」**だけが
+    学習候補になる（split_events の docstring を参照）。
+
+    val_start / val_end はこのfoldの検証期間。片方向walk-forward専用のため
+    常に train_start <= train_end < val_start <= val_end が成り立つ。
+    この不変条件は __post_init__ で強制する。成り立たないFoldは
+    purge・embargoの契約が定義できないので、黙って通さず例外にする。
     """
     index: int
     train_start: date
     train_end: date
     val_start: date
     val_end: date
+
+    def __post_init__(self) -> None:
+        if not (self.train_start <= self.train_end):
+            raise ValueError(
+                f"train_start <= train_end でなければならない: "
+                f"{self.train_start} > {self.train_end}")
+        if not (self.val_start <= self.val_end):
+            raise ValueError(
+                f"val_start <= val_end でなければならない: "
+                f"{self.val_start} > {self.val_end}")
+        if not (self.train_end < self.val_start):
+            # 学習期間が検証期間を跨ぐ・後ろまで伸びる分割は片方向walk-forwardでは
+            # 作れない。ここを通すと「未来で学習して過去を検証する」分割が
+            # 静かに成立してしまう（外部レビューR23）。
+            raise ValueError(
+                f"片方向walk-forwardでは train_end < val_start が必要: "
+                f"train_end={self.train_end} val_start={self.val_start}")
 
 
 def sessions_of(events: pd.DataFrame) -> list:
@@ -316,7 +339,17 @@ EOF
 
 **purge の規則（spec §7）:** 学習側から `label_end_at >= fold.val_start` のイベントを除外する。学習イベントのラベルが検証期間の価格で確定していると、検証期間の情報が学習側へ入るため。
 
-**embargo:** 既定で無効（`embargo_sessions=0`）。有効にすると `val_end` の後 `embargo_sessions` セッションぶんのイベントを学習側から除外する。片方向 walk-forward では学習期間が常に検証期間より前にあるため**この経路は構造的に存在せず、無効化のままでよい**。前後両側を学習に使う別の分割を将来採用したときのために口だけ用意する。
+**embargo:** 既定で無効（`embargo_sessions=0`）。有効にすると `val_start` の**直前** `embargo_sessions` セッションぶんの判断日を学習側から除外する。
+
+> **定義を変更した理由（外部レビューR23・2026-09-12）。** 当初案は「`val_end` の**後ろ**
+> `embargo_sessions` セッションを除外する」としていたが、片方向walk-forwardでは
+> `train_end < val_start <= val_end` が常に成り立つため、`val_end` より後の判断日は
+> 学習側に**一件も入り得ない**。つまり当初の embargo は到達不能なコードであり、
+> それを検証するテストも成立しなかった（後述）。
+>
+> 一方、検証開始の直前にある学習イベントは、purge を通した後でも系列相関で
+> 検証期間の結果と相関する。片方向walk-forwardで意味を持つ embargo は
+> **「検証開始前に空白セッションを置く」方向だけ**である。こちらへ揃える。
 
 **ラベルの無いイベント:** `status != STATUS_RESOLVED` のイベントは学習にも検証にも使わない。ラベルが無く、指標も計算できないため。
 
@@ -391,11 +424,40 @@ class TestPurge:
         assert date(2026, 1, 5) in set(train["decision_at"])
         assert date(2026, 1, 7) in set(train["decision_at"])
 
-    def test_no_training_label_ends_inside_validation(self):
-        """不変条件: 学習側のどのラベルも検証開始日より前に確定している"""
+    def test_no_training_label_resolves_after_the_cutoff(self):
+        """不変条件: 学習側のどのラベルも学習締切までに確定している"""
         events, fold = self._overlapping_events()
         train, _ = validation.split_events(events, fold)
-        assert (train["label_end_at"] < fold.val_start).all()
+        assert (train["label_end_at"] <= fold.train_end).all()
+
+    def test_excludes_label_resolved_after_cutoff_even_when_gap_before_validation(self):
+        """判断は締切前でもラベル確定が締切後なら学習に使えない
+
+        分割日は候補イベントのある営業日から作るため、train_end と val_start の
+        間に候補の無い空白期間ができる。そこへラベル確定日が落ちると、
+        「label_end_at < val_start」という条件では素通りしてしまう。
+        学習締切の時点では誰も知り得ない情報なので除外されなければならない
+        （外部レビューR06の反例をそのまま置く）。
+        """
+        rows = [
+            # 1/5に判断し1/8に確定。train_end=1/5 の時点では結果が分からない
+            {"symbol": "7203", "decision_at": date(2026, 1, 5),
+             "label_end_at": date(2026, 1, 8), "label": 1},
+            # 1/5に判断し1/5に確定。こちらは締切時点で観測できる
+            {"symbol": "9984", "decision_at": date(2026, 1, 5),
+             "label_end_at": date(2026, 1, 5), "label": 0},
+            {"symbol": "7203", "decision_at": date(2026, 1, 12),
+             "label_end_at": date(2026, 1, 12), "label": 1},
+        ]
+        events = _events(rows)
+        fold = validation.Fold(
+            index=0, train_start=date(2026, 1, 5), train_end=date(2026, 1, 5),
+            val_start=date(2026, 1, 12), val_end=date(2026, 1, 12))
+
+        train, _ = validation.split_events(events, fold)
+        symbols = set(train["symbol"])
+        assert "7203" not in symbols   # 締切後に確定するので除外
+        assert "9984" in symbols       # 締切までに確定するので残る
 
     def test_purge_applies_to_every_generated_fold(self):
         events = _daily_events(["7203", "9984"], date(2026, 1, 5), 60, holding=5)
@@ -403,38 +465,93 @@ class TestPurge:
             train, _ = validation.split_events(events, fold)
             if len(train) == 0:
                 continue
-            assert (train["label_end_at"] < fold.val_start).all()
+            assert (train["label_end_at"] <= fold.train_end).all()
+
+
+class TestFoldContract:
+    def test_rejects_fold_whose_training_spans_the_validation_period(self):
+        """検証期間を跨ぐ・後ろまで伸びる分割は作れない
+
+        片方向walk-forward専用なので train_end < val_start が不変条件である。
+        これを満たさないFoldを黙って受け取ると、purge・embargoの契約が
+        定義できないまま「未来で学習して過去を検証する」分割が成立する
+        （外部レビューR23）。
+        """
+        with pytest.raises(ValueError, match="train_end < val_start"):
+            validation.Fold(
+                index=0, train_start=date(2026, 1, 5), train_end=date(2026, 1, 12),
+                val_start=date(2026, 1, 7), val_end=date(2026, 1, 8))
+
+    def test_rejects_inverted_validation_period(self):
+        with pytest.raises(ValueError, match="val_start <= val_end"):
+            validation.Fold(
+                index=0, train_start=date(2026, 1, 5), train_end=date(2026, 1, 6),
+                val_start=date(2026, 1, 9), val_end=date(2026, 1, 8))
+
+    def test_rejects_inverted_training_period(self):
+        with pytest.raises(ValueError, match="train_start <= train_end"):
+            validation.Fold(
+                index=0, train_start=date(2026, 1, 7), train_end=date(2026, 1, 6),
+                val_start=date(2026, 1, 9), val_end=date(2026, 1, 10))
+
+    def test_every_generated_fold_satisfies_the_contract(self):
+        """calendar_folds が作る分割は全てこの契約を満たす"""
+        events = _daily_events(["7203", "9984"], date(2026, 1, 5), 60, holding=5)
+        folds = validation.calendar_folds(events, n_splits=5)
+        assert len(folds) > 0
+        for fold in folds:
+            assert fold.train_start <= fold.train_end < fold.val_start <= fold.val_end
 
 
 class TestEmbargo:
-    def test_is_a_no_op_for_forward_folds(self):
-        """片方向walk-forwardでは学習が常に検証より前なので効果が無い"""
-        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=2)
-        fold = validation.calendar_folds(events, n_splits=5)[2]
-        without = validation.split_events(events, fold)[0]
-        with_embargo = validation.split_events(events, fold, embargo_sessions=5)[0]
-        assert list(without["event_id"]) == list(with_embargo["event_id"])
+    """embargo は「検証開始の直前に空白セッションを置く」方向にだけ存在する。
 
-    def test_excludes_post_validation_events_when_training_spans_them(self):
-        """検証期間の後ろまで学習範囲が伸びる分割では、指定ぶん除外する"""
+    `val_end` より後ろを外す向きは片方向walk-forwardでは到達不能なので
+    実装しない（外部レビューR23）。
+    """
+
+    def _events_with_gap(self):
         rows = [
             {"symbol": "7203", "decision_at": date(2026, 1, 5),
              "label_end_at": date(2026, 1, 5), "label": 1},
-            {"symbol": "7203", "decision_at": date(2026, 1, 9),
-             "label_end_at": date(2026, 1, 9), "label": 0},   # val_end(1/8)の翌日
-            {"symbol": "7203", "decision_at": date(2026, 1, 12),
-             "label_end_at": date(2026, 1, 12), "label": 1},
+            {"symbol": "7203", "decision_at": date(2026, 1, 6),
+             "label_end_at": date(2026, 1, 6), "label": 0},
+            {"symbol": "7203", "decision_at": date(2026, 1, 7),
+             "label_end_at": date(2026, 1, 7), "label": 1},   # val_start直前
+            {"symbol": "7203", "decision_at": date(2026, 1, 8),
+             "label_end_at": date(2026, 1, 8), "label": 0},   # 検証側
         ]
-        events = _events(rows)
-        fold = validation.Fold(
-            index=0, train_start=date(2026, 1, 5), train_end=date(2026, 1, 12),
-            val_start=date(2026, 1, 7), val_end=date(2026, 1, 8))
+        return _events(rows), validation.Fold(
+            index=0, train_start=date(2026, 1, 5), train_end=date(2026, 1, 7),
+            val_start=date(2026, 1, 8), val_end=date(2026, 1, 8))
 
-        without = validation.split_events(events, fold)[0]
-        with_embargo = validation.split_events(events, fold, embargo_sessions=1)[0]
-        assert date(2026, 1, 9) in set(without["decision_at"])
-        assert date(2026, 1, 9) not in set(with_embargo["decision_at"])
-        assert date(2026, 1, 12) in set(with_embargo["decision_at"])
+    def test_default_is_disabled(self):
+        events, fold = self._events_with_gap()
+        train, _ = validation.split_events(events, fold)
+        assert date(2026, 1, 7) in set(train["decision_at"])
+
+    def test_excludes_the_sessions_immediately_before_validation(self):
+        """embargo_sessions=1 なら val_start 直前の1営業日を学習から外す"""
+        events, fold = self._events_with_gap()
+        train, _ = validation.split_events(events, fold, embargo_sessions=1)
+        decisions = set(train["decision_at"])
+        assert date(2026, 1, 7) not in decisions   # 直前1営業日は外れる
+        assert date(2026, 1, 6) in decisions       # その前は残る
+        assert date(2026, 1, 5) in decisions
+
+    def test_embargo_of_two_removes_two_sessions(self):
+        events, fold = self._events_with_gap()
+        train, _ = validation.split_events(events, fold, embargo_sessions=2)
+        decisions = set(train["decision_at"])
+        assert date(2026, 1, 7) not in decisions
+        assert date(2026, 1, 6) not in decisions
+        assert date(2026, 1, 5) in decisions
+
+    def test_embargo_never_touches_the_validation_set(self):
+        events, fold = self._events_with_gap()
+        _, val_off = validation.split_events(events, fold)
+        _, val_on = validation.split_events(events, fold, embargo_sessions=2)
+        assert list(val_off["event_id"]) == list(val_on["event_id"])
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -460,14 +577,26 @@ def split_events(events: pd.DataFrame, fold: Fold, *,
                  embargo_sessions: int = 0) -> tuple:
     """fold を適用して (学習イベント, 検証イベント) を返す。
 
-    **purge**: 学習側から `label_end_at >= fold.val_start` のイベントを除外する。
-    学習イベントのラベルが検証期間の価格で確定していると、検証期間の情報が
-    学習側へ入るため（spec §7）。
+    **purge**: 学習側から `label_end_at > fold.train_end` のイベントを除外する。
 
-    **embargo**: 既定で無効。有効にすると val_end の後 embargo_sessions
-    セッションぶんのイベントを学習側から外す。片方向walk-forwardでは学習期間が
-    常に検証期間より前にあるためこの経路は構造的に存在せず、無効のままでよい。
-    前後両側を学習に使う別の分割を将来採用したときのために口だけ用意している。
+    `train_end` は学習締切＝この分割で学習を実行する時点である。判断日だけを
+    締切で切ると、「判断は締切前だがラベルの確定は締切後」というイベントが
+    学習に入る。それは学習実行時点では観測できない情報であり、
+    walk-forward が答えようとしている「その時点で何を知り得たか」を壊す。
+
+    `train_end < val_start` を Fold が保証しているので、この条件は
+    「ラベルが検証期間へ食い込む学習イベントを落とす」という従来の purge
+    （spec §7 の `label_end_at >= val_start` を除外）を必ず含む。厳しいほうを採る。
+
+    **embargo**: 既定で無効。有効にすると `val_start` の**直前** embargo_sessions
+    セッションぶんの判断日を学習側から外す。purge を通した後でも、検証開始の
+    直前にある学習イベントは系列相関で検証期間の結果と相関するため、
+    境界に空白セッションを置きたい場合に使う。
+
+    片方向walk-forwardでは `val_end` より後の判断日が学習側に入ることは
+    構造的に無いので、「検証期間の後ろを外す」向きの embargo は実装しない
+    （到達不能なコードになる）。両側を学習に使う分割を将来採用するなら、
+    purge の契約から分けて設計し直すこと。
     """
     resolved = _resolved(events)
 
@@ -479,15 +608,24 @@ def split_events(events: pd.DataFrame, fold: Fold, *,
     train = resolved[
         (resolved["decision_at"] >= fold.train_start)
         & (resolved["decision_at"] <= fold.train_end)
-        & (resolved["decision_at"] < fold.val_start)
     ]
-    # purge: ラベルが検証期間へ食い込む学習イベントを落とす
-    train = train[train["label_end_at"] < fold.val_start]
+    # purge = 学習締切での実現可能性。
+    # decision_at だけを train_end で切ると、判断は締切前でもラベルが締切後に
+    # 確定するイベントが学習に入る。例: train_end=1/5, val_start=1/12 のとき、
+    # 1/5判断・1/8確定のラベルは「1/5時点では誰も知り得ない」のに通ってしまう
+    # （外部レビューR06）。学習締切とは学習を実行する時点のことなので、
+    # ラベル確定日も同じ締切で切る。
+    #
+    # train_end < val_start が Fold で保証されているため、この条件は
+    # 従来の purge（label_end_at < val_start）を必ず含む。より厳しいほうだけ残す。
+    train = train[train["label_end_at"] <= fold.train_end]
 
     if embargo_sessions > 0:
+        # 検証開始の直前セッションを学習側から落とす（前方ギャップ）。
+        # 特徴量の系列相関は purge を通した後でも残るため、境界に空白を置く。
         sessions = sessions_of(resolved)
-        after = [s for s in sessions if s > fold.val_end]
-        embargoed = set(after[:embargo_sessions])
+        before = [s for s in sessions if s < fold.val_start]
+        embargoed = set(before[-embargo_sessions:])
         if embargoed:
             train = train[~train["decision_at"].isin(embargoed)]
 
@@ -497,20 +635,22 @@ def split_events(events: pd.DataFrame, fold: Fold, *,
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_validation.py -v`
-Expected: PASS（17件）
+Expected: PASS（25件）
 
 - [ ] **Step 5: コミット**
 
 ```bash
 git add src/strategy/validation.py tests/test_validation.py
 git commit -m "$(cat <<'EOF'
-feat(strategy): purgeを効かせたfold適用を追加
+feat(strategy): 学習締切でラベル確定日まで切るfold適用を追加
 
-学習側からlabel_end_atが検証開始日以降のイベントを除外する。学習イベントの
-ラベルが検証期間の価格で確定していると、検証期間の情報が学習側へ入るため。
+train_endは学習を実行する時点である。判断日だけを締切で切ると、判断は締切前
+だがラベルの確定が締切後というイベントが学習に入り、その時点では観測できない
+情報で学習することになる。label_end_atも同じ締切で切る。train_end<val_startを
+Foldが保証するため、この条件は従来のpurgeを必ず含む。
 ラベルの無いイベントは学習にも検証にも使わない。
-embargoは片方向walk-forwardでは構造的に不要なので既定で無効とし、
-前後両側を使う分割に備えて口だけ用意する。
+embargoはval_start直前の空白セッションとして定義する。val_endより後ろを外す
+向きは片方向walk-forwardでは到達不能なので実装しない。
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 EOF

@@ -71,6 +71,7 @@ spec §6 のイベント表は `sample_weight`（一意性重み）を列とし�
   - `EVENT_COLUMNS: list[str]` — `META_COLUMNS + FEATURE_COLS`（イベント表の列順はこれで固定する）
   - `NOMINAL_QUANTITY: int`
   - `make_event_id(symbol: str, decision_at: date) -> str`
+  - `make_label_contract_id(policy_conf: policy.PolicyConfig, costs: execution.CostConfig, *, peak_basis: str = PEAK_BASIS_PREVIOUS) -> str` — ラベルの作られ方の契約ID（SHA256先頭12桁）。イベント表の `label_contract_id` 列に入り、段階C2で実績（`PredictionOutcome`）の保存キーの一部になる
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -89,9 +90,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.backtest import execution
 from src.core import config as cfg
 from src.strategy import dataset
 from src.strategy import indicators
+from src.strategy import policy
 
 
 @pytest.fixture(autouse=True)
@@ -117,7 +120,8 @@ class TestSchema:
     def test_meta_columns_cover_spec_requirements(self):
         """spec §6 が要求する列が揃っている"""
         required = {
-            "event_id", "symbol", "decision_at", "feature_as_of", "entry_at",
+            "event_id", "label_contract_id", "symbol", "decision_at",
+            "feature_as_of", "entry_at",
             "label_end_at", "status", "label", "net_return", "exit_reason",
             "feature_version", "strategy_version", "execution_model_version",
         }
@@ -138,6 +142,60 @@ class TestMakeEventId:
         base = dataset.make_event_id("7203", date(2026, 9, 10))
         assert dataset.make_event_id("9984", date(2026, 9, 10)) != base
         assert dataset.make_event_id("7203", date(2026, 9, 11)) != base
+
+
+class TestLabelContractId:
+    """ラベル契約ID。このクラスだけで完結するようヘルパを局所に置く
+    （_policy_conf / _costs は後続タスクのテストで定義される）。"""
+
+    @staticmethod
+    def _p(stop=-0.07, breakeven=0.02, trailing=0.04,
+           sell_thr=-0.25, max_holding=10):
+        return policy.PolicyConfig(
+            stop_loss_pct=stop, breakeven_trigger_pct=breakeven,
+            trailing_stop_pct=trailing, sell_threshold=sell_thr,
+            max_holding_sessions=max_holding)
+
+    @staticmethod
+    def _c(slip=0.0, comm=0.0):
+        return execution.CostConfig(slippage_pct=slip, commission_pct=comm)
+
+    def test_same_settings_give_the_same_id(self):
+        a = dataset.make_label_contract_id(self._p(), self._c())
+        b = dataset.make_label_contract_id(self._p(), self._c())
+        assert a == b
+        assert len(a) == 12
+
+    def test_different_costs_give_a_different_id(self):
+        """コストが違えば同じ銘柄・同じ日でもラベルは別物になる
+
+        この2つが同じIDになると、別コストで評価をやり直したときに
+        過去runの実績を上書きしてしまう（外部レビューR07）。
+        """
+        free = dataset.make_label_contract_id(self._p(), self._c())
+        costly = dataset.make_label_contract_id(
+            self._p(), self._c(slip=0.001, comm=0.001))
+        assert free != costly
+
+    def test_different_exit_policy_gives_a_different_id(self):
+        base = dataset.make_label_contract_id(self._p(), self._c())
+        assert dataset.make_label_contract_id(
+            self._p(stop=-0.03), self._c()) != base
+        assert dataset.make_label_contract_id(
+            self._p(max_holding=5), self._c()) != base
+        assert dataset.make_label_contract_id(
+            self._p(sell_thr=-0.5), self._c()) != base
+
+    def test_id_takes_no_data_argument(self):
+        """契約IDはラベルの定義だけを表し、対象データには依存しない
+
+        dataset_id（内容ハッシュ）を実績キーに使うと、銘柄を1つ足すだけで
+        過去の実績と結び付かなくなる。銘柄・日付・件数を引数に取らないこと
+        自体を契約として固定する。
+        """
+        import inspect
+        params = set(inspect.signature(dataset.make_label_contract_id).parameters)
+        assert params == {"policy_conf", "costs", "peak_basis"}
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -189,6 +247,7 @@ STATUS_INVALID_FEATURES = "invalid_features"  # 特徴量が揃っていない
 FEATURE_VERSION = "f1"                      # indicators.FEATURE_COLS の定義
 STRATEGY_VERSION = "rule_only_v1"           # 候補生成はルールのみ
 EXECUTION_MODEL_VERSION = "t1_open_v1"      # Tの引けで判断しT+1の寄りで執行
+LABEL_VERSION = "l1"                        # トリプルバリアの定義そのもの
 
 # 純収益率は数量に依存しない（買い代金・売り代金・手数料が同じ係数で伸縮し、
 # 比を取ると約分される）。Fill の型を満たすための名目値として持つ。
@@ -196,6 +255,7 @@ NOMINAL_QUANTITY = 100
 
 META_COLUMNS = [
     "event_id",
+    "label_contract_id",        # ラベルの作られ方（退出ポリシー＋コスト＋版）
     "symbol",
     "decision_at",              # 売買判断の時点（Tの引け）
     "feature_as_of",            # 特徴量に使った情報の最終時点
@@ -222,14 +282,58 @@ def make_event_id(symbol: str, decision_at: date) -> str:
 
     銘柄と判断セッションの組で一意になる。内容ハッシュ（dataset_id）を
     安定させるため、乱数やタイムスタンプを混ぜず決定的に作る。
+
+    **これは「どの判断を指すか」であって「ラベルがどう作られたか」ではない。**
+    同じ銘柄・同じ日でも、退出ポリシーやコストを変えれば実績ラベルは別物になる。
+    実績の保存キーには make_label_contract_id() と組で使うこと
+    （外部レビューR07）。
     """
     return f"{symbol}:{pd.Timestamp(decision_at).strftime('%Y%m%d')}"
+
+
+def make_label_contract_id(policy_conf: "policy.PolicyConfig",
+                           costs: "execution.CostConfig", *,
+                           peak_basis: str = PEAK_BASIS_PREVIOUS) -> str:
+    """ラベルの作られ方を一意に決める契約ID（SHA256の先頭12桁）。
+
+    同じ (symbol, decision_at) でも、損切り幅・トレーリング・売り閾値・
+    最大保有期間・スリッページ・手数料・執行モデルが違えば `label` と
+    `net_return` は別の値になる。実績を `event_id` だけで保存すると、
+    別のコストで評価をやり直したときに**過去runの実績を上書きしてしまい、
+    保存済みの指標が後から変わる**（外部レビューR07）。
+
+    `dataset_id`（内容ハッシュ）ではなくパラメータのハッシュにする理由:
+    dataset_id は銘柄を1つ増やしただけでも変わるため、shadow運用のように
+    データが継ぎ足されていく用途では過去の実績と結び付かなくなる。
+    契約IDは「ラベルの定義」だけを表し、対象データの増減では変わらない。
+
+    順序が確定した JSON にしてからハッシュする。dict の反復順や float の
+    既定表現に依存すると、同じ設定で違うIDが出る。
+    """
+    payload = {
+        "label_version": LABEL_VERSION,
+        "execution_model_version": EXECUTION_MODEL_VERSION,
+        "peak_basis": peak_basis,
+        "stop_loss_pct": round(float(policy_conf.stop_loss_pct), 8),
+        "breakeven_trigger_pct": round(float(policy_conf.breakeven_trigger_pct), 8),
+        "trailing_stop_pct": round(float(policy_conf.trailing_stop_pct), 8),
+        "sell_threshold": round(float(policy_conf.sell_threshold), 8),
+        "max_holding_sessions": int(policy_conf.max_holding_sessions),
+        "slippage_pct": round(float(costs.slippage_pct), 8),
+        "commission_pct": round(float(costs.commission_pct), 8),
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 ```
+
+`import json` と `import hashlib` をファイル先頭へ足す（`hashlib` は
+`compute_dataset_id` で既に使う）。
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_dataset.py -v`
-Expected: PASS（6件）
+Expected: PASS（10件）
 
 - [ ] **Step 5: BOM確認とコミット**
 
@@ -881,12 +985,17 @@ def build_events(symbol: str, ohlcv: pd.DataFrame,
     scores = rule_scores(feat)
     candidates = find_candidates(feat, buy_threshold)
 
+    # ラベル契約IDは銘柄・日付に依存しないので、ループの外で一度だけ作る
+    label_contract_id = make_label_contract_id(
+        policy_conf, costs, peak_basis=peak_basis)
+
     rows = []
     for i in candidates:
         outcome = simulate_event(feat, i, policy_conf, costs, peak_basis=peak_basis)
         decision_at = feat.index[i].date()
         row = {
             "event_id": make_event_id(symbol, decision_at),
+            "label_contract_id": label_contract_id,
             "symbol": symbol,
             "decision_at": decision_at,
             # 特徴量は判断セッションまでの情報だけで作られるため同じ時点になる

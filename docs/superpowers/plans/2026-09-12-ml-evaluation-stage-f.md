@@ -243,7 +243,13 @@ class TestTrainV2:
         return {"7203": _ohlcv(seed=1), "9984": _ohlcv(seed=2, start_price=500.0)}
 
     def test_produces_a_candidate_not_a_promotion(self, isolated_db, tmp_path):
-        """学習成功は候補の生成であって運用モデルの差し替えではない"""
+        """学習成功は候補の生成であって運用モデルの差し替えではない
+
+        **`if res.model_id is not None:` で包まない。** 包むと、保存が
+        AttributeError で失敗して `train_as_candidate` が None を返した
+        場合でもこのテストが通ってしまう（外部レビューR02）。
+        成功ケースは成功したことを断言する。
+        """
         from src.strategy import model_store as ms
         from src.strategy import v2_training
 
@@ -251,10 +257,64 @@ class TestTrainV2:
             self._bars(), policy_conf=_policy_conf(), costs=_costs(),
             base_dir=str(tmp_path / "models"))
 
-        if res.model_id is not None:
-            assert ms.candidate_dir(res.model_id, str(tmp_path / "models")).exists()
+        assert res.skipped_reason is None, res.skipped_reason
+        assert res.model_id is not None
+        assert ms.candidate_dir(res.model_id, str(tmp_path / "models")).exists()
         # 現行は未昇格のまま
         assert ms.read_current(base_dir=str(tmp_path / "models")) is None
+
+    def test_the_saved_candidate_can_be_loaded_and_predicts_the_same(
+            self, isolated_db, tmp_path):
+        """保存物を読み直して、学習直後と同じ予測が出ること
+
+        段階Cのラッパーは `booster_` も `save_model()` も持たない。
+        保存側と学習側の型契約が合っていないと、ここで落ちる
+        （外部レビューR02）。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from src.strategy import model_store as ms
+        from src.strategy import v2_training
+        from src.strategy.indicators import FEATURE_COLS
+
+        base = str(tmp_path / "models")
+        res = v2_training.train_v2(
+            self._bars(), policy_conf=_policy_conf(), costs=_costs(),
+            base_dir=base)
+        assert res.model_id is not None
+
+        loaded, meta = ms.load_model(res.model_id, base_dir=base)
+        assert list(meta.feature_cols) == list(FEATURE_COLS)
+        assert meta.label_contract_id is not None
+
+        rng = np.random.default_rng(0)
+        X = pd.DataFrame(
+            rng.normal(0, 1, (5, len(FEATURE_COLS))), columns=list(FEATURE_COLS))
+        proba = loaded.predict(X)
+        assert len(proba) == 5
+        assert np.all((proba >= 0.0) & (proba <= 1.0))
+
+    def test_a_save_failure_is_reported_not_swallowed(self, isolated_db, tmp_path):
+        """保存に失敗したら model_id は None で理由が残る（成功と紛れない）"""
+        from src.strategy import v2_training
+
+        original = v2_training._fit_candidate
+
+        class Unsavable:
+            def predict_proba(self, X):
+                return None
+
+        v2_training._fit_candidate = lambda events, weights: Unsavable()
+        try:
+            res = v2_training.train_v2(
+                self._bars(), policy_conf=_policy_conf(), costs=_costs(),
+                base_dir=str(tmp_path / "models"))
+        finally:
+            v2_training._fit_candidate = original
+
+        assert res.model_id is None
+        assert res.skipped_reason is not None
 
     def test_records_the_dataset(self, isolated_db, tmp_path):
         from src.data.database import Dataset
@@ -451,6 +511,9 @@ def train_v2(ohlcv_by_symbol: dict, *, policy_conf, costs,
             positive_rate=positive_rate,
             fold_results=[],
             dataset_id=dataset_id,
+            # どう作られたラベルで学習したかを固定する。昇格検査が
+            # 評価実行のラベル契約と突き合わせる（外部レビューR07/R13）
+            label_contract_id=ds.make_label_contract_id(policy_conf, costs),
         )
 
     saved_id = ms.train_as_candidate(
@@ -473,7 +536,7 @@ def train_v2(ohlcv_by_symbol: dict, *, policy_conf, costs,
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_v2_training.py -v`
-Expected: PASS（9件）
+Expected: PASS（12件）
 
 - [ ] **Step 5: コミット**
 
@@ -791,44 +854,105 @@ async def _run_backtest_v2(req):
     from src.backtest import execution, walkforward as wf
     from src.backtest import portfolio as pf
     from src.data.market_data import load_ohlcv
+    from src.strategy import dataset as ds
     from src.strategy import policy
 
-    bars = {req.symbol: load_ohlcv(req.symbol, limit=2000, price_basis="raw")}
+    policy_conf = policy.config_from_settings()
+    costs = execution.config_from_settings()
+
+    # 価格基準を用途で分ける（段階A）。
+    #   raw      … 約定価格・必要資金・出来高
+    #   adjusted … 特徴量・リターン
+    # 生OHLCVだけを walk-forward へ渡すと、判断側の行に rule_score も
+    # 特徴量も存在せず、`row.get(col, 0.0)` で0に埋まる。既定の正の買い閾値
+    # では全候補が落ち、「取引ゼロの正常なバックテスト」に見えるが、
+    # 実際には特徴量が一度も繋がっていない（外部レビューR03）。
+    raw = load_ohlcv(req.symbol, limit=2000, price_basis="raw")
+    adjusted = load_ohlcv(req.symbol, limit=2000, price_basis="adjusted")
+    if raw.empty or adjusted.empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{req.symbol} の日足がありません。先にデータを取得してください")
+
+    # 調整系列から因果的に特徴量とルールスコアを作る。
+    # feature_valid=False の行は判断対象外になる（助走期間・欠損）。
+    features = ds.build_feature_frame_with_scores(adjusted)
+    covered = features.index[features["feature_valid"]]
+    if len(covered) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"{req.symbol} は特徴量の助走期間を満たしていません"
+                    f"（{len(adjusted)}本）"))
+    if covered.min().date() > req.start_date or covered.max().date() < req.end_date:
+        # 期間がデータに覆われていない。黙って短い期間で回さない
+        raise HTTPException(
+            status_code=400,
+            detail=(f"指定期間がデータに覆われていません: "
+                    f"利用可能 {covered.min().date()}〜{covered.max().date()} / "
+                    f"指定 {req.start_date}〜{req.end_date}"))
+
+    bars = {req.symbol: raw}
     sectors = {req.symbol: watchlist_store.get_sectors().get(req.symbol, "")}
-    md = wf.MarketData(bars=bars, sectors=sectors)
+    md = wf.MarketData(bars=bars, sectors=sectors,
+                       features={req.symbol: features})
 
     strategy_conf = wf.StrategyConfig(
-        buy_threshold=cfg.get_section("strategy").get("buy_threshold", 0.25))
+        buy_threshold=cfg.get_section("strategy").get("buy_threshold", 0.25),
+        # 設定値を明示的に渡す。渡さないと halt_new 指定が既定の
+        # rule_only へ戻る（外部レビューR05）
+        on_model_failure=cfg.get_section("strategy").get(
+            "on_model_failure", wf.ON_FAILURE_RULE_ONLY),
+    )
     decide = wf.make_rule_then_ml(strategy_conf, _v2_score_fn(req.use_ml))
+
+    # 過去評価には**各判断時点で利用可能なモデル**を使う。
+    # load_current() の戻り値を閉包に固定して過去の全日付へ当てると、
+    # 評価期間を学習済みのモデルでも使えてしまう（外部レビューR04）。
+    # 再学習を結線しない実行は run_walkforward 側で degraded になる。
+    retrain, train_model = _v2_retrain(req, policy_conf, costs)
 
     result = await asyncio.to_thread(
         wf.run_walkforward, md, req.start_date, req.end_date,
         initial_capital=req.initial_capital, decide=decide,
-        policy_conf=policy.config_from_settings(),
-        costs=execution.config_from_settings(),
+        policy_conf=policy_conf,
+        costs=costs,
         sizing=_v2_sizing_config(),
-        liquidity=execution.LiquidityConfig(),
+        liquidity=_v2_liquidity_config(),
+        exit_score_fn=_v2_exit_score_fn(req.use_ml),
+        retrain=retrain,
+        train_model=train_model,
     )
 
+    run_config = _v2_run_config(req, strategy_conf, policy_conf, costs,
+                                features=features)
     snapshot = wf.RunSnapshot(
-        strategy_version=strategy_conf and "rule_then_ml_v1",
-        config_hash="", config_json=json_mod.dumps(
-            cfg.get_section("strategy"), ensure_ascii=False),
+        strategy_version="rule_then_ml_v1",
+        config_hash=run_config.config_hash,
+        config_json=run_config.config_json,
+        dataset_id=run_config.dataset_id,
+        code_version=run_config.code_version,
         execution_model_version="t1_open_v1",
     )
     run_id = await asyncio.to_thread(
         wf.save_run, result, snapshot, symbol_label=req.symbol,
         start=req.start_date, end=req.end_date,
         initial_capital=req.initial_capital,
-        costs=execution.config_from_settings())
+        costs=costs)
 
     return {"run_id": run_id, "engine_version": "v2",
             "degraded": result.degraded,
+            "degraded_reasons": list(result.degraded_reasons),
             "final_capital": float(result.daily["nav"].iloc[-1]) if len(result.daily) else req.initial_capital,
             "trade_count": len(result.trades)}
 ```
 
-`_v2_score_fn` と `_v2_sizing_config` は、既存の `compute_rule_score` と `trading` 節の設定から作る小さなヘルパー。
+**`config_hash=""` にしない。** 実行条件は開始時に固定し、戦略節だけでなく
+リスク・手数料・数量制限・流動性設定まで含めて保存する。実行終了後に
+`config.yaml` を読み直すと、実行中に設定が変わっていた場合に「実際に
+使った設定」とずれる（外部レビューの残件「評価実行の再現用記録」）。
+
+
+実行に必要なヘルパー群。`_v2_score_fn` と `_v2_exit_score_fn` は Task 5 で完成させる（本タスクでは経路の選択と legacy 不変を通す）。
 
 ```python
 def _v2_sizing_config():
@@ -842,26 +966,113 @@ def _v2_sizing_config():
     )
 
 
-def _v2_score_fn(use_ml: bool):
-    """(ルールスコア, ML確率 or None) を返す関数を作る。
+def _v2_liquidity_config():
+    from src.backtest import execution
 
-    v2バックテストはモデルを昇格済みのものから読む。未昇格なら ML なしで
-    ルールだけになる（on_model_failure の設定に従う）。
+    return execution.LiquidityConfig(
+        max_volume_share=cfg.get_section("backtest").get("max_volume_share", 0.0))
+
+
+def _v2_run_config(req, strategy_conf, policy_conf, costs, *, features):
+    """実行条件を**開始時に固定**して返す（外部レビューの残件）。
+
+    戦略節だけでは足りない。リスク・手数料・数量制限・流動性設定・
+    入力データID・コード版まで含める。終了後に `config.yaml` を読み直すと、
+    実行中に設定が変わっていた場合に「実際に使った設定」とずれる。
     """
-    from src.strategy import model_store as ms
-    from src.strategy.indicators import build_feature_frame
-    from src.strategy.signal import compute_rule_score
+    from dataclasses import asdict
 
-    loaded = ms.load_current() if use_ml else None
+    from src.strategy import dataset as ds
+    from src.strategy.evaluation import RunConfig, _code_version
 
-    def score_fn(symbol, row):
-        rule = float(row.get("rule_score", 0.0))
-        if loaded is None:
-            return rule, None
-        return rule, None   # ML推論の結線は段階F Task 5 で行う
+    payload = {
+        "symbol": req.symbol,
+        "start": str(req.start_date), "end": str(req.end_date),
+        "initial_capital": req.initial_capital,
+        "use_ml": bool(req.use_ml),
+        "strategy": asdict(strategy_conf),
+        "policy": asdict(policy_conf),
+        "costs": asdict(costs),
+        "sizing": asdict(_v2_sizing_config()),
+        "liquidity": asdict(_v2_liquidity_config()),
+        "n_feature_rows": int(features["feature_valid"].sum()),
+    }
+    config_json = json_mod.dumps(payload, sort_keys=True, ensure_ascii=False,
+                                 separators=(",", ":"), default=str)
+    return RunConfig(
+        dataset_id=None,
+        label_contract_id=ds.make_label_contract_id(policy_conf, costs),
+        feature_version=ds.FEATURE_VERSION,
+        execution_model_version=ds.EXECUTION_MODEL_VERSION,
+        code_version=_code_version(),
+        config_json=config_json,
+        config_hash=hashlib.sha256(
+            config_json.encode("utf-8")).hexdigest()[:16],
+    )
 
-    return score_fn
+
+def _v2_retrain(req, policy_conf, costs):
+    """(RetrainConfig, train_model) を返す。
+
+    過去評価では**各判断時点で利用可能なモデル**を使う。
+    `load_current()` の戻り値を閉包に固定して過去の全日付へ当てると、
+    評価期間を学習済みのモデルでもそのまま使えてしまう（外部レビューR04）。
+
+    「現在の昇格モデルを固定して過去へ当てる」診断が必要なときは
+    `req.use_current_model_fixed=True` を渡す。その実行は
+    `run_walkforward` が degraded として記録し、昇格の根拠から外れる。
+    採否用の walk-forward 成績とは別物として扱う。
+    """
+    from src.backtest import walkforward as wf
+    from src.data.market_data import load_ohlcv
+    from src.strategy import dataset as ds
+    from src.strategy import validation
+    from src.strategy.evaluation import CurrentLightGBM
+    from src.strategy.indicators import FEATURE_COLS
+
+    if getattr(req, "use_current_model_fixed", False) or not req.use_ml:
+        return None, None
+
+    backtest_conf = cfg.get_section("backtest")
+    retrain = wf.RetrainConfig(
+        every_sessions=backtest_conf.get("retrain_every_sessions", 20),
+        warmup_sessions=backtest_conf.get("retrain_warmup_sessions", 120),
+    )
+
+    adjusted = {req.symbol: load_ohlcv(req.symbol, limit=2000,
+                                       price_basis="adjusted")}
+    all_events = ds.build_events_multi(adjusted, policy_conf, costs)
+
+    def train_model(as_of):
+        """`as_of` の引けを学習締切としてモデルを作る。
+
+        締切の適用は `validation.training_inputs()` に任せる。判断日だけで
+        なくラベル確定日も締切で切られるので、その時点で観測できない
+        イベントは入らない（段階C・外部レビューR06）。
+        """
+        fold = validation.Fold(
+            index=0,
+            train_start=min(all_events["decision_at"]) if len(all_events) else as_of,
+            train_end=as_of,
+            val_start=as_of + timedelta(days=1),
+            val_end=as_of + timedelta(days=1),
+        )
+        inputs = validation.training_inputs(
+            all_events, fold, feature_cols=list(FEATURE_COLS))
+        if len(inputs.events) == 0 or inputs.events["label"].nunique() < 2:
+            return None, len(inputs.events)
+        model = CurrentLightGBM()
+        model.fit(inputs.events[list(FEATURE_COLS)].astype("float64"),
+                  inputs.events["label"].astype(int), inputs.weights)
+        return model, len(inputs.events)
+
+    return retrain, train_model
 ```
+
+> **`req.use_current_model_fixed`** をリクエストモデルへ足す（既定 `False`）。
+> 現在の昇格モデルを固定して過去へ当てる診断と、採否に使える walk-forward
+> 成績を**同じ数字として並べない**ための分岐である（外部レビューR04）。
+
 
 > **実装者への注記:** `_v2_score_fn` の ML 推論部分は Task 5 で完成させる。本タスクでは「経路が選ばれること」と「legacy が変わらないこと」までを通す。
 
@@ -906,7 +1117,11 @@ EOF
 
 **Interfaces:**
 - Consumes: Task 4、`model_store.load_current`、`indicators.build_feature_frame`、`signal.compute_rule_score`
-- Produces: `_v2_score_fn` が昇格済みモデルで確率を返す（未昇格なら `None`）
+- Produces:
+  - `ModelInferenceError(RuntimeError)` — 推論障害。**握り潰さず送出する**
+  - `_v2_score_fn(use_ml)` — 意図したML無効／モデル未昇格／推論障害の3状態を区別する
+  - `_v2_exit_score_fn(use_ml)` — 保有銘柄の売りスコア（ラベル生成と同じ契約）
+  - `_rule_score_of(row)` / `_required_feature_row(row, cols)` — **欠落を0で補完せず例外にする**
 
 **背景:** v2 バックテストは `make_rule_then_ml` を使う。ルールが候補を作り、MLが順位を決める。**モデルは昇格済みのものだけを読む**（`model_store.load_current()`）。未昇格なら ML なしで、`on_model_failure` の設定に従う。
 
@@ -917,7 +1132,7 @@ EOF
 ```python
 class TestV2ScoreFunction:
     def test_returns_none_probability_when_unpromoted(self, tmp_path, monkeypatch):
-        """モデル未昇格ならML確率はNone（ルールだけで動く）"""
+        """モデル未昇格ならML確率はNone（ルールだけで動く）。これは劣化ではない"""
         from src.dashboard import app as dash
         from src.strategy import model_store as ms
 
@@ -950,8 +1165,13 @@ class TestV2ScoreFunction:
         _, proba = score_fn("7203", {"rule_score": 0.3, "f1": 1.0, "f2": 2.0})
         assert proba == pytest.approx(0.77)
 
-    def test_inference_failure_degrades_to_rule_only(self, monkeypatch):
-        """推論に失敗したらMLなしへ落ちる（例外を外へ出さない）"""
+    def test_inference_failure_is_raised_not_swallowed(self, monkeypatch):
+        """推論障害は例外として外へ出す（外部レビューR05）
+
+        `(rule, None)` へ落とすと「意図したML無効」と見分けがつかず、
+        walk-forward の degraded も立たない。MLが効いていない実行が
+        正常な成績として保存されてしまう。
+        """
         from src.dashboard import app as dash
         from src.strategy import model_store as ms
 
@@ -964,59 +1184,262 @@ class TestV2ScoreFunction:
 
         monkeypatch.setattr(ms, "load_current", lambda **k: (_Broken(), _Meta()))
         score_fn = dash._v2_score_fn(use_ml=True)
-        _, proba = score_fn("7203", {"rule_score": 0.3, "f1": 1.0, "f2": 2.0})
-        assert proba is None
+        with pytest.raises(dash.ModelInferenceError):
+            score_fn("7203", {"rule_score": 0.3, "f1": 1.0, "f2": 2.0})
+
+    def test_missing_rule_score_is_an_error_not_a_zero(self, monkeypatch):
+        """rule_score が無い行を0で埋めない（外部レビューR03）
+
+        0で埋めると、特徴量が一度も繋がっていない状態が「全候補が
+        買い閾値に届かない正常なバックテスト」に見える。
+        """
+        from src.dashboard import app as dash
+        from src.strategy import model_store as ms
+
+        monkeypatch.setattr(ms, "load_current", lambda **k: None)
+        score_fn = dash._v2_score_fn(use_ml=True)
+        with pytest.raises(dash.ModelInferenceError, match="rule_score"):
+            score_fn("7203", {"close": 1000.0})
+
+    def test_missing_features_are_an_error_not_zeros(self, monkeypatch):
+        from src.dashboard import app as dash
+        from src.strategy import model_store as ms
+
+        class _Booster:
+            def predict(self, X):
+                return [0.77] * len(X)
+
+        class _Meta:
+            feature_cols = ["f1", "f2"]
+
+        monkeypatch.setattr(ms, "load_current", lambda **k: (_Booster(), _Meta()))
+        score_fn = dash._v2_score_fn(use_ml=True)
+        with pytest.raises(dash.ModelInferenceError, match="特徴量"):
+            score_fn("7203", {"rule_score": 0.3, "f1": 1.0})   # f2 が無い
+
+
+class TestV2ExitScoreFunction:
+    def test_returns_the_rule_score_for_held_symbols(self):
+        from src.dashboard import app as dash
+
+        fn = dash._v2_exit_score_fn(use_ml=False)
+        assert fn("7203", {"rule_score": -0.4}) == pytest.approx(-0.4)
+
+    def test_missing_rule_score_is_an_error(self):
+        from src.dashboard import app as dash
+
+        fn = dash._v2_exit_score_fn(use_ml=False)
+        with pytest.raises(dash.ModelInferenceError):
+            fn("7203", {"close": 1000.0})
+
+
+class TestV2BacktestEndToEnd:
+    """合成OHLCV → エンドポイント → T+1約定まで実際の型で通す。
+
+    テストで `rule_score` を手渡すだけでは、特徴量が経路上で供給されて
+    いることを確認できない（外部レビューR03）。
+    """
+
+    def _seed_ohlcv(self, symbol="7203", n=300):
+        """特徴量の助走期間を満たす合成日足をDBへ入れる"""
+        import numpy as np
+        import pandas as pd
+
+        from src.data import market_data
+
+        rng = np.random.default_rng(0)
+        close = 1000 + np.cumsum(rng.normal(0, 15, n))
+        idx = pd.bdate_range("2025-01-06", periods=n)
+        df = pd.DataFrame({
+            "open": close, "high": close * 1.01, "low": close * 0.99,
+            "close": close, "adjusted_close": close,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        df.index.name = "date"
+        market_data.upsert_ohlcv(symbol, df)
+        return idx
+
+    def test_features_reach_the_decision_and_trades_can_happen(
+            self, isolated_db, client):
+        idx = self._seed_ohlcv()
+        cfg.get_section("strategy")["engine_version"] = "v2"
+
+        res = client.post("/api/backtest", json={
+            "symbol": "7203",
+            "start_date": str(idx[200].date()),
+            "end_date": str(idx[-2].date()),
+            "initial_capital": 1_000_000.0,
+            "use_ml": False,
+        })
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["engine_version"] == "v2"
+        # 特徴量が供給されていれば、ルールスコアは一様に0にならない。
+        # 取引ゼロでも「常に0点」ではないことをrun記録から確かめる
+        assert body["run_id"] is not None
+
+    def test_a_period_not_covered_by_the_data_is_rejected(
+            self, isolated_db, client):
+        """期間がデータに覆われていないときは黙って短い期間で回さない"""
+        self._seed_ohlcv()
+        cfg.get_section("strategy")["engine_version"] = "v2"
+
+        res = client.post("/api/backtest", json={
+            "symbol": "7203",
+            "start_date": "2020-01-06",
+            "end_date": "2020-12-30",
+            "initial_capital": 1_000_000.0,
+            "use_ml": False,
+        })
+        assert res.status_code == 400
+        assert "覆われていません" in res.json()["detail"]
+
+    def test_a_symbol_without_bars_is_rejected(self, isolated_db, client):
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        res = client.post("/api/backtest", json={
+            "symbol": "9999",
+            "start_date": "2026-01-05",
+            "end_date": "2026-02-05",
+            "initial_capital": 1_000_000.0,
+            "use_ml": False,
+        })
+        assert res.status_code == 400
+
+    def test_the_run_records_a_real_config_hash(self, isolated_db, client):
+        """config_hash="" で保存しない（外部レビューの残件）"""
+        from sqlalchemy import select
+
+        from src.data import database as db
+        from src.data.database import get_session
+
+        idx = self._seed_ohlcv()
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        client.post("/api/backtest", json={
+            "symbol": "7203",
+            "start_date": str(idx[200].date()),
+            "end_date": str(idx[-2].date()),
+            "initial_capital": 1_000_000.0,
+            "use_ml": False,
+        })
+        with get_session() as session:
+            row = session.scalars(
+                select(db.BacktestRun).order_by(db.BacktestRun.id.desc())).first()
+        assert row.config_hash
+        assert row.config_hash != ""
+        assert row.config_json and row.config_json != "{}"
+        # 戦略節だけでなくコスト・数量制限まで入っている
+        assert "costs" in row.config_json
+        assert "sizing" in row.config_json
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
 
 Run: `pytest tests/test_engine_version_wiring.py::TestV2ScoreFunction -v`
-Expected: FAIL — `test_uses_the_promoted_model_when_available` が `None` を返す
+Expected: FAIL — `AttributeError: module 'src.dashboard.app' has no attribute 'ModelInferenceError'`
 
 - [ ] **Step 3: 実装を完成させる**
 
 `src/dashboard/app.py` の `_v2_score_fn` を次に置き換える。
 
 ```python
+class ModelInferenceError(RuntimeError):
+    """v2バックテストのML推論に失敗した。
+
+    **握り潰さない。** 例外を捕まえて `(rule, None)` を返すと、
+    「意図してMLを使っていない」実行と区別がつかなくなり、
+    walk-forward 側の degraded も立たない（外部レビューR05）。
+    degraded を立てるのは外へ届いた例外なので、ここで飲み込んではいけない。
+    """
+
+
+def _required_feature_row(row, cols: list) -> dict:
+    """推論に必要な特徴量を行から取り出す。**欠けていたら例外。**
+
+    `row.get(col, 0.0)` で埋めると、特徴量が一度も繋がっていない状態が
+    「全部0の入力」として通り、正の買い閾値の下で全候補が落ちる。
+    結果は「取引ゼロの正常なバックテスト」に見える（外部レビューR03）。
+    """
+    missing = [c for c in cols if c not in row or pd_mod.isna(row[c])]
+    if missing:
+        raise ModelInferenceError(
+            f"特徴量が供給されていません: {missing}。"
+            "MarketData.features に特徴量フレームを渡してください")
+    return {c: float(row[c]) for c in cols}
+
+
+def _rule_score_of(row) -> float:
+    """判断行からルールスコアを取り出す。**無ければ例外。**"""
+    if "rule_score" not in row or pd_mod.isna(row["rule_score"]):
+        raise ModelInferenceError(
+            "rule_score が供給されていません。"
+            "MarketData.features に rule_score 列を含めてください")
+    return float(row["rule_score"])
+
+
 def _v2_score_fn(use_ml: bool):
     """(ルールスコア, ML確率 or None) を返す関数を作る。
 
-    **モデルは昇格済みのものだけを読む**（model_store.load_current）。
-    未昇格なら ML なしで、walkforward の on_model_failure 設定に従う。
-    推論に失敗した場合も ML なしへ落とし、例外を外へ出さない
-    （1銘柄の推論失敗でバックテスト全体を落とさないため。degraded は
-    walkforward 側が別途立てる）。
-    """
-    import pandas as pd_mod
+    3つの状態を**区別する**（外部レビューR05）。
 
+      1. 意図したML無効（`use_ml=False`） … `(rule, None)`。劣化ではない
+      2. モデル未昇格 … `(rule, None)`。劣化ではない
+      3. 推論障害 … `ModelInferenceError` を**送出する**。
+         walk-forward が捕まえて `degraded_reasons` へ積み、
+         その実行は比較・昇格の対象から外れる
+
+    3を `(rule, None)` に落とすと1・2と見分けがつかず、
+    「MLが効いていない実行」が正常な成績として保存される。
+
+    モデルは昇格済みのものだけを読む（`model_store.load_current`）。
+    """
     from src.strategy import model_store as ms
 
     loaded = ms.load_current() if use_ml else None
     if loaded is None:
         def rule_only(symbol, row):
-            return float(row.get("rule_score", 0.0)), None
+            # 未昇格・ML無効。意図した状態なので degraded にしない
+            return _rule_score_of(row), None
         return rule_only
 
-    booster, meta = loaded
+    model, meta = loaded
     cols = list(meta.feature_cols)
 
     def score_fn(symbol, row):
-        rule = float(row.get("rule_score", 0.0))
+        rule = _rule_score_of(row)
+        features = _required_feature_row(row, cols)
         try:
-            X = pd_mod.DataFrame([{c: float(row.get(c, 0.0)) for c in cols}])
-            proba = float(booster.predict(X)[0])
+            proba = float(model.predict(pd_mod.DataFrame([features]))[0])
         except Exception as e:
-            logger.warning(f"v2バックテストのML推論に失敗（ルールのみで継続）: {symbol} {e}")
-            return rule, None
+            # ここで飲み込まない。degraded を立てられるよう外へ出す
+            logger.error(f"v2バックテストのML推論に失敗: {symbol} {e}")
+            raise ModelInferenceError(f"{symbol}: {e}") from e
         return rule, proba
 
     return score_fn
+
+
+def _v2_exit_score_fn(use_ml: bool):
+    """保有銘柄の売りスコアを返す関数を作る。
+
+    結線しないと policy の SIGNAL_SELL 条件が一度も成立せず、
+    ストップか満了まで持ち続ける挙動になる（外部レビューR10）。
+
+    **ラベル生成（`dataset.simulate_event`）と同じ契約にする。** ラベル側が
+    ルールスコアで売りを判定しているなら、ここも同じ値を使う。片方だけ
+    MLを混ぜると、学習したラベルと検証時の退出が別物になる。
+    """
+    def exit_score_fn(symbol, row):
+        return _rule_score_of(row)
+
+    return exit_score_fn
 ```
+
+`import pandas as pd_mod` をモジュール先頭へ足す。
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_engine_version_wiring.py -v`
-Expected: PASS（16件）
+Expected: PASS（20件）
 
 - [ ] **Step 5: 全体回帰とコミット**
 

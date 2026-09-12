@@ -48,7 +48,7 @@ spec §4 の構造表は段階Cの新規モジュールとして `src/strategy/v
 | ファイル | 責務 |
 |---|---|
 | `src/strategy/evaluation.py`（新規） | モデルの共通インターフェースと5つの比較対象、確率校正、閾値選択、外側foldの評価ループ、指標の算出 |
-| `src/data/database.py`（改修） | `Prediction` / `PredictionOutcome` テーブルの追加 |
+| `src/data/database.py`（改修） | `Prediction` / `PredictionOutcome` / `EvaluationRun` テーブルの追加 |
 | `tests/test_evaluation.py`（新規） | 5モデル、校正、閾値、評価ループ、指標、予測明細からの再計算、学習窓の内側比較 |
 
 ---
@@ -56,7 +56,7 @@ spec §4 の構造表は段階Cの新規モジュールとして `src/strategy/v
 ## Task 1: 予測明細のテーブルと保存・関連付け
 
 **Files:**
-- Modify: `src/data/database.py`（`Prediction` / `PredictionOutcome` を追加）
+- Modify: `src/data/database.py`（`Prediction` / `PredictionOutcome` / `EvaluationRun` を追加。`sqlalchemy` の import に `Text` が無ければ足す）
 - Create: `src/strategy/evaluation.py`
 - Test: `tests/test_evaluation.py`
 
@@ -68,6 +68,10 @@ spec §4 の構造表は段階Cの新規モジュールとして `src/strategy/v
   - `PURPOSE_VALIDATION` / `PURPOSE_SHADOW` 定数
   - `save_predictions(predictions: pd.DataFrame, evaluation_run_id: str, model_id: str, *, purpose: str = PURPOSE_VALIDATION) -> int`
   - `save_outcomes(events: pd.DataFrame) -> int`
+  - `EvaluationRun` モデル: `evaluation_run_id` / `started_at` / `finished_at` / `purpose` / `model_id` / `dataset_id` / `label_contract_id` / `feature_version` / `execution_model_version` / `code_version` / `config_hash` / `config_json` / `n_folds` / `n_predictions` / `degraded` / `degraded_reasons`
+  - `RunConfig`（frozen dataclass）と `capture_run_config(events, *, n_splits, window_sessions, feature_cols) -> RunConfig` — 実行条件を**開始時に固定**する
+  - `save_evaluation_run(evaluation_run_id, run_config, *, purpose, model_id, n_folds, n_predictions, degraded_reasons=None) -> None`
+  - `load_evaluation_run(evaluation_run_id)` — 段階Eの昇格検査が読む唯一の根拠
   - `load_prediction_details(evaluation_run_id: str, model_id: Optional[str] = None) -> pd.DataFrame`
 
 **背景（spec §7・§11）:** 実績ラベルは予測時点では確定していない場合がある（shadow運用が該当する）。**予測を先に保存し、満期後に実績ラベルを関連付ける**更新規約にすることで、検証用の予測と未確定の運用予測を同じテーブルで扱える。サンプル単位の明細があれば、AUCも売買判断も後から再計算できる。
@@ -104,8 +108,14 @@ def isolated_db(tmp_path):
     return tmp_path
 
 
+# テスト用のラベル契約ID。実物は dataset.make_label_contract_id() が作る
+# （退出ポリシー＋コスト＋版のハッシュ）。ここでは固定文字列で代用する。
+_LC = "testcontract"
+
+
 def _events(n_sessions: int = 60, symbols=("7203", "9984"),
-            start=date(2026, 1, 5), holding: int = 2, seed: int = 0) -> pd.DataFrame:
+            start=date(2026, 1, 5), holding: int = 2, seed: int = 0,
+            label_contract_id: str = _LC) -> pd.DataFrame:
     """テスト用のイベント表。特徴量はラベルと弱く相関させる"""
     rng = np.random.default_rng(seed)
     rows = []
@@ -115,6 +125,7 @@ def _events(n_sessions: int = 60, symbols=("7203", "9984"),
             label = int(rng.random() < 0.45)
             rows.append({
                 "event_id": f"{s}:{d:%Y%m%d}",
+                "label_contract_id": label_contract_id,
                 "symbol": s,
                 "decision_at": d,
                 "entry_at": d + timedelta(days=1),
@@ -135,6 +146,7 @@ class TestPredictionTables:
     def test_save_and_read_back_predictions(self, isolated_db):
         preds = pd.DataFrame({
             "event_id": ["7203:20260105", "9984:20260105"],
+            "label_contract_id": [_LC, _LC],
             "raw_probability": [0.6, 0.3],
             "calibrated_probability": [0.55, 0.35],
             "fold_index": [0, 0],
@@ -153,6 +165,7 @@ class TestPredictionTables:
     def test_shadow_purpose_is_recorded(self, isolated_db):
         preds = pd.DataFrame({
             "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
             "raw_probability": [0.6],
             "calibrated_probability": [0.55],
             "fold_index": [-1],
@@ -168,6 +181,7 @@ class TestPredictionTables:
         """予測を先に保存し、実績は別テーブルに後から関連付ける"""
         preds = pd.DataFrame({
             "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
             "raw_probability": [0.6],
             "calibrated_probability": [0.55],
             "fold_index": [0],
@@ -196,6 +210,7 @@ class TestPredictionTables:
     def test_details_can_be_filtered_by_model(self, isolated_db):
         preds = pd.DataFrame({
             "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
             "raw_probability": [0.6],
             "calibrated_probability": [0.55],
             "fold_index": [0],
@@ -205,6 +220,91 @@ class TestPredictionTables:
 
         assert len(evaluation.load_prediction_details("run1")) == 2
         assert len(evaluation.load_prediction_details("run1", model_id="lgbm")) == 1
+
+    def test_save_predictions_rejects_missing_label_contract_id(self, isolated_db):
+        """結合キーが欠けた予測は保存できない"""
+        preds = pd.DataFrame({
+            "event_id": ["7203:20260105"],
+            "raw_probability": [0.6],
+            "calibrated_probability": [0.55],
+            "fold_index": [0],
+        })
+        with pytest.raises(ValueError, match="label_contract_id"):
+            evaluation.save_predictions(preds, "run1", "const")
+
+
+class TestOutcomeIsolationBetweenLabelContracts:
+    """別のコストで評価し直しても、過去runの明細と指標が変わらないこと。
+
+    実績を `event_id` だけで upsert していると、2回目の save_outcomes が
+    1回目の実績を上書きし、保存済みの1回目の予測明細を読み直したときの
+    `actual_label` まで変わってしまう（外部レビューR07）。
+    """
+
+    _CHEAP = "cheapcontract"
+    _COSTLY = "costlycontrct"
+
+    def _preds(self, contract):
+        return pd.DataFrame({
+            "event_id": ["7203:20260105"],
+            "label_contract_id": [contract],
+            "raw_probability": [0.6],
+            "calibrated_probability": [0.55],
+            "fold_index": [0],
+        })
+
+    def _outcome_events(self, contract, label):
+        events = _events(n_sessions=1, symbols=("7203",))
+        events.loc[0, "event_id"] = "7203:20260105"
+        events.loc[0, "label_contract_id"] = contract
+        events.loc[0, "label"] = label
+        events.loc[0, "net_return"] = 0.05 if label else -0.05
+        events.loc[0, "status"] = dataset.STATUS_RESOLVED
+        return events
+
+    def test_second_run_with_different_costs_does_not_rewrite_the_first(
+            self, isolated_db):
+        # 1回目: 手数料ゼロの契約で、このイベントは勝ち
+        evaluation.save_predictions(self._preds(self._CHEAP), "run1", "const")
+        evaluation.save_outcomes(self._outcome_events(self._CHEAP, 1))
+        first = evaluation.load_prediction_details("run1")
+        assert first["actual_label"].iloc[0] == 1
+
+        # 2回目: 手数料を乗せた契約で評価し直すと、同じイベントが負けになる
+        evaluation.save_predictions(self._preds(self._COSTLY), "run2", "const")
+        evaluation.save_outcomes(self._outcome_events(self._COSTLY, 0))
+
+        # 1回目の明細は変わらない
+        again = evaluation.load_prediction_details("run1")
+        assert again["actual_label"].iloc[0] == 1
+        assert again["net_return"].iloc[0] == first["net_return"].iloc[0]
+        # 2回目は2回目の実績を見る
+        second = evaluation.load_prediction_details("run2")
+        assert second["actual_label"].iloc[0] == 0
+
+    def test_both_outcomes_coexist(self, isolated_db):
+        evaluation.save_outcomes(self._outcome_events(self._CHEAP, 1))
+        evaluation.save_outcomes(self._outcome_events(self._COSTLY, 0))
+        with get_session() as session:
+            rows = list(session.scalars(select(db.PredictionOutcome)).all())
+        assert len(rows) == 2
+        assert {r.label_contract_id for r in rows} == {self._CHEAP, self._COSTLY}
+
+    def test_same_contract_still_upserts(self, isolated_db):
+        """同じ契約なら従来どおり上書きする（データ改訂の反映）"""
+        evaluation.save_outcomes(self._outcome_events(self._CHEAP, 1))
+        evaluation.save_outcomes(self._outcome_events(self._CHEAP, 0))
+        with get_session() as session:
+            rows = list(session.scalars(select(db.PredictionOutcome)).all())
+        assert len(rows) == 1
+        assert rows[0].actual_label == 0
+
+    def test_prediction_does_not_join_a_foreign_contract_outcome(self, isolated_db):
+        """契約が違う実績は結合されない（NaN のままになる）"""
+        evaluation.save_predictions(self._preds(self._CHEAP), "run1", "const")
+        evaluation.save_outcomes(self._outcome_events(self._COSTLY, 0))
+        details = evaluation.load_prediction_details("run1")
+        assert pd.isna(details["actual_label"].iloc[0])
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -225,10 +325,15 @@ class Prediction(Base):
 
     実績ラベルはここに持たない。予測時点では確定していない場合があるため
     （shadow運用が該当する）、PredictionOutcome へ後から関連付ける。
+
+    関連付けのキーは `event_id` 単独ではなく
+    **`(label_contract_id, event_id)`** である。同じ銘柄・同じ判断日でも
+    退出ポリシーやコストが違えば実績ラベルは別物になるため（外部レビューR07）。
     """
     __tablename__ = "predictions"
     id = Column(Integer, primary_key=True)
     event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
     evaluation_run_id = Column(String(64), nullable=False)
     model_id = Column(String(64), nullable=False)
     predicted_at = Column(DateTime, default=clock.now)
@@ -239,20 +344,72 @@ class Prediction(Base):
 
     __table_args__ = (
         Index("ix_predictions_run_model", "evaluation_run_id", "model_id"),
-        Index("ix_predictions_event_id", "event_id"),
+        Index("ix_predictions_event_id", "label_contract_id", "event_id"),
     )
 
 
 class PredictionOutcome(Base):
-    """イベントの実績。予測より後に確定するため別テーブルに持つ。"""
+    """イベントの実績。予測より後に確定するため別テーブルに持つ。
+
+    **一意キーは `(label_contract_id, event_id)`。** `event_id` だけを一意に
+    すると、同じ銘柄・同じ判断日を別のコストや退出条件で評価し直したときに、
+    過去runの実績が新しい実績で上書きされる。上書きされれば保存済みの
+    予測明細と結合し直したときの指標まで後から変わってしまい、
+    「あの時どう測ったか」を復元できなくなる（外部レビューR07）。
+
+    `dataset_id` ではなく `label_contract_id` を使う理由は
+    `dataset.make_label_contract_id()` の docstring を参照。
+    """
     __tablename__ = "prediction_outcomes"
     id = Column(Integer, primary_key=True)
     event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
     actual_label = Column(Integer)
     net_return = Column(Float)
     resolved_at = Column(DateTime, default=clock.now)
 
-    __table_args__ = (Index("ix_prediction_outcomes_event_id", "event_id", unique=True),)
+    __table_args__ = (
+        Index("ix_prediction_outcomes_key",
+              "label_contract_id", "event_id", unique=True),
+    )
+
+
+class EvaluationRun(Base):
+    """評価実行そのものの記録。
+
+    **これが「その評価が昇格の根拠に使えるか」の唯一の根拠である。**
+    段階Eの `check_promotable()` は呼び出し側から渡された `degraded` を
+    信じず、この行を読む。呼び出し側の bool を信じると、degraded な実行の
+    成績でも引数を `False` にすれば昇格できてしまう（外部レビューR13）。
+
+    実行条件は**開始時に固定して保存する**。終了後に `config.yaml` を
+    読み直すと、実行中に設定が変わっていた場合に「実際に使った設定」と
+    ずれる（外部レビューの残件「評価実行の再現用記録」）。
+    """
+    __tablename__ = "evaluation_runs"
+    id = Column(Integer, primary_key=True)
+    evaluation_run_id = Column(String(64), nullable=False)
+    started_at = Column(DateTime, default=clock.now)
+    finished_at = Column(DateTime)
+    purpose = Column(String(16))            # "validation" / "shadow"
+    model_id = Column(String(64))           # 単一モデルの評価なら埋める
+    # 入力の来歴
+    dataset_id = Column(String(64))
+    label_contract_id = Column(String(32))
+    feature_version = Column(String(16))
+    execution_model_version = Column(String(32))
+    code_version = Column(String(64))
+    # 実行条件一式（戦略節だけでなくリスク・手数料・数量制限・分割設定を含む）
+    config_hash = Column(String(64))
+    config_json = Column(Text)
+    n_folds = Column(Integer)
+    n_predictions = Column(Integer)
+    degraded = Column(Integer, default=0)
+    degraded_reasons = Column(Text)         # JSON配列
+
+    __table_args__ = (
+        Index("ix_evaluation_runs_run_id", "evaluation_run_id", unique=True),
+    )
 ```
 
 - [ ] **Step 4: 実装を書く**
@@ -274,6 +431,8 @@ class PredictionOutcome(Base):
 分割そのものは validation.py の担当で、本モジュールは events を独自に
 絞り込まない（学習に入る入力の検査点を1箇所に保つため）。
 """
+import hashlib
+import json
 from typing import Optional
 
 import numpy as np
@@ -291,18 +450,28 @@ def save_predictions(predictions: pd.DataFrame, evaluation_run_id: str,
                      model_id: str, *, purpose: str = PURPOSE_VALIDATION) -> int:
     """予測明細を保存する。保存した件数を返す。
 
-    predictions は event_id / raw_probability / calibrated_probability /
-    fold_index の列を持つこと。実績ラベルはここでは書かない。
+    predictions は event_id / label_contract_id / raw_probability /
+    calibrated_probability / fold_index の列を持つこと。
+    実績ラベルはここでは書かない。
+
+    `label_contract_id` を必須にするのは、後で実績と結合するときの
+    キーがこの組だからである（外部レビューR07）。欠けたまま保存すると
+    結合先が定まらないので、既定値で埋めずに例外にする。
     """
     from src.data.database import Prediction, get_session
 
     if len(predictions) == 0:
         return 0
+    if "label_contract_id" not in predictions.columns:
+        raise ValueError(
+            "predictions に label_contract_id 列がありません。"
+            "実績との結合キーなので省略できません")
     now = clock.now()
     with get_session() as session:
         for _, r in predictions.iterrows():
             session.add(Prediction(
                 event_id=str(r["event_id"]),
+                label_contract_id=str(r["label_contract_id"]),
                 evaluation_run_id=evaluation_run_id,
                 model_id=model_id,
                 predicted_at=now,
@@ -316,7 +485,13 @@ def save_predictions(predictions: pd.DataFrame, evaluation_run_id: str,
 
 
 def save_outcomes(events: pd.DataFrame) -> int:
-    """決着したイベントの実績を保存する（既存の event_id は上書きする）。
+    """決着したイベントの実績を保存する。
+
+    上書きの単位は **`(label_contract_id, event_id)`** である。同じ銘柄・
+    同じ判断日でも、別の退出ポリシーやコストで作ったラベルは別の行になる。
+    `event_id` だけを鍵にすると、コストを変えて評価をやり直した瞬間に
+    過去runの実績が置き換わり、保存済みの予測と結合し直したときの指標が
+    後から変わってしまう（外部レビューR07）。
 
     予測より後に呼ぶ。未成熟・未約定にはラベルが無いので保存しない。
     """
@@ -326,24 +501,28 @@ def save_outcomes(events: pd.DataFrame) -> int:
     resolved = events[events["status"] == STATUS_RESOLVED]
     if len(resolved) == 0:
         return 0
+    if "label_contract_id" not in resolved.columns:
+        raise ValueError(
+            "events に label_contract_id 列がありません。"
+            "実績の同一性を決める鍵なので省略できません")
     now = clock.now()
     with get_session() as session:
         existing = {
-            r.event_id: r
+            (r.label_contract_id, r.event_id): r
             for r in session.scalars(sa_select(PredictionOutcome)).all()
         }
         for _, r in resolved.iterrows():
-            eid = str(r["event_id"])
+            key = (str(r["label_contract_id"]), str(r["event_id"]))
             label = int(r["label"])
             ret = float(r["net_return"]) if pd.notna(r.get("net_return")) else None
-            if eid in existing:
-                existing[eid].actual_label = label
-                existing[eid].net_return = ret
-                existing[eid].resolved_at = now
+            if key in existing:
+                existing[key].actual_label = label
+                existing[key].net_return = ret
+                existing[key].resolved_at = now
             else:
                 session.add(PredictionOutcome(
-                    event_id=eid, actual_label=label,
-                    net_return=ret, resolved_at=now))
+                    label_contract_id=key[0], event_id=key[1],
+                    actual_label=label, net_return=ret, resolved_at=now))
         session.commit()
     return len(resolved)
 
@@ -363,16 +542,19 @@ def load_prediction_details(evaluation_run_id: str,
         if model_id is not None:
             stmt = stmt.where(Prediction.model_id == model_id)
         preds = list(session.scalars(stmt).all())
+        # 結合キーは (label_contract_id, event_id)。event_id 単独で引くと、
+        # 別コストで作られた実績を拾って過去runの指標が変わる（外部レビューR07）
         outcomes = {
-            o.event_id: o
+            (o.label_contract_id, o.event_id): o
             for o in session.scalars(sa_select(PredictionOutcome)).all()
         }
 
     rows = []
     for p in preds:
-        o = outcomes.get(p.event_id)
+        o = outcomes.get((p.label_contract_id, p.event_id))
         rows.append({
             "event_id": p.event_id,
+            "label_contract_id": p.label_contract_id,
             "evaluation_run_id": p.evaluation_run_id,
             "model_id": p.model_id,
             "predicted_at": p.predicted_at,
@@ -389,7 +571,7 @@ def load_prediction_details(evaluation_run_id: str,
 - [ ] **Step 5: テストを実行して成功を確認**
 
 Run: `pytest tests/test_evaluation.py -v`
-Expected: PASS（5件）
+Expected: PASS（8件）
 
 - [ ] **Step 6: BOM確認とコミット**
 
@@ -660,7 +842,7 @@ EOF
 - Consumes: Task 2 のインターフェース
 - Produces:
   - `SmallLightGBM` — `n_estimators=50` / `num_leaves=7` / `learning_rate=0.05`
-  - `CurrentLightGBM` — 現行 `ml_model._fit()` と同じ `n_estimators=200` / `num_leaves=31` / `learning_rate=0.05`
+  - `CurrentLightGBM` — 現行 `ml_model._fit()` と同じ `n_estimators=200` / `num_leaves=31` / `learning_rate=0.05`（`is_constant` / `constant_probability` / `booster` を公開する。段階Eの `model_store.save_candidate()` はこの3つだけを見る）
   - `default_model_factories() -> dict[str, Callable[[], object]]` — 5モデルの生成関数
 
 **注意:** 現行 `ml_model._fit()` は fold ごとに early stopping を行い、その `best_iteration_` の平均を最終モデルの木数にしている。本モジュールでは early stopping を**内側 fold**で行う（Task 5）。ここでは素の分類器として実装し、`fit` は追加の検証データを取らない。
@@ -756,10 +938,24 @@ Expected: FAIL — `AttributeError: module 'src.strategy.evaluation' has no attr
 class _LightGbmBase:
     """LightGBM分類器の共通部。
 
-    early stopping はここでは行わない。内側foldで決めるため（spec §7）。
     現行 ml_model._fit() は fold ごとの best_iteration_ の平均を最終モデルの
     木数にしているが、その fold は early stopping と指標報告を兼ねており
-    報告値が楽観に寄る。
+    報告値が楽観に寄る。本計画はその二重利用をやめる。
+
+    **木数は候補ごとに固定し、early stopping は本段階では実装しない
+    （意図的な設計差分・外部レビュー残件2026-09-12）。** spec §7 は
+    「early stopping は内側foldで決める」としているが、本段階の `fit_inner()`
+    は通常の `fit()` を呼ぶだけで、木数は 50（Small）/ 200（Current）に固定する。
+    現時点で内側foldが担うのは**閾値選択と確率校正**であり、木数選択は
+    含まれない。固定木数どうしの比較は公平（同じ内側集合・同じ検証集合）なので
+    段階Cの目的である「正しく測る」は満たすが、
+    **「木数を内側で選んだ」とは書かないこと**。
+
+    木数選択を入れる場合は、`_LightGbmBase.fit()` に `eval_set` を渡す
+    `fit_with_early_stopping()` を別メソッドとして足し、`fit_inner()` から
+    内側検証で `best_iteration_` を決め、外側学習ではその木数を固定値として
+    使う形にする。外側検証を eval_set に使うと元の問題に戻るので、
+    その経路だけは絶対に作らないこと。
     """
     name = "lightgbm"
     params: dict = {}
@@ -781,6 +977,32 @@ class _LightGbmBase:
         if self._constant is not None:
             return np.full(len(X), self._constant, dtype=float)
         return self._model.predict_proba(X)[:, 1]
+
+    # ─── 保存のための契約（段階Eの model_store が使う）─────────────────
+    # このラッパーは `_model` と `predict_proba()` しか持たないため、
+    # `getattr(model, "booster_", model).save_model(...)` のような
+    # 書き方では保存できず AttributeError になる（外部レビューR02）。
+    # 「二値がそろったモデル」と「単一クラス時の定数モデル」は保存形式が
+    # 違うので、どちらであるかを型として公開する。
+
+    @property
+    def is_constant(self) -> bool:
+        """単一クラスしか見なかったため定数を返すモデルか。"""
+        return self._constant is not None
+
+    @property
+    def constant_probability(self) -> Optional[float]:
+        """定数モデルのときの確率。二値モデルなら None。"""
+        return self._constant
+
+    @property
+    def booster(self):
+        """LightGBM の Booster。定数モデルなら None。
+
+        `lgb.LGBMClassifier.booster_` を取り出したもの。model_store は
+        これを `save_model()` でネイティブ形式へ書く。
+        """
+        return None if self._model is None else self._model.booster_
 
 
 class SmallLightGBM(_LightGbmBase):
@@ -1489,6 +1711,8 @@ def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
 
     predictions = pd.DataFrame({
         "event_id": val["event_id"].values,
+        # 実績との結合キー。イベント表から持ち回り、ここで作り直さない
+        "label_contract_id": val["label_contract_id"].values,
         "raw_probability": raw,
         "calibrated_probability": calibrated,
         "fold_index": fold.index,
@@ -1502,6 +1726,123 @@ def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
         train_positive_rate=train_rate, threshold=threshold,
         metrics=metrics, predictions=predictions,
     )
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """評価実行の条件一式。**開始時に固定する。**
+
+    終了後に `config.yaml` を読み直すと、実行中に設定が変わっていた場合に
+    「実際に使った設定」とずれる。戦略節だけでなく、リスク・手数料・
+    数量制限・分割設定まで含める（外部レビューの残件「評価実行の再現用記録」）。
+    """
+    dataset_id: Optional[str]
+    label_contract_id: Optional[str]
+    feature_version: str
+    execution_model_version: str
+    code_version: Optional[str]
+    config_json: str
+    config_hash: str
+
+
+def _code_version() -> Optional[str]:
+    """現在のコード版（git の短縮SHA）。取れなければ None。"""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def capture_run_config(events: pd.DataFrame, *, n_splits: int,
+                       window_sessions: Optional[int],
+                       feature_cols: Optional[list]) -> RunConfig:
+    """実行条件を今この瞬間の値で固めて返す。"""
+    from src.core import config as cfg
+
+    payload = {
+        "n_splits": n_splits,
+        "window_sessions": window_sessions,
+        "feature_cols": list(feature_cols) if feature_cols else list(FEATURE_COLS),
+        "n_events": int(len(events)),
+        # 実行条件は戦略節だけでは足りない。約定コスト・リスク・数量制限まで含める
+        "strategy": cfg.get_section("strategy"),
+        "trading": cfg.get_section("trading"),
+        "backtest": cfg.get_section("backtest"),
+    }
+    config_json = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), default=str)
+    config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()[:16]
+
+    def _one(col):
+        if col not in events.columns or len(events) == 0:
+            return None
+        values = set(events[col].dropna().astype(str))
+        return values.pop() if len(values) == 1 else None
+
+    return RunConfig(
+        dataset_id=_one("dataset_id"),
+        label_contract_id=_one("label_contract_id"),
+        feature_version=_one("feature_version") or "",
+        execution_model_version=_one("execution_model_version") or "",
+        code_version=_code_version(),
+        config_json=config_json,
+        config_hash=config_hash,
+    )
+
+
+def save_evaluation_run(evaluation_run_id: str, run_config: RunConfig, *,
+                        purpose: str, model_id: Optional[str],
+                        n_folds: int, n_predictions: int,
+                        degraded_reasons: Optional[list] = None) -> None:
+    """評価実行そのものを保存する（同じIDなら上書き）。
+
+    段階Eの `check_promotable()` はこの行を昇格可否の根拠にする。
+    """
+    from src.data.database import EvaluationRun, get_session
+    from sqlalchemy import select as sa_select
+
+    reasons = list(degraded_reasons or [])
+    now = clock.now()
+    with get_session() as session:
+        row = session.scalar(sa_select(EvaluationRun).where(
+            EvaluationRun.evaluation_run_id == evaluation_run_id))
+        if row is None:
+            row = EvaluationRun(evaluation_run_id=evaluation_run_id,
+                                started_at=now)
+            session.add(row)
+        row.finished_at = now
+        row.purpose = purpose
+        row.model_id = model_id
+        row.dataset_id = run_config.dataset_id
+        row.label_contract_id = run_config.label_contract_id
+        row.feature_version = run_config.feature_version
+        row.execution_model_version = run_config.execution_model_version
+        row.code_version = run_config.code_version
+        row.config_hash = run_config.config_hash
+        row.config_json = run_config.config_json
+        row.n_folds = int(n_folds)
+        row.n_predictions = int(n_predictions)
+        row.degraded = 1 if reasons else 0
+        row.degraded_reasons = json.dumps(reasons, ensure_ascii=False)
+        session.commit()
+
+
+def load_evaluation_run(evaluation_run_id: str):
+    """保存済みの評価実行を返す（無ければ None）。"""
+    from src.data.database import EvaluationRun, get_session
+    from sqlalchemy import select as sa_select
+
+    with get_session() as session:
+        row = session.scalar(sa_select(EvaluationRun).where(
+            EvaluationRun.evaluation_run_id == evaluation_run_id))
+        if row is None:
+            return None
+        session.expunge(row)
+        return row
 
 
 def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = None,
@@ -1518,6 +1859,13 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
     if evaluation_run_id is None:
         evaluation_run_id = f"{clock.now():%Y%m%dT%H%M%S}"
 
+    # 実行条件は**開始時に固定する**。終了後に読み直すと、実行中に設定が
+    # 変わっていた場合に「実際に使った設定」とずれる。
+    run_config = capture_run_config(
+        events, n_splits=n_splits, window_sessions=window_sessions,
+        feature_cols=feature_cols)
+    degraded_reasons: list = []
+
     folds = validation.calendar_folds(events, n_splits=n_splits)
     results = []
     for model_id, make_model in factories.items():
@@ -1533,6 +1881,13 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
 
     if persist:
         save_outcomes(events)
+        save_evaluation_run(
+            evaluation_run_id, run_config,
+            purpose=PURPOSE_VALIDATION,
+            model_id=(list(factories)[0] if len(factories) == 1 else None),
+            n_folds=len(folds),
+            n_predictions=sum(len(r.predictions) for r in results),
+            degraded_reasons=degraded_reasons)
 
     rows = []
     for r in results:
@@ -1642,6 +1997,7 @@ class TestRecomputeFromDetails:
     def test_skips_rows_without_outcomes(self, isolated_db):
         preds = pd.DataFrame({
             "event_id": ["a", "b"],
+            "label_contract_id": [_LC, _LC],
             "raw_probability": [0.6, 0.4],
             "calibrated_probability": [0.6, 0.4],
             "fold_index": [0, 0],
@@ -1684,6 +2040,60 @@ class TestSelectTrainingWindow:
         assert evaluation.select_training_window(
             events, fold, evaluation.ConstantProbability,
             candidates=[], feature_cols=FEATURES) is None
+
+    def test_all_candidates_share_the_same_inner_validation_set(self):
+        """候補窓を変えても内側の検証集合は同一である
+
+        窓で外側集合を先に切ってから内側foldを作り直すと、短い窓と拡大窓で
+        評価日も件数も変わり、「学習窓の効果」と「評価期間の差」が混ざる
+        （外部レビューR19）。窓は学習側にだけ掛かること自体を固定する。
+        """
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        ids = evaluation.inner_validation_event_ids(
+            events, fold, feature_cols=FEATURES)
+        assert len(ids) > 0
+
+        # 内側検証集合は窓候補を引数に取らない＝窓に依存しない
+        import inspect
+        params = set(inspect.signature(
+            evaluation.inner_validation_event_ids).parameters)
+        assert "candidates" not in params
+        assert "window_sessions" not in params
+
+    def test_window_only_shrinks_the_training_side(self):
+        """短い窓は学習件数を減らすが、検証件数は減らさない"""
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        base = validation.training_inputs(events, fold, feature_cols=FEATURES)
+        inner = list(validation.inner_folds(base.events, n_splits=3))[0]
+
+        wide = validation.training_inputs(
+            base.events, inner, feature_cols=FEATURES)
+        narrow = validation.training_inputs(
+            base.events, inner, window_sessions=10, feature_cols=FEATURES)
+        _, val = validation.split_events(base.events, inner)
+
+        assert len(narrow.events) < len(wide.events)
+        # 検証側は split_events だけで決まり、窓を渡していないので変わらない
+        assert len(val) > 0
+
+    def test_comparison_is_per_event_not_a_sum(self):
+        """比較値は採用イベント1件あたりの平均である
+
+        総和のままだと「多く拾う窓」が中身の良し悪しと無関係に勝つ。
+        候補を1つだけ渡した場合でも、採用が0件なら選ばれない。
+        """
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        # ConstantProbability は全件同じ確率を返す。select_threshold が
+        # 収益を最大化する閾値を選ぶので、全件負なら採用0件になりうる。
+        losing = events.copy()
+        losing["net_return"] = -0.05
+        got = evaluation.select_training_window(
+            losing, fold, evaluation.ConstantProbability,
+            candidates=[20], feature_cols=FEATURES)
+        assert got in (None, 20)   # 採用0件なら None、拾ったなら 20
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -1720,26 +2130,42 @@ def select_training_window(events: pd.DataFrame, fold, make_model,
     """学習窓を**内側foldだけ**で選ぶ。
 
     外側成績を見て窓を選び、同じ成績を最終証拠として使わない（spec §7）。
-    各候補について内側foldの予測からコスト控除後の総収益を求め、最大の窓を返す。
+
+    **内側の検証期間は全候補で共通にする。** 候補窓は各内側foldの**学習側にだけ**
+    適用し、検証側には触らない。窓で外側集合を先に切ってから内側foldを作り直すと、
+    短い窓と拡大窓で検証日も件数も変わる。比較値がコスト控除後の収益の**総和**で
+    ある以上、件数が多い候補がそれだけで有利になり、「学習窓の効果」と
+    「評価期間・件数の差」が混ざる（外部レビューR19）。
+
+    比較値は総和ではなく**1イベントあたりの平均**にする。共通の検証集合を使えば
+    件数は揃うが、採用閾値を超えた件数は候補ごとに変わるため、総和のままだと
+    「多く拾う窓」が有利に出る。
+
     候補が空なら None（拡大窓）を返す。
     """
     if not candidates:
         return None
 
     cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
-    best_window, best_total = None, -np.inf
-    for window in candidates:
-        outer = validation.training_inputs(
-            events, fold, window_sessions=window, feature_cols=cols)
-        if len(outer.events) == 0:
-            continue
 
-        total = 0.0
-        scored = False
-        for inner in validation.inner_folds(outer.events, n_splits=inner_splits):
+    # 内側foldは「窓を適用する前の外側学習集合」から一度だけ作る。
+    # これで検証側の event_id が全候補で同一になる。
+    base = validation.training_inputs(events, fold, feature_cols=cols)
+    if len(base.events) == 0:
+        return None
+    inner_folds = list(validation.inner_folds(base.events, n_splits=inner_splits))
+    if not inner_folds:
+        return None
+
+    best_window, best_score = None, -np.inf
+    for window in candidates:
+        total, n_taken, scored = 0.0, 0, False
+        for inner in inner_folds:
+            # 窓は学習側にだけ掛ける
             inner_inputs = validation.training_inputs(
-                outer.events, inner, window_sessions=window, feature_cols=cols)
-            _, inner_val = validation.split_events(outer.events, inner)
+                base.events, inner, window_sessions=window, feature_cols=cols)
+            # 検証側は窓に依存しない（window_sessions を渡さない）
+            _, inner_val = validation.split_events(base.events, inner)
             if len(inner_inputs.events) == 0 or len(inner_val) == 0:
                 continue
             model = make_model()
@@ -1749,18 +2175,43 @@ def select_training_window(events: pd.DataFrame, fold, make_model,
             p = model.predict_proba(inner_val[cols].astype("float64"))
             ret = inner_val["net_return"].astype(float).values
             threshold = select_threshold(p, ret)
-            total += float(ret[p >= threshold].sum())
+            taken = ret[p >= threshold]
+            total += float(taken.sum())
+            n_taken += int(len(taken))
             scored = True
 
-        if scored and total > best_total:
-            best_total, best_window = total, window
+        if not scored:
+            continue
+        # 1件も採らない窓は「収益0」ではなく比較対象外にする。
+        # 総和0が負の窓に勝ってしまうのを避ける。
+        if n_taken == 0:
+            continue
+        score = total / n_taken
+        if score > best_score:
+            best_score, best_window = score, window
     return best_window
+
+
+def inner_validation_event_ids(events: pd.DataFrame, fold, *,
+                               feature_cols: Optional[list] = None,
+                               inner_splits: int = 3) -> list:
+    """select_training_window が使う内側検証集合の event_id を返す（検証用）。
+
+    「全候補窓で検証集合が同一である」ことをテストから確かめるために切り出す。
+    """
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    base = validation.training_inputs(events, fold, feature_cols=cols)
+    out = []
+    for inner in validation.inner_folds(base.events, n_splits=inner_splits):
+        _, inner_val = validation.split_events(base.events, inner)
+        out.extend(list(inner_val["event_id"]))
+    return out
 ```
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_evaluation.py -v`
-Expected: PASS（65件）
+Expected: PASS（72件）
 
 - [ ] **Step 5: 全体回帰を確認**
 

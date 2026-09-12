@@ -440,6 +440,55 @@ class TestLoadPriceBasis:
         market_data.upsert_ohlcv("7203", df)
 
         assert market_data.load_ohlcv("7203")["close"].iloc[0] == 502.5
+
+    def test_adjusted_basis_preserves_low_close_high_invariant(self, tmp_path):
+        """adjusted基準の足は low <= close <= high を満たす。
+
+        終値だけを調整値へ差し替える実装だとここで落ちる。生OHLと調整済み
+        終値が混ざった系列は、指標・ストップ判定・約定価格の全てを狂わせる。
+        """
+        cfg.load("config.yaml")
+        cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+        db.init()
+
+        # 生のlow=980は adjusted_close=850 より高い。
+        # そのまま返すと不変条件が壊れる組み合わせを意図的に選ぶ。
+        df = pd.DataFrame(
+            {
+                "open": [990.0], "high": [1010.0], "low": [980.0],
+                "close": [1000.0], "adjusted_close": [850.0], "volume": [100000],
+            },
+            index=[date(2026, 9, 10)],
+        )
+        df.index.name = "date"
+        market_data.upsert_ohlcv("7203", df)
+
+        adj = market_data.load_ohlcv("7203", price_basis="adjusted")
+        row = adj.iloc[0]
+        assert row["low"] <= row["close"] <= row["high"]
+        # 係数は 850/1000 = 0.85。OHL にも同じ係数が掛かる
+        assert row["low"] == pytest.approx(833.0)
+        assert row["high"] == pytest.approx(858.5)
+        assert row["open"] == pytest.approx(841.5)
+
+    def test_raw_basis_is_untouched(self, tmp_path):
+        """raw基準は調整を一切かけない（株数計算・必要資金の根拠）"""
+        cfg.load("config.yaml")
+        cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+        db.init()
+
+        df = pd.DataFrame(
+            {
+                "open": [990.0], "high": [1010.0], "low": [980.0],
+                "close": [1000.0], "adjusted_close": [850.0], "volume": [100000],
+            },
+            index=[date(2026, 9, 10)],
+        )
+        df.index.name = "date"
+        market_data.upsert_ohlcv("7203", df)
+
+        raw = market_data.load_ohlcv("7203", price_basis="raw")
+        assert list(raw.iloc[0][["open", "high", "low", "close"]]) == [990.0, 1010.0, 980.0, 1000.0]
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -496,17 +545,33 @@ def load_ohlcv(symbol: str, limit: int = 500,
         ).all()))
     if not rows:
         return pd.DataFrame()
-    data = [
-        {
-            "date": r.date,
-            "open": r.open,
-            "high": r.high,
-            "low": r.low,
-            "close": (r.adjusted_close or r.close) if price_basis == "adjusted" else r.close,
-            "volume": r.volume,
-        }
-        for r in rows
-    ]
+    data = []
+    for r in rows:
+        if price_basis == "adjusted":
+            # 終値だけを調整値に差し替えると low <= close <= high が壊れる。
+            # 例: 生 O=1000/H=1010/L=990/C=1000、AdjC=850 のとき、
+            #     L=990 > C=850 となり以後の指標・約定判定が全て狂う。
+            # 分割・配当の調整は全価格に同じ係数が掛かるのが定義なので、
+            # 終値から求めた比率を OHL にも掛ける。
+            adj_close = r.adjusted_close or r.close
+            ratio = (adj_close / r.close) if r.close else 1.0
+            data.append({
+                "date": r.date,
+                "open": r.open * ratio,
+                "high": r.high * ratio,
+                "low": r.low * ratio,
+                "close": adj_close,
+                "volume": r.volume,
+            })
+        else:
+            data.append({
+                "date": r.date,
+                "open": r.open,
+                "high": r.high,
+                "low": r.low,
+                "close": r.close,
+                "volume": r.volume,
+            })
     df = pd.DataFrame(data).set_index("date")
     df.index = pd.to_datetime(df.index)
     return df
@@ -517,7 +582,7 @@ def load_ohlcv(symbol: str, limit: int = 500,
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_market_data_freshness.py -v`
-Expected: PASS（5件）
+Expected: PASS（7件）
 
 - [ ] **Step 5: 既存テストの回帰を確認**
 
@@ -745,7 +810,7 @@ def split_factor_between(symbol: str, start: date, end: date) -> float:
 - [ ] **Step 5: テストを実行して成功を確認**
 
 Run: `pytest tests/test_corporate_actions.py -v`
-Expected: PASS（5件）
+Expected: PASS（7件）
 
 - [ ] **Step 6: コミット**
 
@@ -1336,6 +1401,15 @@ Expected: PASS
 Run: `pytest tests/test_corporate_actions.py::TestSplitInvariant -v`
 Expected: PASS
 
+> **この確認の限界（外部レビューR残件・2026-09-12）。** `TestSplitInvariant` は
+> テスト内で価格を `factor` で割り、株数に `factor` を掛けている。つまり
+> 「`split_factor_between()` が正しい係数を返す」ことしか確認できておらず、
+> 読込系列（`load_ohlcv`）・企業行動イベント・保有ポジションが実際に結線
+> されていることは確認していない。**設計書§14の完了条件「分割だけでNAVが
+> 増えない」は本段階では未達**であり、段階D2（`portfolio.apply_corporate_action()`
+> と walk-forward の日次ループ）で実経路を通すテストを置いて初めて満たされる。
+> 完了表でも段階Aは「係数の取得まで」と記載すること。
+
 - [ ] **確認4: 引け後のT日更新でT日の足が取得範囲に入る**
 
 Run: `pytest tests/test_market_data_freshness.py::TestFetchBoundary -v`
@@ -1347,6 +1421,16 @@ Run: `pytest tests/ -q`
 Expected: 段階A着手前と同じ結果
 
 ---
+
+## 次の段階
+
+**段階Aから持ち越す宿題（外部レビュー2026-09-12）**
+
+- **分割の実経路結線** … 上記「確認3の限界」のとおり段階D2で扱う。
+- **執行用価格と特徴量用価格の分離** … `price_basis="raw"` / `"adjusted"` で
+  入口は分けたが、「どちらを使うか」の判断は各呼び出し側に委ねたままである。
+  段階D1/D2で「現金・株数・約定は raw、特徴量・リターンは adjusted」を
+  型レベルで強制する（`ExecutionPrice` / `FeaturePrice` の別名型）ところまで運ぶ。
 
 ## 次の段階
 

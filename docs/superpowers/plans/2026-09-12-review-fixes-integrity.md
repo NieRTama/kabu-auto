@@ -203,15 +203,83 @@ SOURCE_BOOK_VALUE = "book_value"    # 取得単価での代用（=価格が分�
 QUALITY_FRESH = "fresh"       # 新規リスクの判断に使える
 QUALITY_STALE = "stale"       # 古い。表示には使えるが新規判断には使わない
 QUALITY_UNKNOWN = "unknown"   # 価格が分からない
+```
+
+**`latest_close_rows()` を `src/data/market_data.py` へ足す**（外部レビューR22）。
+
+既存の `latest_closes()`（`src/data/market_data.py:258`）は `{symbol: close}` しか
+返さないため、「何日前の終値か」を呼び出し側が知りようがない。**既存関数は
+変えず**（他の呼び出し側が依存している）、日付付きの姉妹関数を足す。
+
+```python
+@dataclass(frozen=True)
+class LatestClose:
+    """最新終値と、その足の営業日。"""
+    symbol: str
+    close: float
+    date: date
 
 
+def latest_close_rows(symbols: list[str]) -> dict[str, LatestClose]:
+    """指定銘柄群の最新終値を、**足の営業日つきで**まとめて取得する。
+
+    latest_closes() は値だけを返すため、読み出し側が「何日前の終値か」を
+    判定できない。鮮度を扱う経路はこちらを使う（外部レビューR22）。
+    latest_closes() は既存の呼び出し側のためにそのまま残す。
+    """
+    if not symbols:
+        return {}
+    with get_session() as session:
+        rn = func.row_number().over(
+            partition_by=OHLCV.symbol, order_by=OHLCV.date.desc()
+        ).label("rn")
+        subq = (
+            select(OHLCV.symbol, OHLCV.close, OHLCV.date, rn)
+            .where(OHLCV.symbol.in_(symbols))
+            .subquery()
+        )
+        rows = session.execute(
+            select(subq.c.symbol, subq.c.close, subq.c.date)
+            .where(subq.c.rn == 1)
+        ).all()
+    return {r.symbol: LatestClose(symbol=r.symbol, close=r.close, date=r.date)
+            for r in rows if r.close is not None}
+```
+
+**大引け時刻の定数**も置く。`src/data/bar_status.py`（段階Aで新設済み）が
+`_CLOSE_HOUR` / `_CLOSE_MINUTE` を持っているので、そこから公開定数を出す。
+
+```python
+# src/data/bar_status.py に追加（既存の _CLOSE_HOUR / _CLOSE_MINUTE から作る）
+SESSION_CLOSE_TIME = time(_CLOSE_HOUR, _CLOSE_MINUTE)
+```
+
+`PriceQuote` を次に置き換える。
+
+```python
 @dataclass(frozen=True)
 class PriceQuote:
-    """価格と、それをいつ・どこから得たか。"""
+    """価格と、それをいつ・どこから得たか。
+
+    `observed_at` と `read_at` は別物である（外部レビューR22）。
+
+      observed_at … **その価格が市場で成立した時点**。キャッシュから読み
+                    直しても変わらない。DB終値ならその足の大引け時点。
+      read_at     … この呼び出しで値を取り出した時刻。ログや画面表示用。
+
+    鮮度の判定に使うのは `observed_at` だけである。読み出しのたびに
+    `observed_at` を現在時刻へ貼り直すと、許容鮮度2秒のときに4秒前の
+    キャッシュを読んでも鮮度0秒として扱われ、鮮度判定そのものが
+    機能しなくなる。
+
+    `session` は足の営業日（DB終値のとき必須）。「何日前の終値か」を
+    辿るために持つ。
+    """
     symbol: str
     value: float
     observed_at: datetime
     source: str
+    read_at: Optional[datetime] = None
     session: Optional[date] = None
     quality: str = QUALITY_UNKNOWN
 
@@ -319,10 +387,12 @@ class TestRiskManagerQuotes:
         assert quotes["7203"].value == pytest.approx(1000.0)
 
     def test_fallback_values_are_marked_daily_close(self, monkeypatch):
+        from src.data.market_data import LatestClose
         from src.risk import manager as mgr
 
         rm = self._manager(price_fn=lambda syms: {})
-        monkeypatch.setattr(mgr, "latest_closes", lambda syms: {"7203": 990.0})
+        monkeypatch.setattr(mgr, "latest_close_rows", lambda syms: {
+            "7203": LatestClose("7203", 990.0, date(2026, 9, 10))})
         quotes = rm.get_price_quotes(["7203"])
         assert quotes["7203"].source == pq.SOURCE_DAILY_CLOSE
         assert quotes["7203"].value == pytest.approx(990.0)
@@ -332,13 +402,101 @@ class TestRiskManagerQuotes:
         from src.risk import manager as mgr
 
         rm = self._manager(price_fn=lambda syms: {})
-        monkeypatch.setattr(mgr, "latest_closes", lambda syms: {})
+        monkeypatch.setattr(mgr, "latest_close_rows", lambda syms: {})
         assert rm.get_price_quotes(["7203"]) == {}
 
     def test_observed_at_is_recorded(self):
         rm = self._manager(price_fn=lambda syms: {s: 1000.0 for s in syms})
         quotes = rm.get_price_quotes(["7203"])
         assert quotes["7203"].observed_at is not None
+
+
+class TestObservationTimeIsNotRewrittenOnRead:
+    """読み出すたびに観測時刻を現在へ貼り直さないこと（外部レビューR22）。
+
+    貼り直すと、許容鮮度2秒のときに4秒前のキャッシュを読んでも
+    鮮度0秒として扱われ、鮮度判定そのものが機能しなくなる。
+    """
+
+    def _manager(self, price_fn=None):
+        from src.core import config as cfg
+        from src.risk.manager import RiskManager
+
+        cfg.load("config.yaml")
+        return RiskManager(price_fn=price_fn)
+
+    def test_cached_reads_keep_the_original_observed_at(self, monkeypatch):
+        calls = []
+
+        def price_fn(syms):
+            calls.append(tuple(syms))
+            return {s: 1000.0 for s in syms}
+
+        rm = self._manager(price_fn=price_fn)
+        first = rm.get_price_quotes(["7203"])["7203"]
+        second = rm.get_price_quotes(["7203"])["7203"]
+
+        assert len(calls) == 1                      # 2回目はキャッシュ
+        assert second.observed_at == first.observed_at
+
+    def test_read_at_does_advance(self, monkeypatch):
+        """読み出し時刻は別項目として進む"""
+        from src.core import clock
+
+        rm = self._manager(price_fn=lambda syms: {s: 1000.0 for s in syms})
+        first = rm.get_price_quotes(["7203"])["7203"]
+
+        later = clock.now() + timedelta(seconds=30)
+        monkeypatch.setattr(clock, "now", lambda: later)
+        second = rm.get_price_quotes(["7203"])["7203"]
+
+        assert second.observed_at == first.observed_at
+        assert second.read_at == later
+
+    def test_a_stale_cached_value_is_classified_stale(self, monkeypatch):
+        """許容鮮度を過ぎたキャッシュは fresh にならない
+
+        観測時刻を貼り直していると、このテストが必ず fresh になってしまう。
+        """
+        from src.core import clock
+
+        rm = self._manager(price_fn=lambda syms: {s: 1000.0 for s in syms})
+        rm.get_price_quotes(["7203"])
+
+        later = clock.now() + timedelta(seconds=4)
+        monkeypatch.setattr(clock, "now", lambda: later)
+        quote = rm.get_price_quotes(["7203"])["7203"]
+
+        assert pq.classify_quality(quote, later, max_age_seconds=2) ==             pq.QUALITY_STALE
+
+    def test_db_close_carries_the_bar_session(self, monkeypatch):
+        """DB終値には足の営業日が入る（何日前の終値かを辿れる）"""
+        from src.data.market_data import LatestClose
+        from src.risk import manager as mgr
+
+        rm = self._manager(price_fn=lambda syms: {})
+        monkeypatch.setattr(mgr, "latest_close_rows", lambda syms: {
+            "7203": LatestClose("7203", 990.0, date(2026, 9, 10))})
+        quote = rm.get_price_quotes(["7203"])["7203"]
+
+        assert quote.session == date(2026, 9, 10)
+        assert quote.observed_at.date() == date(2026, 9, 10)
+        assert quote.observed_at.hour == 15
+
+    def test_an_old_db_close_is_not_treated_as_current(self, monkeypatch):
+        """何日も前の終値が「今取った値」にならない"""
+        from src.core import clock
+        from src.data.market_data import LatestClose
+        from src.risk import manager as mgr
+
+        rm = self._manager(price_fn=lambda syms: {})
+        monkeypatch.setattr(mgr, "latest_close_rows", lambda syms: {
+            "7203": LatestClose("7203", 990.0, date(2026, 9, 1))})
+        quote = rm.get_price_quotes(["7203"])["7203"]
+
+        now = clock.now()
+        assert (now - quote.observed_at).days >= 1
+        assert pq.classify_quality(quote, now, max_age_seconds=2) != pq.QUALITY_FRESH
 
 
 class TestGetCurrentPricesUnchanged:
@@ -402,8 +560,13 @@ Expected: FAIL — `AttributeError: 'RiskManager' object has no attribute 'get_p
             for s in symbols:
                 cached = self._price_cache.get(s)
                 if cached is not None and cached_now - cached[1] < self._PRICE_CACHE_TTL_SEC:
+                    # **観測時刻は元のまま。読み出し時刻へ貼り直さない。**
+                    # 貼り直すと、許容鮮度2秒のときに4秒前のキャッシュを
+                    # 読んでも鮮度0秒として扱われ、鮮度判定が機能しない
+                    # （外部レビューR22）。
                     quotes[s] = PriceQuote(
-                        symbol=s, value=cached[0], observed_at=now,
+                        symbol=s, value=cached[0],
+                        observed_at=cached[2], read_at=now,
                         source=SOURCE_REALTIME)
                 else:
                     to_fetch.append(s)
@@ -412,19 +575,29 @@ Expected: FAIL — `AttributeError: 'RiskManager' object has no attribute 'get_p
                     fetched = dict(self._price_fn(to_fetch))
                     for s, p in fetched.items():
                         if p:
-                            self._price_cache[s] = (p, cached_now)
+                            # 取得したこの瞬間が観測時刻。以後の読み出しでも
+                            # この値を持ち回る
+                            self._price_cache[s] = (p, cached_now, now)
                             quotes[s] = PriceQuote(
-                                symbol=s, value=float(p), observed_at=now,
+                                symbol=s, value=float(p),
+                                observed_at=now, read_at=now,
                                 source=SOURCE_REALTIME)
                 except Exception as e:
                     logger.warning(f"現在値のリアルタイム取得に失敗（終値で代用します）: {e}")
 
         missing = [s for s in symbols if s not in quotes]
         if missing:
-            for s, p in latest_closes(missing).items():
-                if p:
+            # DB終値は「何日前の終値か」が鮮度である。読み出し時刻を
+            # observed_at にすると常に最新扱いになり、何日前の値かを
+            # 辿れなくなる（外部レビューR22）。足の営業日を持たせる。
+            for s, row in latest_close_rows(missing).items():
+                if row.close:
                     quotes[s] = PriceQuote(
-                        symbol=s, value=float(p), observed_at=now,
+                        symbol=s, value=float(row.close),
+                        # その足の大引け時点を観測時刻とみなす
+                        observed_at=datetime.combine(row.date, SESSION_CLOSE_TIME),
+                        read_at=now,
+                        session=row.date,
                         source=SOURCE_DAILY_CLOSE)
         return quotes
 
@@ -483,7 +656,9 @@ EOF
 - Consumes: なし
 - Produces:
   - `_apply_if_active(name: str, params: dict) -> bool` — アクティブなら適用する共通処理
-  - `import_profile` / `update_custom` / `set_active` が同じ適用関数を通る
+  - `_commit_profile(name, params, *, action)` — **保存してから適用**する共通処理
+  - `_persist_snapshot(custom: dict, active: Optional[str]) -> None` — 共有状態を読まず、渡された内容を原子的に書く
+  - `import_profile` / `update_custom` / `set_active` が同じ適用関数を通る（順序も同じ）
 
 **背景（F11）:** `update_custom()` は更新対象がアクティブなら `_apply()` する（`src/core/risk_profile.py:271-285`）が、`import_profile(..., overwrite=True)` は同じチェックをせず保存だけする（`src/core/risk_profile.py:323-336`）。**アクティブな同名プロファイルを取り込むと、保存した内容と実行中設定が一致しなくなる。**
 
@@ -565,6 +740,102 @@ class TestImportAppliesWhenActive:
         rp.set_active("a")
         rp.set_active("b")
         assert cfg.get_section("trading")["stop_loss_pct"] == pytest.approx(-0.09)
+
+
+class TestSaveFailureLeavesEverythingUnchanged:
+    """保存に失敗したら、稼働中の設定も履歴も保存内容も変わらないこと。
+
+    適用を保存より先に行うと、`os.replace()` が失敗したときに
+    **APIは失敗を返すのに実行中の損切り幅だけ新しい設定**になる。
+    次回起動でファイルの古い設定へ戻るので、再起動を挟むと挙動が変わる。
+    一時ファイルへの保存だけでは解消しない（外部レビューR14）。
+    """
+
+    def _break_persist(self, monkeypatch):
+        import os as os_mod
+
+        def boom(*args, **kwargs):
+            raise OSError("ディスクが一杯です")
+
+        monkeypatch.setattr(os_mod, "replace", boom)
+
+    def test_update_of_the_active_profile_does_not_change_running_config(
+            self, tmp_path, monkeypatch):
+        rp.import_profile("mine", _params(stop=-0.05))
+        rp.set_active("mine")
+        assert cfg.get_section("trading")["stop_loss_pct"] == pytest.approx(-0.05)
+
+        self._break_persist(monkeypatch)
+        with pytest.raises(OSError):
+            rp.update_custom("mine", _params(stop=-0.20))
+
+        # 実行中設定は着手前のまま
+        assert cfg.get_section("trading")["stop_loss_pct"] == pytest.approx(-0.05)
+
+    def test_the_saved_file_is_unchanged_after_a_failed_write(
+            self, tmp_path, monkeypatch):
+        rp.import_profile("mine", _params(stop=-0.05))
+        before = rp._path.read_text(encoding="utf-8")
+
+        self._break_persist(monkeypatch)
+        with pytest.raises(OSError):
+            rp.update_custom("mine", _params(stop=-0.20))
+
+        assert rp._path.read_text(encoding="utf-8") == before
+
+    def test_the_in_memory_profile_is_unchanged_after_a_failed_write(
+            self, tmp_path, monkeypatch):
+        rp.import_profile("mine", _params(stop=-0.05))
+        self._break_persist(monkeypatch)
+        with pytest.raises(OSError):
+            rp.update_custom("mine", _params(stop=-0.20))
+        assert rp.resolve_profile("mine")["stop_loss_pct"] == pytest.approx(-0.05)
+
+    def test_history_is_unchanged_after_a_failed_write(self, tmp_path, monkeypatch):
+        rp.import_profile("mine", _params(stop=-0.05))
+        before = len(rp.list_history())
+
+        self._break_persist(monkeypatch)
+        with pytest.raises(OSError):
+            rp.update_custom("mine", _params(stop=-0.20))
+        assert len(rp.list_history()) == before
+
+    def test_import_of_a_new_inactive_profile_also_rolls_back(
+            self, tmp_path, monkeypatch):
+        """非アクティブ設定の追加が失敗した場合も、何も残さない"""
+        rp.import_profile("mine", _params(stop=-0.05))
+        rp.set_active("mine")
+
+        self._break_persist(monkeypatch)
+        with pytest.raises(OSError):
+            rp.import_profile("other", _params(stop=-0.30))
+
+        assert "other" not in rp.list_profiles()
+        assert cfg.get_section("trading")["stop_loss_pct"] == pytest.approx(-0.05)
+
+    def test_set_active_rolls_back_on_a_failed_write(self, tmp_path, monkeypatch):
+        rp.import_profile("a", _params(stop=-0.05))
+        rp.import_profile("b", _params(stop=-0.30))
+        rp.set_active("a")
+
+        self._break_persist(monkeypatch)
+        with pytest.raises(OSError):
+            rp.set_active("b")
+
+        assert rp.get_active() == "a"
+        assert cfg.get_section("trading")["stop_loss_pct"] == pytest.approx(-0.05)
+
+    def test_a_successful_update_changes_both_together(self, tmp_path):
+        """成功したときは保存内容と実行中設定が必ず一致する"""
+        import json as json_mod
+
+        rp.import_profile("mine", _params(stop=-0.05))
+        rp.set_active("mine")
+        rp.update_custom("mine", _params(stop=-0.20))
+
+        saved = json_mod.loads(rp._path.read_text(encoding="utf-8"))
+        assert saved["custom"]["mine"]["stop_loss_pct"] == pytest.approx(-0.20)
+        assert cfg.get_section("trading")["stop_loss_pct"] == pytest.approx(-0.20)
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -583,35 +854,136 @@ def _apply_if_active(name: str, params: dict) -> bool:
     update_custom だけがこの再適用を持ち、import_profile には無かったため、
     **アクティブな同名プロファイルを取り込むと保存内容と実行中設定が
     食い違っていた**（レビューF11）。適用の判断を1箇所に集める。
+
+    **この関数を保存より先に呼ばないこと。** 呼び出し順は
+    `_commit_profile()` が持つ（外部レビューR14）。
     """
     if _active != name:
         return False
     _apply(params)
     logger.info(f"アクティブなリスクプロファイルを再適用: {name}")
     return True
+
+
+def _commit_profile(name: str, params: dict, *, action: str) -> None:
+    """検証済みのプロファイルを **保存してから** 実行中設定へ反映する。
+
+    変更の順序が結果を分ける（外部レビューR14）。
+
+      悪い順序: `_custom` を書き換える → `_apply_if_active()` → `_persist()`
+        ここで `_persist()` が失敗すると、APIは失敗を返すのに
+        **実行中の損切り幅は新しい設定、保存ファイルは古い設定**になる。
+        次回起動で元へ戻るので、再起動を挟むと挙動が変わる。
+        `_persist()` を一時ファイル経由の原子的書き込みにしても解消しない。
+        原子的なのはファイルの書き換えだけで、共有状態との整合ではない。
+
+      この関数の順序: 候補を共有状態から**分離**して保存を先に完了させ、
+        成功したときだけ `_custom` と実行中設定を一括で切り替える。
+        保存に失敗したら共有状態は着手前のまま残り、例外を送出する。
+
+    `import_profile` / `update_custom` / `set_active` は全てこの関数を通る。
+    どれか1つだけ順序が違う状態を作らないため。
+    """
+    previous_custom = dict(_custom)
+    previous_history = list(_history)
+
+    # 1. 保存する内容を、共有状態とは別に組み立てる
+    candidate_custom = dict(_custom)
+    candidate_custom[name] = params
+
+    # 2. 先に保存する。ここで落ちても共有状態は無傷
+    try:
+        _persist_snapshot(candidate_custom, _active)
+    except Exception:
+        logger.error(f"リスクプロファイルの保存に失敗しました: {name}（変更は破棄）")
+        raise
+
+    # 3. 保存が成功した。共有状態と実行中設定を切り替える
+    try:
+        _custom.clear()
+        _custom.update(candidate_custom)
+        _apply_if_active(name, params)
+        _record_history(action, to=name)
+    except Exception:
+        # 適用側で落ちた場合は共有状態を戻し、保存も戻す
+        _custom.clear()
+        _custom.update(previous_custom)
+        _history.clear()
+        _history.extend(previous_history)
+        _persist_snapshot(previous_custom, _active)
+        raise
+```
+
+`_persist_snapshot` は `_persist` を「渡された内容を書く」形へ一般化したもの。
+共有状態（`_custom` / `_active`）を直接読まないので、保存を先に行える。
+
+```python
+def _persist_snapshot(custom: dict, active: Optional[str]) -> None:
+    """渡された内容を原子的に書く。共有状態は読まない。
+
+    一時ファイルへ書き切ってから os.replace() で差し替える。
+    書き込み途中で落ちても、前の内容が読める状態で残る（レビューF11）。
+    """
+    payload = {"active": active, "custom": custom, "history": list(_history)}
+    _path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{_path.name}.", dir=str(_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(_path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 ```
 
 `update_custom` の適用部分を差し替える。
 
 ```python
-    _custom[name] = validated
-    _apply_if_active(name, validated)
-    _record_history("update", to=name)
+    validated = validate_profile(params)
+    _commit_profile(name, validated, action="update")
 ```
 
-`import_profile` に適用を足す。
+`import_profile` も同じ関数を通す。
 
 ```python
     validated = validate_profile(params)
-    _custom[name] = validated
-    _apply_if_active(name, validated)
-    _record_history("import", to=name)
+    _commit_profile(name, validated, action="import")
 ```
+
+`set_active` も同じ契約へ揃える。**アクティブの切替も「保存してから適用」**である。
+
+```python
+def set_active(name: str) -> None:
+    params = resolve_profile(name)          # 存在しなければここで例外
+    previous_active = _active
+
+    try:
+        _persist_snapshot(dict(_custom), name)
+    except Exception:
+        logger.error(f"アクティブプロファイルの保存に失敗しました: {name}（変更は破棄）")
+        raise
+
+    globals()["_active"] = name
+    try:
+        _apply(params)
+        _record_history("set_active", to=name)
+    except Exception:
+        globals()["_active"] = previous_active
+        _persist_snapshot(dict(_custom), previous_active)
+        raise
+```
+
+`import os`・`import tempfile`・`from typing import Optional` をファイル先頭へ足す。
 
 - [ ] **Step 4: テストを実行して成功を確認**
 
 Run: `pytest tests/test_profile_atomicity.py -v`
-Expected: PASS（5件）
+Expected: PASS（11件）
 
 - [ ] **Step 5: 既存のプロファイルテストが通ることを確認**
 
@@ -1188,23 +1560,125 @@ Expected: 着手前と同じ結果（新規テスト37件ぶんだけ増える�
 
 本番DBに対して検査を1回だけ実行し、結果を記録する。**削除も書き換えもしない。**
 
+> **`db.init()` を使わない（外部レビューR24）。** `init()` は WAL 設定を書き、
+> SQLAlchemy の `create_all()` で**不足しているテーブルを作る**。本計画自身が
+> `init()` 内の WAL 設定を前提にしており、段階B後半以降の計画は新テーブルの
+> 自動作成を前提にしている。旧スキーマの本番DBに対してこの手順を踏むと、
+> 「書き換え禁止」を手順として保証できない。**接続モードで担保する。**
+>
+> SQLite の読み取り専用は URI の `?mode=ro` で指定する。この接続では
+> `CREATE TABLE` も `PRAGMA journal_mode=WAL` も書き込みとして拒否される。
+> 対応していないテーブルがあれば「未対応」として報告し、DBは変更しない。
+
+検査用の読み取り専用接続を `src/data/database.py` へ足す。
+
+```python
+@contextmanager
+def readonly_connection(db_path: Optional[str] = None):
+    """検査専用の読み取り専用接続。
+
+    **初期化・マイグレーション・WAL設定を一切行わない。** init() は
+    create_all() でテーブルを作り、PRAGMA journal_mode=WAL も書く。
+    「本番DBを書き換えずに調べる」手順でそれを呼んではいけない
+    （外部レビューR24）。
+
+    SQLite の `mode=ro` は書き込みを接続レベルで拒否する。手順の約束では
+    なく、DBエンジンが拒否する形にする。
+    """
+    path = db_path or cfg.get_section("data")["db_path"]
+    uri = f"file:{Path(path).as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.row_factory = sqlite3.Row
+        yield conn
+    finally:
+        conn.close()
+
+
+def _table_exists(conn, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone()
+    return row is not None
+
+
+def inspect_integrity_readonly(db_path: Optional[str] = None) -> dict:
+    """本番DBを**一切変更せず**に整合性を調べる。
+
+    旧スキーマで対象テーブルが無い場合は、作らずに "unsupported" を返す。
+    """
+    out: dict = {}
+    with readonly_connection(db_path) as conn:
+        for key, tables, sql in _INTEGRITY_QUERIES:
+            missing = [t for t in tables if not _table_exists(conn, t)]
+            if missing:
+                out[key] = {"status": "unsupported",
+                            "missing_tables": missing}
+                continue
+            out[key] = {"status": "ok",
+                        "rows": [dict(r) for r in conn.execute(sql).fetchall()]}
+    return out
+```
+
+`_INTEGRITY_QUERIES` は `check_referential_integrity()` /
+`check_quantity_consistency()` と**同じ SQL** を素の文字列で持つ。ORM 経由だと
+`create_all()` を伴う経路に戻ってしまうため。
+
+実行する手順。
+
 ```python
 from src.core import config as cfg
 from src.data import database as db
 
-cfg.load("config.yaml")
-db.init()
-print("参照整合:", db.check_referential_integrity())
-print("数量:", db.check_quantity_consistency())
+cfg.load("config.yaml")            # 設定を読むだけ。init() は呼ばない
+import json
+print(json.dumps(db.inspect_integrity_readonly(), ensure_ascii=False, indent=2))
 ```
 
-Expected: 件数が得られること。**不整合が出た場合はユーザーへ報告して指示を仰ぐ。** 自動で修復しない（実取引の履歴であるため）。
+Expected: 件数か `"unsupported"` が得られること。**不整合が出た場合はユーザーへ報告して指示を仰ぐ。** 自動で修復しない（実取引の履歴であるため）。
+
+- [ ] **確認8b: 検査が本番DBを一切変更していないこと**
+
+検査の前後でファイルのハッシュを取り、一致することを確認する。
+
+```bash
+python -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" data/kabu.db
+# 確認8を実行
+python -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" data/kabu.db
+```
+
+Expected: 2つのハッシュが一致すること。`-wal` / `-shm` ファイルが新しく作られていないこと。一致しなければ **その場で止めてユーザーへ報告する**。
 
 ---
 
+## 完了範囲（F10・F15 は「是正完了」にしない）
+
+外部レビュー（2026-09-12）の指摘どおり、本計画で **F10 と F15 は完了しない**。
+完了表の書き方をここで固定する。
+
+| 指摘 | 本計画で完了する範囲 | **完了しない範囲** |
+|---|---|---|
+| **F10**（リスク判断の価格鮮度） | 価格の出所と品質を**区別できる状態**を作る（`PriceQuote` / `classify_quality` / `observed_at` の正しい伝播） | **新規発注判断への適用**。`validate_buy` 等は従来どおり `get_current_prices()` を使い続ける。古い価格・価格不明のときに新規リスク判断を止める変更は入らない |
+| **F15**（DBの参照整合） | 既存の不整合を**検出**する（読み取り専用の検査）。`PRAGMA foreign_keys=ON` を接続時に有効化する | **新規の不整合の防止**。`ForeignKey` 宣言が無い列は `PRAGMA foreign_keys=ON` だけでは保護されない。制約の無い参照列は今回も無制約のまま |
+
+> **`PRAGMA foreign_keys=ON` の限界。** SQLite の外部キー強制は、**スキーマに
+> `REFERENCES` 句がある列にだけ**効く。宣言の無い列に対しては何も検査しない
+> （[SQLite公式](https://www.sqlite.org/foreignkeys.html)）。本計画は宣言を
+> 追加しないので、F15 は**検出段階まで**である。完了報告に「参照整合を
+> 保証した」と書かないこと。
+
+これはバグの見落としではなく、**是正範囲を意図的に先送りしている**という
+判断事項である。先送りの理由は次のとおり。
+
+- **F10**: 鮮度不足で新規発注が止まる頻度が読めない。止まりすぎれば運用が
+  成立しなくなるので、まず「どれだけ古い価格を使っていたか」を実測する。
+- **F15**: `ForeignKey` の追加は既存スキーマからの移行を伴う。実取引の履歴を
+  持つ本番DBに対して行うので、検出でゼロを確認してから、移行・再実行・
+  復元をテストした上で入れる。
+
 ## 残る作業（本計画のスコープ外）
 
-- **`ForeignKey` 宣言の追加**。上記の検査でゼロを確認してから、既存スキーマからの移行・再実行・復元をテストした上で入れる
+- **`ForeignKey` 宣言の追加**（F15の残り）。上記の検査でゼロを確認してから、既存スキーマからの移行・再実行・復元をテストした上で入れる
 - **F10 の結線**。`get_price_quotes` を発注判断（`validate_buy` 等）へ実際に使わせるかは、鮮度不足で発注が止まる頻度を実測してから決める。本計画は「区別できる状態」を作るところまで
 - **PBKDF2 の反復回数**。現行は 200,000 回、OWASP の同方式の推奨は 600,000 回。端末上の認証時間を測った上で強化し、次回の成功ログインで更新する方式が要る（レビュー §7 F13 の付随項目）
 - **設計書への反映**。`docs/詳細設計書.md` / `docs/概要設計書.md` に本計画の変更を追記する

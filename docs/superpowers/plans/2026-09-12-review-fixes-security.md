@@ -427,19 +427,48 @@ async def setup_credentials(req: CredentialsRequest, request: Request):
 
 - [ ] **Step 4: 起動時のトークン発行を結線する**
 
-`src/dashboard/app.py` の起動処理（`_dashboard_token` を決めている箇所と同じ関数）に追加する。**初期設定が必要なときだけ**発行し、コンソールへ一度だけ出す。
+`src/dashboard/app.py` の起動処理（`_dashboard_token` を決めている箇所と同じ関数）から `_init_setup_token()` を呼ぶ。**初期設定が必要なときだけ**発行し、コンソールへ一度だけ出す。テストから直接叩けるよう独立した関数にする。
+
+**トークンは `logger` へ渡さない。** `logger.warning()` はファイルシンクにも
+配送されるため、初期設定が完了する前にログを読める者へ、LAN経由の初期ユーザー
+作成に必要な資格情報が渡る（外部レビューR15）。マスク関数で伏せるのも当てに
+できない — 和文の説明に続く裸のトークンは `token=` にも `Authorization:` にも
+一致しない。**専用のローカルコンソール出力へ分離する。**
 
 ```python
+def _print_setup_token(token: str) -> None:
+    """初期設定トークンを**コンソールにだけ**出す。
+
+    loguru を通さない。logger はファイルシンク・通知シンクへ配送するため、
+    ログを読める者に資格情報が渡る（外部レビューR15）。
+    このプロセスを起動した端末の標準エラー出力にだけ書く。
+
+    ログには「発行した」という事実だけを残し、値は残さない。
+    """
+    import sys
+
+    print("=" * 64, file=sys.stderr)
+    print("初期設定用トークン（この起動でのみ有効・一度だけ表示）", file=sys.stderr)
+    print(f"  {token}", file=sys.stderr)
+    print("LAN経由で初期設定する場合は HTTP ヘッダー X-Setup-Token に指定して",
+          file=sys.stderr)
+    print("ください。端末のローカル操作（127.0.0.1）なら不要です。", file=sys.stderr)
+    print("=" * 64, file=sys.stderr)
+
+
+def _init_setup_token() -> None:
+    """初期設定が必要なときだけトークンを発行する。
+
+    起動処理から呼ぶ。テストが出力先ごとに秘密値の有無を確認できるよう、
+    起動処理に埋め込まず独立した関数にする（外部レビューR15）。
+    """
     global _setup_token
     if auth_store.is_setup_allowed():
         _setup_token = secrets.token_urlsafe(24)
+        _print_setup_token(_setup_token)
+        # ログには事実だけ。値は書かない
         logger.warning(
-            "初期設定用トークン（この起動でのみ有効・一度だけ表示）: "
-            f"{_setup_token}"
-        )
-        logger.warning(
-            "LAN経由で初期設定する場合は HTTP ヘッダー X-Setup-Token に指定してください。"
-            "端末のローカル操作（127.0.0.1）なら不要です。"
+            "初期設定用トークンを発行しました（値はこの端末のコンソールにのみ表示）。"
         )
     else:
         _setup_token = None
@@ -448,7 +477,7 @@ async def setup_credentials(req: CredentialsRequest, request: Request):
 - [ ] **Step 5: テストを実行して成功を確認**
 
 Run: `pytest tests/test_setup_protection.py -v`
-Expected: PASS（18件）
+Expected: PASS（21件）
 
 - [ ] **Step 6: 既存のダッシュボード認証テストが通ることを確認**
 
@@ -480,13 +509,15 @@ EOF
 
 **Files:**
 - Modify: `src/dashboard/app.py:378-384`（`logout`）、`_has_valid_token`
+- Modify: `config.yaml`（`dashboard.allow_query_token` / `dashboard.query_token_until` を追加。既定は `false` / 未設定）
 - Test: `tests/test_logout_revocation.py`
 
 **Interfaces:**
 - Consumes: なし
 - Produces:
   - `logout` が `kabu_session` と `kabu_token` の両方を削除する
-  - `_has_valid_token(request)` が **Cookie 由来のトークンを受け付けない**（ヘッダーとクエリのみ）
+  - `_has_valid_token(request)` が **Cookie 由来のトークンを受け付けない**。既定では `X-API-Token` ヘッダーのみ。`?token=` は `dashboard.allow_query_token: true` の移行期間中だけ
+  - `_query_token_allowed() -> bool` — `dashboard.allow_query_token`（既定 `false`）と `dashboard.query_token_until`（期限、省略可）で判定する
 
 **背景（F13）:** ミドルウェアは `kabu_session` **または** `kabu_token` Cookie を認証として読む（`src/dashboard/app.py:185-191`）。ログアウトはセッションだけを破棄するため、**過去にクエリトークンで発行した `kabu_token` が残っていれば、ログアウト後も認証が続く**。
 
@@ -568,20 +599,68 @@ class TestLogoutRevokesEverything:
         assert client.post("/api/logout").status_code == 200
 
 
-class TestQueryTokenIssuesASession:
-    def test_query_token_grants_a_usable_session(self, client):
+class TestQueryTokenIsDisabledByDefault:
+    """URLクエリのAPIトークンは既定で受け付けない（外部レビューR16）。
+
+    リダイレクトしても、最初のHTTPリクエストにトークンが載った時点で
+    アクセスログ・Referer への流出経路は成立している。漏れたAPIトークンからは
+    ログアウト後も新しいセッションを取れる。既定は無効にする。
+    """
+
+    def test_query_token_does_not_authenticate_by_default(self, client):
+        cfg.get_section("dashboard").pop("allow_query_token", None)
+        assert client.get(
+            "/api/status", params={"token": "api-t0ken"}).status_code == 401
+
+    def test_header_token_still_authenticates(self, client):
+        assert client.get(
+            "/api/status", headers={"X-API-Token": "api-t0ken"}
+        ).status_code == 200
+
+
+class TestQueryTokenDuringMigration:
+    """移行期間中だけ受け付ける。既存ユーザーを締め出さないための繋ぎ。"""
+
+    def _enable(self, until=None):
+        conf = cfg.get_section("dashboard")
+        conf["allow_query_token"] = True
+        if until is None:
+            conf.pop("query_token_until", None)
+        else:
+            conf["query_token_until"] = until
+
+    def test_query_token_grants_a_usable_session_when_enabled(self, client):
         """?token= で到達したブラウザは、以後セッションで通る
 
         Cookieトークンを認証から外したので、代わりにセッションを発行する。
         これが無いと、?token= 付きURLを開く運用が次の遷移で止まる。
         """
+        self._enable()
         client.get("/api/status", params={"token": "api-t0ken"})
         assert client.get("/api/status").status_code == 200
 
     def test_that_session_is_revoked_by_logout(self, client):
+        self._enable()
         client.get("/api/status", params={"token": "api-t0ken"})
         client.post("/api/logout")
         assert client.get("/api/status").status_code == 401
+
+    def test_usage_is_logged_as_a_warning(self, client, caplog):
+        self._enable()
+        with caplog.at_level("WARNING"):
+            client.get("/api/status", params={"token": "api-t0ken"})
+        assert any("X-API-Token" in r.message for r in caplog.records)
+
+    def test_an_expired_migration_window_rejects_the_query_token(self, client):
+        """期限を過ぎたら設定が true でも受け付けない"""
+        self._enable(until="2020-01-01")
+        assert client.get(
+            "/api/status", params={"token": "api-t0ken"}).status_code == 401
+
+    def test_a_future_window_still_accepts(self, client):
+        self._enable(until="2099-12-31")
+        assert client.get(
+            "/api/status", params={"token": "api-t0ken"}).status_code in (200, 303)
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -602,25 +681,82 @@ def _has_valid_token(request: Request) -> bool:
     認証が続いてしまうため（レビューF13）。ブラウザの認証は失効できる
     セッションだけに揃え、プログラム向けはヘッダー限定にする。
     """
-    provided = (
-        request.headers.get("X-API-Token")
-        or request.query_params.get("token")
-    )
+    provided = request.headers.get("X-API-Token")
+    if provided is None and _query_token_allowed():
+        # 移行期間のみ。既定は無効（下記の判断事項を参照）
+        provided = request.query_params.get("token")
     return bool(provided and _dashboard_token is not None
                 and secrets.compare_digest(provided, _dashboard_token))
+
+
+def _query_token_allowed() -> bool:
+    """URLクエリでのAPIトークンを受け付けるか。**既定は False。**
+
+    `config.yaml` の `dashboard.allow_query_token`（既定 `false`）と
+    `dashboard.query_token_until`（YYYY-MM-DD、省略可）で制御する。
+    期限を過ぎたら設定が true でも受け付けない。
+    """
+    conf = cfg.get_section("dashboard")
+    if not conf.get("allow_query_token", False):
+        return False
+    until = conf.get("query_token_until")
+    if until and clock.today() > date.fromisoformat(str(until)):
+        logger.warning(
+            f"URLクエリトークンの移行期限（{until}）を過ぎています。"
+            "X-API-Token ヘッダーへ切り替えてください")
+        return False
+    return True
 ```
+
+> **判断事項: URLクエリトークンをいつ止めるか（外部レビューR16）**
+>
+> レビューの指摘は正しい。`?token=` を受理してセッションを発行し、その後
+> トークンの無いURLへリダイレクトしても、**最初のHTTPリクエストに長期APIトークンが
+> 載る**。アクセスログ・プロキシログ・Referer への流出経路は残る。漏れた
+> APIトークンからはログアウト後も新しいセッションを取得できる。
+> 「リダイレクトしたこと」を漏えい防止の合格条件にはしない。
+>
+> 一方で**即時廃止はユーザーをロックアウトする**。現行の運用はブックマークした
+> `?token=` 付きURLからの接続に依存している可能性が高く、それを黙って切ると
+> LAN内の端末からダッシュボードへ入れなくなる。既存ユーザーを締め出さないことは
+> 本計画の制約である。
+>
+> **本計画の決定:**
+>
+> | | 扱い |
+> |---|---|
+> | ブラウザの認証 | ログイン → **セッションのみ**。Cookieトークンは認証として読まない |
+> | プログラムからのアクセス | **`X-API-Token` ヘッダーのみ** |
+> | `?token=` | **既定で無効**（`allow_query_token: false`）。明示的に有効化したときだけ、移行期間中に限り受理する |
+> | 有効化したとき | 使用のたびに WARNING を出し、ダッシュボードへ移行案内を表示。`query_token_until` の期限を過ぎたら受理しない |
+>
+> 移行手順はユーザーが決める事項として残す。**期限の既定値は置かない**
+> （運用を止めないことが優先のため）。ユーザーがヘッダー認証へ移り終えたら
+> `allow_query_token` を消し、この分岐ごと削除する。
 
 - [ ] **Step 4: クエリトークンでの到達時にセッションを発行する**
 
 ミドルウェアの `?token=` 処理（`_set_token_cookie(redirect)` と `_set_token_cookie(response)` の2箇所）を、セッションの発行に差し替える。
 
 ```python
-    has_query_token = bool(request.query_params.get("token"))
+    # 既定では受け付けない。有効化されている移行期間中だけ真になる
+    # （外部レビューR16。判断事項は Step 3 の表を参照）
+    has_query_token = bool(
+        request.query_params.get("token")) and _query_token_allowed()
+    if has_query_token:
+        # **リダイレクトは漏えい防止の合格条件ではない。** 最初のHTTP
+        # リクエストに長期APIトークンが載った時点で、アクセスログ・
+        # プロキシログ・Referer への流出経路は既に成立している。
+        # 使われたこと自体を記録し、移行を促す。
+        logger.warning(
+            "URLクエリのAPIトークンで到達しました。アクセスログ・Referer に"
+            "トークンが残ります。X-API-Token ヘッダーへ移行してください"
+        )
     # ブラウザで ?token= 付きURLを直開きした場合、**セッションを発行**してから
     # URLからトークンを取り除いたクリーンなURLへ即リダイレクトする。
     # Cookieトークンを認証から外した（F13）ため、繋ぎとしてセッションを渡す。
-    # これによりブラウザ履歴・Referer・スクリーンショット・プロキシログに
-    # トークンが残るのを防ぐ効果は維持される。
+    # 以後のリクエストにトークンが載らなくなる効果はあるが、既に載った
+    # 1回目は取り消せない。
     if has_query_token and accepts_html and request.method == "GET" \
             and not path.startswith("/api/"):
         clean = request.url.remove_query_params("token")
@@ -698,6 +834,8 @@ EOF
 - Consumes: なし
 - Produces:
   - `mask_secrets(text: str) -> str` — Webhook URL・APIトークン・パスワード風の値を伏せる
+  - `_masked_exception(exc: BaseException) -> BaseException` — 例外の文字列表現を伏せた複製（連鎖例外もたどる。元の例外は書き換えない）
+  - `_mask_record(record) -> bool` — loguru フィルタ。`record["message"]` と **`record["exception"]`** の両方を処理する
   - loguru のフォーマッタ／パッチで全ログ出力に適用する
 
 **背景（F14）:** 今回のレビューで実際に、保存済みログから Discord Webhook の ID とトークンを含むURLが1件見つかった。`src/core/alerts.py:119` は `last_error`（例外）をそのまま文字列化しており、**通知失敗の例外にWebhook URLが含まれれば再びログへ残る**。`logger.py` の `diagnose=False` は変数展開を防ぐが、この明示的な例外文字列の出力は防げない。
@@ -813,6 +951,158 @@ class TestAppliedToLogOutput:
         content = path.read_text(encoding="utf-8")
         assert "abcDEF-ghiJKL" not in content
         assert "REDACTED" in content
+
+class TestExceptionsAreMaskedInSinkOutput:
+    """例外本文・トレースバックまでマスクされること（外部レビューR17）。
+
+    `_mask_record()` が `record["message"]` だけを書き換えると、
+    `logger.exception()` の例外は別に整形されるため、Webhook URL を含む
+    例外文字列がそのまま出力へ残る。**マスク関数の単体テストではなく、
+    実際のシンク出力を読んで確かめる。**
+    """
+
+    def _capture(self, tmp_path, emit):
+        from loguru import logger as loguru_logger
+        from src.core import logger as log_mod
+
+        path = tmp_path / "exc.log"
+        sink_id = loguru_logger.add(
+            str(path), format="{message}", level="INFO",
+            filter=log_mod._mask_record, backtrace=True, diagnose=False)
+        try:
+            emit(loguru_logger)
+        finally:
+            loguru_logger.remove(sink_id)
+        return path.read_text(encoding="utf-8")
+
+    def test_logger_exception_masks_the_exception_text(self, tmp_path):
+        def emit(lg):
+            try:
+                raise RuntimeError(f"送信に失敗しました: {_WEBHOOK}")
+            except RuntimeError:
+                lg.exception("通知エラー")
+
+        content = self._capture(tmp_path, emit)
+        assert "abcDEF-ghiJKL" not in content
+        assert "REDACTED" in content
+
+    def test_opt_exception_true_is_masked(self, tmp_path):
+        def emit(lg):
+            try:
+                raise RuntimeError(f"送信に失敗しました: {_WEBHOOK}")
+            except RuntimeError:
+                lg.opt(exception=True).error("通知エラー")
+
+        content = self._capture(tmp_path, emit)
+        assert "abcDEF-ghiJKL" not in content
+
+    def test_chained_exceptions_are_masked_on_both_sides(self, tmp_path):
+        def emit(lg):
+            try:
+                try:
+                    raise ValueError(f"元の失敗: {_WEBHOOK}")
+                except ValueError as e:
+                    raise RuntimeError("通知の再試行にも失敗") from e
+            except RuntimeError:
+                lg.exception("通知エラー")
+
+        content = self._capture(tmp_path, emit)
+        assert "abcDEF-ghiJKL" not in content
+
+    def test_implicit_context_is_masked(self, tmp_path):
+        """`from` を付けない連鎖（__context__）も伏せる"""
+        def emit(lg):
+            try:
+                try:
+                    raise ValueError(f"元の失敗: {_WEBHOOK}")
+                except ValueError:
+                    raise RuntimeError("後続の失敗")
+            except RuntimeError:
+                lg.exception("通知エラー")
+
+        content = self._capture(tmp_path, emit)
+        assert "abcDEF-ghiJKL" not in content
+
+    def test_a_token_in_an_exception_is_masked(self, tmp_path):
+        def emit(lg):
+            try:
+                raise RuntimeError("認証に失敗: X-API-Token: t0k3nvalue1234")
+            except RuntimeError:
+                lg.exception("認証エラー")
+
+        content = self._capture(tmp_path, emit)
+        assert "t0k3nvalue1234" not in content
+
+    def test_the_original_exception_object_is_not_mutated(self, tmp_path):
+        """マスクは複製に対して行う。呼び出し側の例外を壊さない"""
+        from src.core import logger as log_mod
+
+        original = RuntimeError(f"送信に失敗しました: {_WEBHOOK}")
+        masked = log_mod._masked_exception(original)
+        assert _WEBHOOK in str(original)      # 元は無傷
+        assert _WEBHOOK not in str(masked)
+        assert isinstance(masked, RuntimeError)
+
+    def test_a_custom_exception_that_cannot_be_rebuilt_still_masks(self):
+        """引数が独自の例外でも、値を残すより型を失うほうを選ぶ"""
+        from src.core import logger as log_mod
+
+        class Weird(Exception):
+            def __init__(self, a, b, c):
+                super().__init__(f"{a} {b} {c}")
+                self.a, self.b, self.c = a, b, c
+
+        exc = Weird(1, 2, _WEBHOOK)
+        masked = log_mod._masked_exception(exc)
+        assert _WEBHOOK not in str(masked)
+
+
+class TestSetupTokenNeverReachesFileSinks:
+    """初期設定トークンがファイルシンクへ出ないこと（外部レビューR15）。
+
+    マスク関数の単体テストでは足りない。和文の説明に続く裸のトークンは
+    `token=` にも `Authorization:` にも一致しないため、マスクは効かない。
+    **出力先ごとに秘密値の有無を確認する。**
+    """
+
+    def test_the_token_value_is_not_written_to_the_log_file(
+            self, tmp_path, monkeypatch, capsys):
+        from loguru import logger as loguru_logger
+        from src.core import logger as log_mod
+        from src.dashboard import app as dash
+
+        path = tmp_path / "app.log"
+        sink_id = loguru_logger.add(
+            str(path), format="{message}", level="INFO",
+            filter=log_mod._mask_record)
+        try:
+            monkeypatch.setattr(dash.auth_store, "is_setup_allowed",
+                                lambda: True)
+            dash._init_setup_token()          # 起動処理から切り出した関数
+            token = dash._setup_token
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert token
+        content = path.read_text(encoding="utf-8")
+        assert token not in content
+        assert "発行しました" in content      # 事実だけは残る
+
+    def test_the_token_value_goes_to_the_console(self, monkeypatch, capsys):
+        from src.dashboard import app as dash
+
+        monkeypatch.setattr(dash.auth_store, "is_setup_allowed", lambda: True)
+        dash._init_setup_token()
+        captured = capsys.readouterr()
+        assert dash._setup_token in captured.err
+
+    def test_no_token_is_issued_once_setup_is_done(self, monkeypatch, capsys):
+        from src.dashboard import app as dash
+
+        monkeypatch.setattr(dash.auth_store, "is_setup_allowed", lambda: False)
+        dash._init_setup_token()
+        assert dash._setup_token is None
+        assert "初期設定用トークン" not in capsys.readouterr().err
 ```
 
 - [ ] **Step 2: テストを実行して失敗を確認**
@@ -864,10 +1154,55 @@ def _mask_record(record) -> bool:
 
     フィルタで record["message"] を差し替えると、そのシンクの出力に反映される。
     常に True を返す（落とすのではなく伏せるのが目的）。
+
+    **message だけでは足りない。** `logger.exception()` や
+    `logger.opt(exception=True)` の例外は `record["exception"]` に入り、
+    シンクへ書き出す段階で message とは別に整形される。message だけを
+    書き換えても、例外文字列に含まれる Webhook URL やトークンはそのまま
+    出力へ残る（外部レビューR17）。`diagnose=False` は変数値の表示を
+    抑えるだけで、例外文字列そのものを除去する設定ではない。
     """
     record["message"] = mask_secrets(record["message"])
+
+    exc = record.get("exception")
+    if exc is not None and exc.value is not None:
+        # 例外の引数をマスクした複製へ差し替える。型と traceback は保つ
+        record["exception"] = exc._replace(value=_masked_exception(exc.value))
     return True
+
+
+def _masked_exception(exc: BaseException) -> BaseException:
+    """例外の文字列表現から秘密情報を伏せた複製を返す。
+
+    連鎖例外（`raise ... from ...` / `__context__`）もたどる。片方だけを
+    伏せると、`During handling of the above exception` の側に原文が残る。
+
+    元の例外を書き換えない（呼び出し側が握っている同じオブジェクトなので、
+    破壊するとアプリの挙動を変えてしまう）。復元に失敗したら、
+    型を保てなくても**伏せるほうを優先**して RuntimeError へ落とす。
+    """
+    masked_args = tuple(
+        mask_secrets(a) if isinstance(a, str) else a for a in exc.args)
+    try:
+        clone = exc.__class__(*masked_args)
+    except Exception:
+        # 引数の数や型が独自の例外は再構築できない。値を残すよりは
+        # 型を失うほうがましなので、平文の RuntimeError にはしない
+        clone = RuntimeError(f"{exc.__class__.__name__}: "
+                             f"{mask_secrets(str(exc))}")
+    clone.__traceback__ = exc.__traceback__
+    if exc.__cause__ is not None:
+        clone.__cause__ = _masked_exception(exc.__cause__)
+    elif exc.__context__ is not None:
+        clone.__context__ = _masked_exception(exc.__context__)
+    return clone
 ```
+
+> **実装者への注記。** loguru の `record["exception"]` は
+> `(type, value, traceback)` の namedtuple（`RecordException`）である。
+> `_replace(value=...)` で差し替えられる。差し替えが効くかどうかは
+> **実際のシンク出力を読んで確かめる**こと（下記テスト）。マスク関数の
+> 単体テストは、この経路が繋がっている証拠にならない。
 
 - [ ] **Step 4: 既存のシンクへ適用する**
 
