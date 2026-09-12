@@ -10,6 +10,17 @@
 実際の売買判断そのものを学習対象にする。さらに、ラベル期間の重なり
 （label concurrency）がIID仮定を破る問題に対し、サンプルの一意性に
 基づく重み（sample uniqueness weight）を付与して過学習を抑える。
+
+**このモジュールは legacy 経路専用である（段階B後半以降）。**
+v2 経路のラベル生成は src/strategy/dataset.py が担当する。dataset.py は
+退出を policy.py に、約定とコストを backtest/execution.py に委ね、未成熟・
+未約定を別ステータスにして学習対象から外す（本モジュールは max_holding に
+満たない末尾のイベントにも最終リターンの符号でラベルを付ける）。
+
+本モジュールを縮小・変更しないこと。ml_model.train()/train_multi() の
+legacy 経路と src/backtest/engine.py がこの挙動に依存しており、
+strategy.engine_version=legacy で旧評価方式へ戻せることが段階投入の前提
+（設計書 §10）になっている。
 """
 from typing import Tuple
 

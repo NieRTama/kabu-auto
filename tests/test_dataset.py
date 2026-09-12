@@ -697,3 +697,30 @@ class TestUniquenessWeights:
     def test_empty_input_returns_empty(self):
         empty = pd.DataFrame(columns=["entry_at", "label_end_at", "status"])
         assert len(dataset.uniqueness_weights(empty)) == 0
+
+
+class TestLegacyLabelingUnchanged:
+    """labeling.py は legacy 経路が依存しているため挙動を変えない（本計画の差分1）"""
+
+    def test_build_training_set_still_returns_three_parts(self):
+        from src.strategy import labeling
+
+        X, y, w = labeling.build_training_set(_ohlcv(200))
+        assert len(X) == len(y) == len(w)
+        assert list(X.columns) == list(indicators.FEATURE_COLS)
+        assert set(y.unique()) <= {0, 1}
+
+    def test_triple_barrier_labels_still_available(self):
+        from src.strategy import labeling
+
+        feat = indicators.build_features(_ohlcv(200)).reset_index(drop=True)
+        labels, t_ends = labeling.triple_barrier_labels(
+            feat, pt_mult=2.0, sl_mult=2.0, max_holding=10)
+        assert len(labels) == len(feat)
+        assert len(t_ends) == len(feat)
+
+    def test_docstring_marks_module_as_legacy(self):
+        """v2経路はdataset.pyを使うことがモジュール自身に書かれている"""
+        from src.strategy import labeling
+
+        assert "dataset.py" in (labeling.__doc__ or "")
