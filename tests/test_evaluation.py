@@ -5,6 +5,7 @@
 """
 from datetime import date, timedelta
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pytest
@@ -376,6 +377,60 @@ class TestLightGbmModels:
         m = evaluation.SmallLightGBM()
         m.fit(X, y, np.ones(3))
         assert np.allclose(m.predict_proba(X), 0.0)
+
+    def test_falls_back_to_constant_on_all_positive(self):
+        """全部positive（y が全て1）の場合もフォールバックする"""
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([1, 1, 1])
+        m = evaluation.SmallLightGBM()
+        m.fit(X, y, np.ones(3))
+        assert np.allclose(m.predict_proba(X), 1.0)
+
+    def test_lightgbm_properties_on_all_negative_single_class(self):
+        """単一クラス（全部negative）フォールバック時のプロパティ契約を検証"""
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([0, 0, 0])
+        m = evaluation.SmallLightGBM()
+        m.fit(X, y, np.ones(3))
+        # フォールバック時のプロパティ値を検証
+        assert m.is_constant is True
+        assert m.constant_probability == 0.0
+        assert m.booster is None
+
+    def test_lightgbm_properties_on_all_positive_single_class(self):
+        """単一クラス（全部positive）フォールバック時のプロパティ契約を検証"""
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([1, 1, 1])
+        m = evaluation.CurrentLightGBM()
+        m.fit(X, y, np.ones(3))
+        # フォールバック時のプロパティ値を検証
+        assert m.is_constant is True
+        assert m.constant_probability == 1.0
+        assert m.booster is None
+
+    def test_lightgbm_properties_on_normal_binary_training(self):
+        """通常の二値分類時のプロパティ契約を検証"""
+        X, y = self._separable()
+        m = evaluation.SmallLightGBM()
+        m.fit(X, y, np.ones(len(X)))
+        # 通常の二値分類時のプロパティ値を検証
+        assert m.is_constant is False
+        assert m.constant_probability is None
+        assert m.booster is not None
+        # booster は lgb.Booster のインスタンスであることも確認
+        assert isinstance(m.booster, lgb.Booster)
+
+    def test_lightgbm_properties_on_normal_binary_training_current(self):
+        """通常の二値分類時のプロパティ契約を検証（現行版）"""
+        X, y = self._separable()
+        m = evaluation.CurrentLightGBM()
+        m.fit(X, y, np.ones(len(X)))
+        # 通常の二値分類時のプロパティ値を検証
+        assert m.is_constant is False
+        assert m.constant_probability is None
+        assert m.booster is not None
+        # booster は lgb.Booster のインスタンスであることも確認
+        assert isinstance(m.booster, lgb.Booster)
 
     def test_names_are_distinct(self):
         assert evaluation.SmallLightGBM().name == "small_lightgbm"
