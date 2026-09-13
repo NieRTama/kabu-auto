@@ -240,3 +240,54 @@ def calc_quantity(pf: Portfolio, symbol: str, price: float,
     remaining = max(0.0, budget - held_value(pf, symbol, price))
     units = int(remaining / (price * LOT_SIZE))
     return units * LOT_SIZE
+
+
+def check_max_positions(pf: Portfolio, candidate: Optional[str],
+                        conf: SizingConfig) -> tuple:
+    """最大保有銘柄数チェック。(通るか, 理由) を返す。
+
+    src/risk/manager.py:441-474 と同じ考え方で、**銘柄の集合**で判定する。
+    候補が既に保有中なら集合は増えないので通る。
+    """
+    after = set(pf.holdings)
+    if candidate:
+        after = after | {candidate}
+    if len(after) > conf.max_positions:
+        return False, f"最大保有銘柄数({conf.max_positions})に達しています"
+    return True, ""
+
+
+def check_sector_concentration(pf: Portfolio, sector: str,
+                               candidate_notional: float, prices: dict,
+                               conf: SizingConfig) -> tuple:
+    """同一セクターの集中投資チェック。(通るか, 理由) を返す。
+
+    src/risk/manager.py:477-535 と同じ式。
+
+    分子は「同一セクターの建玉評価額 ＋ これから出す注文の金額」。
+    分母は**総資金（現金＋建玉評価額）**。投資済み額を分母にすると、保有が
+    少ないほど必ず超過し、**保有ゼロでは比率が常に100%になって最初の1銘柄を
+    永久に買えない**（2026-09-04に実際に起きた）。買付余力は建玉に変わるだけで
+    総資金は増減しないため、分母に候補金額を足すと二重計上になる。
+
+    比率が上限**以上**なら却下する（実運用と同じく >= で判定）。
+    """
+    positions_value = 0.0
+    same_sector_value = candidate_notional
+    for h in pf.holdings.values():
+        value = h.quantity * _price_of(h, prices)
+        positions_value += value
+        if h.sector == sector:
+            same_sector_value += value
+
+    total_value = pf.cash + positions_value
+    if total_value <= 0:
+        return True, ""
+
+    ratio = same_sector_value / total_value
+    if ratio >= conf.max_sector_ratio:
+        return False, (
+            f"セクター集中率が上限({conf.max_sector_ratio:.0%})超: {sector} "
+            f"（{same_sector_value:,.0f}円 / 総資金{total_value:,.0f}円 = {ratio:.0%}）"
+        )
+    return True, ""

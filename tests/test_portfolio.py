@@ -360,3 +360,118 @@ class TestCalcQuantity:
             holdings={"7203": _holding(qty=held_qty, avg_cost=held_price)},
             reserved=0.0)
         assert pf.calc_quantity(p, "7203", price, _sizing(ratio=ratio)) == expected
+
+
+class TestCheckMaxPositions:
+    def test_allows_when_below_the_cap(self):
+        p = pf.Portfolio(cash=1_000_000.0,
+                         holdings={"7203": _holding(symbol="7203")},
+                         reserved=0.0)
+        ok, _ = pf.check_max_positions(p, "9984", _sizing(max_positions=5))
+        assert ok is True
+
+    def test_rejects_when_candidate_would_exceed(self):
+        holdings = {s: _holding(symbol=s) for s in ("A", "B", "C", "D", "E")}
+        p = pf.Portfolio(cash=1_000_000.0, holdings=holdings, reserved=0.0)
+        ok, reason = pf.check_max_positions(p, "F", _sizing(max_positions=5))
+        assert ok is False
+        assert "最大保有銘柄数" in reason
+
+    def test_already_held_candidate_does_not_grow_the_set(self):
+        """既に保有中の銘柄への買い増しは銘柄数を増やさないので通る"""
+        holdings = {s: _holding(symbol=s) for s in ("A", "B", "C", "D", "E")}
+        p = pf.Portfolio(cash=1_000_000.0, holdings=holdings, reserved=0.0)
+        ok, _ = pf.check_max_positions(p, "C", _sizing(max_positions=5))
+        assert ok is True
+
+    def test_no_candidate_checks_current_state_only(self):
+        holdings = {s: _holding(symbol=s) for s in ("A", "B", "C", "D", "E")}
+        p = pf.Portfolio(cash=1_000_000.0, holdings=holdings, reserved=0.0)
+        ok, _ = pf.check_max_positions(p, None, _sizing(max_positions=5))
+        assert ok is True
+
+
+class TestCheckSectorConcentration:
+    def test_allows_the_first_purchase_from_empty(self):
+        """保有ゼロから最初の1銘柄を買えること。
+
+        分母を投資済み額にすると比率が常に100%になり、最初の1銘柄を
+        永久に買えなくなる（2026-09-04の実害）。分母は総資金にする。
+        """
+        p = pf.empty_portfolio(1_000_000.0)
+        ok, _ = pf.check_sector_concentration(
+            p, "自動車", 147_500.0, {}, _sizing(sector_ratio=0.40))
+        assert ok is True
+
+    def test_rejects_when_candidate_pushes_over_the_cap(self):
+        p = pf.Portfolio(
+            cash=600_000.0,
+            holdings={"7203": _holding(symbol="7203", qty=100, avg_cost=3000.0,
+                                       sector="自動車")},
+            reserved=0.0)
+        # 同セクター 300,000 + 候補 200,000 = 500,000
+        # 総資金 600,000 + 300,000 = 900,000 → 55.6% >= 40%
+        ok, reason = pf.check_sector_concentration(
+            p, "自動車", 200_000.0, {"7203": 3000.0}, _sizing(sector_ratio=0.40))
+        assert ok is False
+        assert "セクター集中率" in reason
+
+    def test_other_sectors_do_not_count(self):
+        p = pf.Portfolio(
+            cash=600_000.0,
+            holdings={"7203": _holding(symbol="7203", qty=100, avg_cost=3000.0,
+                                       sector="自動車")},
+            reserved=0.0)
+        # 候補は別セクターなので分子は候補の200,000のみ → 22.2% < 40%
+        ok, _ = pf.check_sector_concentration(
+            p, "情報通信", 200_000.0, {"7203": 3000.0}, _sizing(sector_ratio=0.40))
+        assert ok is True
+
+    def test_denominator_is_total_capital_not_invested_amount(self):
+        """分母は総資金（現金＋建玉）。現金が多いほど比率は下がる"""
+        holdings = {"7203": _holding(symbol="7203", qty=100, avg_cost=3000.0,
+                                     sector="自動車")}
+        rich = pf.Portfolio(cash=5_000_000.0, holdings=holdings, reserved=0.0)
+        poor = pf.Portfolio(cash=100_000.0, holdings=holdings, reserved=0.0)
+        prices = {"7203": 3000.0}
+        assert pf.check_sector_concentration(
+            rich, "自動車", 100_000.0, prices, _sizing(sector_ratio=0.40))[0] is True
+        assert pf.check_sector_concentration(
+            poor, "自動車", 100_000.0, prices, _sizing(sector_ratio=0.40))[0] is False
+
+    def test_uses_avg_cost_when_price_missing(self):
+        p = pf.Portfolio(
+            cash=600_000.0,
+            holdings={"7203": _holding(symbol="7203", qty=100, avg_cost=3000.0,
+                                       sector="自動車")},
+            reserved=0.0)
+        with_price = pf.check_sector_concentration(
+            p, "自動車", 200_000.0, {"7203": 3000.0}, _sizing(sector_ratio=0.40))
+        without_price = pf.check_sector_concentration(
+            p, "自動車", 200_000.0, {}, _sizing(sector_ratio=0.40))
+        assert with_price[0] == without_price[0]
+
+    def test_matches_production_formula(self):
+        """src/risk/manager.py:511-536 と同じ式であること"""
+        cash, qty, price, candidate = 600_000.0, 100, 3000.0, 200_000.0
+        positions_value = qty * price
+        same_sector_value = positions_value + candidate
+        total_value = cash + positions_value
+        expected_ok = (same_sector_value / total_value) < 0.40
+
+        p = pf.Portfolio(
+            cash=cash,
+            holdings={"7203": _holding(symbol="7203", qty=qty, avg_cost=price,
+                                       sector="自動車")},
+            reserved=0.0)
+        ok, _ = pf.check_sector_concentration(
+            p, "自動車", candidate, {"7203": price}, _sizing(sector_ratio=0.40))
+        assert ok is expected_ok
+
+    def test_ratio_at_exactly_the_cap_is_rejected(self):
+        """上限ちょうどは却下（実運用が >= で判定しているため）"""
+        p = pf.Portfolio(cash=600_000.0, holdings={}, reserved=0.0)
+        # 候補240,000 / 総資金600,000 = 40.0%
+        ok, _ = pf.check_sector_concentration(
+            p, "自動車", 240_000.0, {}, _sizing(sector_ratio=0.40))
+        assert ok is False
