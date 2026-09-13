@@ -222,3 +222,97 @@ class TestOutcomeIsolationBetweenLabelContracts:
         evaluation.save_outcomes(self._outcome_events(self._COSTLY, 0))
         details = evaluation.load_prediction_details("run1")
         assert pd.isna(details["actual_label"].iloc[0])
+
+
+def _xy(events: pd.DataFrame):
+    X = events[FEATURES].astype("float64")
+    y = events["label"].astype(int)
+    w = np.ones(len(events))
+    return X, y, w
+
+
+class TestConstantProbability:
+    def test_predicts_the_training_positive_rate(self):
+        events = _events(n_sessions=40)
+        X, y, w = _xy(events)
+        m = evaluation.ConstantProbability()
+        m.fit(X, y, w)
+        p = m.predict_proba(X)
+        assert len(p) == len(X)
+        assert np.allclose(p, y.mean())
+
+    def test_does_not_look_at_features(self):
+        """特徴量を変えても予測は変わらない（床としての性質）"""
+        events = _events(n_sessions=40)
+        X, y, w = _xy(events)
+        m = evaluation.ConstantProbability()
+        m.fit(X, y, w)
+        shifted = X.copy()
+        shifted["x1"] = shifted["x1"] + 100.0
+        assert np.allclose(m.predict_proba(X), m.predict_proba(shifted))
+
+    def test_has_a_name(self):
+        assert evaluation.ConstantProbability().name == "constant_probability"
+
+
+class TestMajorityClass:
+    def test_predicts_one_when_positives_dominate(self):
+        X = pd.DataFrame({"x1": [0.0] * 10, "x2": [0.0] * 10})
+        y = pd.Series([1] * 7 + [0] * 3)
+        m = evaluation.MajorityClass()
+        m.fit(X, y, np.ones(10))
+        assert np.allclose(m.predict_proba(X), 1.0)
+
+    def test_predicts_zero_when_negatives_dominate(self):
+        X = pd.DataFrame({"x1": [0.0] * 10, "x2": [0.0] * 10})
+        y = pd.Series([1] * 3 + [0] * 7)
+        m = evaluation.MajorityClass()
+        m.fit(X, y, np.ones(10))
+        assert np.allclose(m.predict_proba(X), 0.0)
+
+    def test_has_a_name(self):
+        assert evaluation.MajorityClass().name == "majority_class"
+
+
+class TestLogisticRegressionModel:
+    def test_learns_a_separable_signal(self):
+        """x1がラベルと相関する合成データで、正例に高い確率を付ける"""
+        rng = np.random.default_rng(3)
+        y = pd.Series([0] * 100 + [1] * 100)
+        X = pd.DataFrame({
+            "x1": np.concatenate([rng.normal(-2, 0.5, 100), rng.normal(2, 0.5, 100)]),
+            "x2": rng.normal(0, 1, 200),
+        })
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, np.ones(len(X)))
+        p = m.predict_proba(X)
+        assert p[y == 1].mean() > p[y == 0].mean()
+
+    def test_probabilities_are_in_range(self):
+        events = _events(n_sessions=60)
+        X, y, w = _xy(events)
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, w)
+        p = m.predict_proba(X)
+        assert ((p >= 0.0) & (p <= 1.0)).all()
+
+    def test_standardizes_with_training_statistics_only(self):
+        """学習時の統計量で変換する。推論側で fit し直さない"""
+        events = _events(n_sessions=60)
+        X, y, w = _xy(events)
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, w)
+        p_small = m.predict_proba(X.iloc[:5])
+        p_full = m.predict_proba(X)
+        assert np.allclose(p_small, p_full[:5])
+
+    def test_falls_back_to_constant_on_single_class(self):
+        """学習側が片側クラスだけなら定数を返す（例外にしない）"""
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([1, 1, 1])
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, np.ones(3))
+        assert np.allclose(m.predict_proba(X), 1.0)
+
+    def test_has_a_name(self):
+        assert evaluation.LogisticRegressionModel().name == "logistic_regression"

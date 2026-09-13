@@ -19,9 +19,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from loguru import logger
+from sklearn.linear_model import LogisticRegression
 
 from src.core import clock
 from src.strategy.dataset import STATUS_RESOLVED
+from src.strategy.validation import Preprocessor, apply_preprocessor, fit_preprocessor
 
 PURPOSE_VALIDATION = "validation"
 PURPOSE_SHADOW = "shadow"
@@ -147,3 +149,77 @@ def load_prediction_details(evaluation_run_id: str,
             "net_return": o.net_return if o else np.nan,
         })
     return pd.DataFrame(rows)
+
+
+class ConstantProbability:
+    """学習側の正例率を全件に返す。Brier / log loss の床。
+
+    特徴量を一切見ないため、これを上回れないモデルは「確率の質」で
+    何も足していない。
+    """
+    name = "constant_probability"
+
+    def __init__(self) -> None:
+        self._p = 0.5
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: np.ndarray) -> None:
+        self._p = float(np.average(y.astype(float), weights=sample_weight)) \
+            if len(y) and np.sum(sample_weight) > 0 else 0.5
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        return np.full(len(X), self._p, dtype=float)
+
+
+class MajorityClass:
+    """学習側の多数派クラスを 0.0 / 1.0 として返す。accuracy の床。"""
+    name = "majority_class"
+
+    def __init__(self) -> None:
+        self._label = 0.0
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: np.ndarray) -> None:
+        rate = float(np.average(y.astype(float), weights=sample_weight)) \
+            if len(y) and np.sum(sample_weight) > 0 else 0.0
+        self._label = 1.0 if rate >= 0.5 else 0.0
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        return np.full(len(X), self._label, dtype=float)
+
+
+class LogisticRegressionModel:
+    """標準化した特徴量で学習するロジスティック回帰。
+
+    標準化の統計量は**学習時に固定**し、推論側では fit し直さない
+    （validation.fit_preprocessor と同じ規約）。
+    """
+    name = "logistic_regression"
+
+    def __init__(self, feature_cols: Optional[list] = None) -> None:
+        self._feature_cols = feature_cols
+        self._pre: Optional[Preprocessor] = None
+        self._model: Optional[LogisticRegression] = None
+        self._constant: Optional[float] = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: np.ndarray) -> None:
+        cols = self._feature_cols or list(X.columns)
+        self._feature_cols = cols
+        frame = X.copy()
+        frame["label"] = y.values
+        self._pre = fit_preprocessor(frame, feature_cols=cols)
+
+        if y.nunique() < 2:
+            # 片側クラスだけでは境界を引けない。定数にフォールバックする
+            self._constant = float(y.iloc[0]) if len(y) else 0.5
+            self._model = None
+            return
+
+        self._constant = None
+        Z = apply_preprocessor(self._pre, X, feature_cols=cols)
+        self._model = LogisticRegression(max_iter=1000, random_state=42)
+        self._model.fit(Z, y, sample_weight=sample_weight)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        if self._constant is not None:
+            return np.full(len(X), self._constant, dtype=float)
+        Z = apply_preprocessor(self._pre, X, feature_cols=self._feature_cols)
+        return self._model.predict_proba(Z)[:, 1]
