@@ -628,35 +628,45 @@ class TestFitInner:
             events, fold, evaluation.ConstantProbability, feature_cols=FEATURES)
         assert 0.0 <= thr <= 1.0
 
-    def test_inner_training_and_threshold_events_are_disjoint_from_outer_validation(self):
-        """校正・閾値選択に使われたevent_idは、外側検証のevent_idと完全に排他
+    def test_inner_training_and_threshold_events_are_disjoint_from_outer_validation(
+            self, monkeypatch):
+        """fit_inner() を実際に呼び出し、内部で validation.inner_folds() に渡された
+        引数（＝外側学習側のはずのイベント集合）が外側検証のevent_idと
+        完全に排他であることを検証する。
 
-        tests/test_validation.py の TestOuterFoldIsUntouchable/TestInnerFolds が
-        確立した流儀に合わせ、tamper-invariance だけでなく event_id 集合の
-        直接比較でもリークがないことを検証する。fit_inner() は内部で
-        training_inputs/inner_folds/split_events を組み合わせて内側foldの
-        学習・検証イベントを作るので、同じ公開APIで同じ手順を再構成し、
-        そこで実際に使われたevent_id集合が外側検証のevent_id集合と
-        1件も重ならないことを set の交差が空集合であることで直接確認する。
+        前回のテストは fit_inner() を一度も呼ばず、テストコード自身が
+        training_inputs/inner_folds/split_events を独立に再実行して
+        「fit_inner が使うはずの」event_id集合を再構成するだけだった。
+        これでは fit_inner() の実装が実際にその手順をなぞっているかを
+        検証できず、例えば inner_folds に outer_train ではなく events
+        （フルの外側検証込みデータ）を渡すリークバグが混入しても検知
+        できなかった。
+
+        ここでは src/strategy/evaluation.py が `from src.strategy import
+        validation` でモジュール参照していることを利用し、
+        evaluation.validation.inner_folds をスパイに差し替えて、
+        fit_inner() の内部から実際に呼ばれた際の引数を捕捉する。
         """
         events = _events(n_sessions=120)
         fold = validation.calendar_folds(events, n_splits=5)[3]
 
+        # fit_inner の外側から見える「外側検証集合」を独立に計算
         _, outer_val = validation.split_events(events, fold)
         outer_val_ids = set(outer_val["event_id"])
         assert len(outer_val_ids) > 0
 
-        outer = validation.training_inputs(events, fold, feature_cols=FEATURES)
-        outer_train = outer.events
+        captured_train_event_ids: set = set()
+        real_inner_folds = evaluation.validation.inner_folds
 
-        # fit_inner() が内側foldごとに学習・閾値選択へ実際に使うevent_idの集合
-        # （src/strategy/evaluation.py の fit_inner 実装と同じ手順で再構成する）
-        inner_ids: set = set()
-        for inner in validation.inner_folds(outer_train, n_splits=3):
-            inner_inputs = validation.training_inputs(outer_train, inner, feature_cols=FEATURES)
-            _, inner_val = validation.split_events(outer_train, inner)
-            inner_ids.update(inner_inputs.events["event_id"])
-            inner_ids.update(inner_val["event_id"])
+        def spy_inner_folds(train_events, *args, **kwargs):
+            captured_train_event_ids.update(train_events["event_id"])
+            return real_inner_folds(train_events, *args, **kwargs)
 
-        assert len(inner_ids) > 0
-        assert inner_ids.isdisjoint(outer_val_ids)
+        monkeypatch.setattr(evaluation.validation, "inner_folds", spy_inner_folds)
+
+        evaluation.fit_inner(events, fold, evaluation.ConstantProbability,
+                              feature_cols=FEATURES)
+
+        # スパイが実際に呼ばれたことを保証する（空集合同士の比較は自明にPASSしてしまう）
+        assert len(captured_train_event_ids) > 0
+        assert captured_train_event_ids.isdisjoint(outer_val_ids)
