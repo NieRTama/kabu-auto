@@ -397,11 +397,33 @@ class TradingServices:
                 should_exit, exit_reason = self.risk.evaluate_exit(sym, price)
                 if should_exit:
                     logger.warning(f"退出発動: {sym} ({exit_reason})")
+                    label = "利益確定（トレーリングストップ）" if exit_reason == "trailing_stop" else "損切り"
+                    if is_paper and self._paper_uses_v2_execution():
+                        # v2: 日足の終値/始値で判断した直後に同じ価格帯で約定させない。
+                        # signal_scan のSELL経路と同じ合流先（Signal保存）に載せ、
+                        # 翌営業日の morning_execution が実際の退出発注（sell）を行う。
+                        # ここでは sell_market を呼ばない（判断と執行のセッションを分ける）。
+                        _save_signal(TradeSignal(
+                            symbol=sym,
+                            action="SELL",
+                            rule_score=0.0,
+                            ml_score=0.0,
+                            combined_score=0.0,
+                        ))
+                        logger.warning(
+                            f"退出シグナル保存（翌営業日執行予定）: {sym} reason={exit_reason}"
+                        )
+                        alert(
+                            f"{label}判定（翌営業日寄りで執行予定）",
+                            f"{sym} @{price:.0f}円 が退出条件（{exit_reason}）に達しました。"
+                            "翌営業日の寄りで退出注文を出します。",
+                            level=LEVEL_INFO,
+                        )
+                        continue
                     # 損切り・トレーリングストップとも確実な約定を優先し成行で発注する
                     # （指値だと急変時に約定しない）。reason経由で日次上限・損失上限等の
                     # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
                     order_id = self.order_mgr.sell_market(sym, qty, reason=exit_reason)
-                    label = "利益確定（トレーリングストップ）" if exit_reason == "trailing_stop" else "損切り"
                     if order_id:
                         alert(f"{label}実行", f"{sym} @{price:.0f}円", level=LEVEL_INFO)
                     else:
@@ -504,7 +526,9 @@ class TradingServices:
 
         実行対象は paper 以外（live / dry_run / semi_live）。発注の実体は OrderManager が
         モードに応じて分岐する（live=実発注 / dry_run=実発注せず記録のみ / semi_live=承認キュー）。
-        paper は signal_scan 内で当日終値で即時シミュレートするため morning は不要。
+        paper（legacy）は signal_scan 内で当日終値で即時シミュレートするため morning は不要。
+        ただし paper かつ engine_version: v2 のときは例外で、signal_scan / stop_loss_check が
+        保存したBUY/SELLシグナルを翌営業日の寄りでここが拾う（_paper_uses_v2_execution）。
         """
         self._execute_pending_signals(source="morning_execution", skip_existing=False)
 
@@ -559,7 +583,9 @@ class TradingServices:
         対象から除外する（同日の二度打ち防止。前日までの保有は対象外＝買い増しを許す）。
         """
         mode = self.trading_conf.get("mode", "paper")
-        if not tm.uses_morning_execution(mode):
+        if not tm.uses_morning_execution(mode) and not (
+            mode == "paper" and self._paper_uses_v2_execution()
+        ):
             return
         if not TradingScheduler.is_market_open():
             return
