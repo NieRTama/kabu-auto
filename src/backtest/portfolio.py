@@ -205,3 +205,38 @@ def advance_session(pf: Portfolio, prices: dict) -> Portfolio:
         holdings[symbol] = replace(h, peak_price=peak,
                                    sessions_held=h.sessions_held + 1)
     return replace(pf, holdings=holdings)
+
+
+@dataclass(frozen=True)
+class SizingConfig:
+    """資金配分の制限。実運用は trading 節（risk_profile で上書きされる）から来る。"""
+    max_position_ratio: float   # 1銘柄あたり最大資金比率
+    max_positions: int          # 最大同時保有銘柄数
+    max_sector_ratio: float     # 同一セクター最大集中率
+
+
+def position_budget(pf: Portfolio, conf: SizingConfig) -> float:
+    """1銘柄に投じられる上限額。
+
+    src/risk/manager.py:382-396 と同じ式。「**残余力に対する比率**」であり
+    総資産に対する比率ではない。未約定買いの引当を差し引いた実効余力に
+    比率を掛ける（未約定中の多重発注で余力を二重に使う事故を防ぐ）。
+    """
+    available = max(0.0, pf.cash - pf.reserved)
+    return available * conf.max_position_ratio
+
+
+def calc_quantity(pf: Portfolio, symbol: str, price: float,
+                  conf: SizingConfig) -> int:
+    """購入株数（単元切り捨て）。
+
+    src/risk/manager.py:418-439 と同じ式。1銘柄あたりの上限から**既存保有の
+    評価額を差し引いた残り枠**まで買える。差し引かないと、上限いっぱい
+    保有した銘柄へさらに満額買い増そうとしてしまう。
+    """
+    if price <= 0:
+        return 0
+    budget = position_budget(pf, conf)
+    remaining = max(0.0, budget - held_value(pf, symbol, price))
+    units = int(remaining / (price * LOT_SIZE))
+    return units * LOT_SIZE

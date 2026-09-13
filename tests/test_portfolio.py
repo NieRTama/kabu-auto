@@ -285,3 +285,78 @@ class TestAdvanceSession:
         before = self._held()
         after = pf.advance_session(before, {"7203": 1200.0})
         assert after.cash == pytest.approx(before.cash)
+
+
+def _sizing(ratio=0.25, max_positions=5, sector_ratio=0.40):
+    return pf.SizingConfig(max_position_ratio=ratio, max_positions=max_positions,
+                           max_sector_ratio=sector_ratio)
+
+
+class TestPositionBudget:
+    def test_is_ratio_of_effective_cash(self):
+        p = pf.Portfolio(cash=1_000_000.0, holdings={}, reserved=0.0)
+        assert pf.position_budget(p, _sizing(ratio=0.25)) == pytest.approx(250_000.0)
+
+    def test_reserved_reduces_the_budget(self):
+        """未約定買いの引当を差し引いた実効余力で上限を計算する"""
+        p = pf.Portfolio(cash=1_000_000.0, holdings={}, reserved=200_000.0)
+        assert pf.position_budget(p, _sizing(ratio=0.25)) == pytest.approx(200_000.0)
+
+    def test_never_negative(self):
+        p = pf.Portfolio(cash=100_000.0, holdings={}, reserved=500_000.0)
+        assert pf.position_budget(p, _sizing(ratio=0.25)) == pytest.approx(0.0)
+
+    def test_matches_production_formula(self):
+        """src/risk/manager.py:382-396 と同じ式であること"""
+        cash, reserved, ratio = 1_000_000.0, 150_000.0, 0.25
+        expected = max(0.0, cash - reserved) * ratio
+        p = pf.Portfolio(cash=cash, holdings={}, reserved=reserved)
+        assert pf.position_budget(p, _sizing(ratio=ratio)) == pytest.approx(expected)
+
+
+class TestCalcQuantity:
+    def test_rounds_down_to_lot_size(self):
+        p = pf.Portfolio(cash=1_000_000.0, holdings={}, reserved=0.0)
+        # 枠250,000円 ÷ 1,050円 = 238株 → 単元切り捨てで200株
+        assert pf.calc_quantity(p, "7203", 1050.0, _sizing(ratio=0.25)) == 200
+
+    def test_zero_when_one_lot_exceeds_budget(self):
+        """単元の必要額が枠を超えたら0株（買えない）"""
+        p = pf.Portfolio(cash=1_000_000.0, holdings={}, reserved=0.0)
+        # 枠250,000円 < 単元必要額 300,000円
+        assert pf.calc_quantity(p, "9983", 3000.0, _sizing(ratio=0.25)) == 0
+
+    def test_existing_holding_reduces_the_remaining_budget(self):
+        """既存保有の評価額を上限から差し引く（買い増しで枠を二重に使わない）"""
+        p = pf.Portfolio(
+            cash=1_000_000.0,
+            holdings={"7203": _holding(qty=100, avg_cost=1000.0)},
+            reserved=0.0)
+        # 枠250,000 − 既存保有100株×1,000円=100,000 → 残り150,000 → 100株
+        assert pf.calc_quantity(p, "7203", 1000.0, _sizing(ratio=0.25)) == 100
+
+    def test_zero_when_already_at_the_cap(self):
+        p = pf.Portfolio(
+            cash=1_000_000.0,
+            holdings={"7203": _holding(qty=300, avg_cost=1000.0)},
+            reserved=0.0)
+        # 枠250,000 < 既存保有300,000 → 残り0
+        assert pf.calc_quantity(p, "7203", 1000.0, _sizing(ratio=0.25)) == 0
+
+    def test_zero_for_non_positive_price(self):
+        p = pf.Portfolio(cash=1_000_000.0, holdings={}, reserved=0.0)
+        assert pf.calc_quantity(p, "7203", 0.0, _sizing()) == 0
+
+    def test_matches_production_formula(self):
+        """src/risk/manager.py:418-439 と同じ式であること"""
+        cash, ratio, price = 1_000_000.0, 0.25, 1050.0
+        held_qty, held_price = 100, 1050.0
+        budget = max(0.0, cash - 0.0) * ratio
+        remaining = max(0.0, budget - held_qty * held_price)
+        expected = int(remaining / (price * pf.LOT_SIZE)) * pf.LOT_SIZE
+
+        p = pf.Portfolio(
+            cash=cash,
+            holdings={"7203": _holding(qty=held_qty, avg_cost=held_price)},
+            reserved=0.0)
+        assert pf.calc_quantity(p, "7203", price, _sizing(ratio=ratio)) == expected
