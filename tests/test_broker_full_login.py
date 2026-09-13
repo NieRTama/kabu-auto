@@ -334,7 +334,7 @@ class TestRunningFlagBlocksOverlapPastCooldownWindow:
             th.join(timeout=5)
 
         assert ok2 is False
-        assert "実行中" in detail2
+        assert "進行中" in detail2
         assert mock_run.call_count == 1, (
             f"subprocess.run が{mock_run.call_count}回実行された"
             "（実行中フラグが二重実行を防げていない）"

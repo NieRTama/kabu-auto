@@ -42,10 +42,15 @@ RELAUNCH_COOLDOWN_SECONDS = 60
 # KabuS.exe の起動・再起動を行う全モジュールで共有するロック（broker_process_lock.py 参照）。
 # 別々のロックを持つと、broker_full_login.py の完全自動ログインと同時に有効化した際
 # 互いを知らずに二重起動しうる（2026-09-13 に発見）。
+#
+# クールダウン起点（直近の操作完了時刻）も broker_process_lock.py のものを使う
+# （このモジュール独自の _last_launch_at は持たない）。ロックだけ共有しても
+# クールダウン起点がモジュールごとに別々のままだと、broker_full_login.run() が
+# 完全自動ログインを完了させた直後に broker_launcher.launch() がそれを知らずに
+# 起動を試み、逆方向の二重起動を招く（2026-09-13、再現テストで確認）。
 _lock = broker_process_lock.lock
 _attempts: int = 0
 _attempts_date: Optional[date] = None
-_last_launch_at: float = 0.0
 
 
 def _today() -> date:
@@ -113,11 +118,11 @@ def _roll_over_if_new_day() -> None:
 
 def reset() -> None:
     """テスト用に試行回数とクールダウンを初期化する。"""
-    global _attempts, _attempts_date, _last_launch_at
+    global _attempts, _attempts_date
     with _lock:
         _attempts = 0
         _attempts_date = None
-        _last_launch_at = 0.0
+    broker_process_lock.reset()
 
 
 def launch(exe_path: str = "", *,
@@ -131,10 +136,16 @@ def launch(exe_path: str = "", *,
     自動起動と違い、日次上限で止めず・その残枠も消費せず・起動の有無を
     確認できなかった場合も通す。自動起動を無効にした構成では、これが唯一の
     起動経路になるため、機械的な安全弁で人の操作まで塞がないようにする。
+
+    クールダウン起点（`broker_process_lock.last_operation_at`）と実行中フラグ
+    （`broker_process_lock.in_progress`）は broker_full_login.py と共有する。
+    broker_full_login.run() が完全自動ログインを完了させた直後や実行中に、
+    それを知らずにここから重ねて起動を試みると二重起動になるため
+    （2026-09-13、再現テストで確認）。
     """
     path = exe_path or DEFAULT_EXE_PATH
 
-    global _attempts, _last_launch_at
+    global _attempts
     # 二重起動を実際に止めているのは下の**クールダウン**（起動直後は tasklist に
     # 現れず probe_running() が False を返し続けるため、これが無いと近接した2回目が
     # 必ず通る）。生存確認をロック内に入れているのは多重防御で、
@@ -155,10 +166,20 @@ def launch(exe_path: str = "", *,
         if not os.path.isfile(path):
             return False, f"実行ファイルが見つかりません: {path}"
 
-        elapsed = _now() - _last_launch_at
-        if _last_launch_at and elapsed < RELAUNCH_COOLDOWN_SECONDS:
+        if broker_process_lock.in_progress:
+            # broker_full_login.run() の完全自動ログインが今まさに実行中
+            # （KabuS.exeをkillして再起動している最中）。経過時間に関係なく
+            # 無条件で拒否する（クールダウンだけでは、full_login のタイムアウト
+            # 上限がクールダウン秒数を超えるため隙間ができる）。
             return False, (
-                f"起動直後です（{int(elapsed)}秒前に起動）。プロセス一覧に現れるまで"
+                "完全自動ログイン等、別の起動/再起動操作が進行中です。"
+                "完了までお待ちください"
+            )
+
+        elapsed = _now() - broker_process_lock.last_operation_at
+        if elapsed < RELAUNCH_COOLDOWN_SECONDS:
+            return False, (
+                f"起動直後です（{int(elapsed)}秒前に起動/再起動）。プロセス一覧に現れるまで"
                 f"{RELAUNCH_COOLDOWN_SECONDS}秒は再起動しません"
             )
 
@@ -177,14 +198,17 @@ def launch(exe_path: str = "", *,
             _attempts += 1
             attempt_no = _attempts
 
+        broker_process_lock.in_progress = True
         try:
             # 同じデスクトップセッションで起動する（GUIを人が操作できるように）。
             # 親プロセス終了に巻き込まれないよう切り離す。
             subprocess.Popen([path], close_fds=True)
         except Exception as e:
+            broker_process_lock.in_progress = False
             logger.error(f"kabuステーションの起動に失敗しました: {e}")
             return False, f"起動に失敗しました: {e}"
-        _last_launch_at = _now()
+        broker_process_lock.last_operation_at = _now()
+        broker_process_lock.in_progress = False
 
     how = "手動" if attempt_no is None else f"本日{attempt_no}回目"
     logger.warning(f"kabuステーションを起動しました（{how}）: {path}")
