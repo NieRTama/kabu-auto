@@ -13,6 +13,7 @@
 src/backtest/portfolio.py に委ね、本モジュールは進行と記録だけを担う。
 旧 engine.py は strategy.engine_version: legacy の受け皿として無改造で残す。
 """
+import json
 from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Callable, Optional
@@ -23,6 +24,7 @@ from loguru import logger
 
 from src.backtest import execution
 from src.backtest import portfolio as pf
+from src.core import clock
 from src.strategy import policy
 
 _DAILY_COLUMNS = ["session", "nav", "cash", "n_holdings", "realized_pnl"]
@@ -92,6 +94,67 @@ class RetrainConfig:
     """
     every_sessions: int = 0
     warmup_sessions: int = 0
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    """実行開始時に固定する来歴。
+
+    config_hash は同一性の確認には使えるが**復元には使えない**ため、
+    設定の実体（config_json）も併せて持つ（spec §8）。
+    """
+    strategy_version: str
+    config_hash: str
+    config_json: str
+    dataset_id: Optional[str] = None
+    code_version: Optional[str] = None
+    execution_model_version: Optional[str] = None
+
+
+def save_run(result: WalkForwardResult, snapshot: RunSnapshot, *,
+             symbol_label: str, start: date, end: date,
+             initial_capital: float, costs: execution.CostConfig) -> int:
+    """実行結果と来歴を保存し、run_id を返す。
+
+    日次NAVは equity_curve_json に、モデル使用履歴は RunModelUsage に入れる。
+    degraded な実行も**保存する**（比較から外すのは読む側の責任で、
+    「失敗した実行があったこと」自体は残す）。
+    """
+    from src.data.database import BacktestRun, RunModelUsage, get_session
+
+    final_capital = float(result.daily["nav"].iloc[-1]) if len(result.daily) else initial_capital
+    total_return = (final_capital - initial_capital) / initial_capital if initial_capital else 0.0
+    curve = [{"date": r["session"].isoformat(), "equity": round(float(r["nav"]), 0)}
+             for _, r in result.daily.iterrows()]
+
+    with get_session() as session:
+        run = BacktestRun(
+            symbol=symbol_label, start_date=start, end_date=end,
+            initial_capital=initial_capital, final_capital=final_capital,
+            total_return=total_return,
+            trade_count=len(result.trades),
+            slippage_pct=costs.slippage_pct, commission_pct=costs.commission_pct,
+            created_at=clock.now(),
+            equity_curve_json=json.dumps(curve, ensure_ascii=False),
+            strategy_version=snapshot.strategy_version,
+            config_hash=snapshot.config_hash,
+            config_json=snapshot.config_json,
+            dataset_id=snapshot.dataset_id,
+            code_version=snapshot.code_version,
+            execution_model_version=snapshot.execution_model_version,
+            degraded=1 if result.degraded else 0,
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.id
+        for _, u in result.model_usage.iterrows():
+            session.add(RunModelUsage(
+                run_id=run_id, model_id=u["model_id"],
+                from_session=u["from_session"], to_session=u["to_session"],
+                n_train_events=int(u["n_train_events"]),
+            ))
+        session.commit()
+    return run_id
 
 
 def sessions_between(md: MarketData, start: date, end: date) -> list:
@@ -229,6 +292,17 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
     current_model_id: Optional[str] = None
     model_since: Optional[date] = None
     current_n_train = 0
+    degraded_reasons: list = []
+
+    if train_model is None or retrain is None or retrain.every_sessions <= 0:
+        if model is not None:
+            # 過去の全日付を1つのモデルで判断する実行。
+            # そのモデルが評価期間より後のデータで学習されていないことを
+            # この関数は確かめられない。診断には使えるが、walk-forward成績
+            # として昇格の根拠にはできない（外部レビューR04）。
+            degraded_reasons.append(
+                "再学習が結線されていないため全期間を単一モデルで判断した"
+                "（診断用。昇格の根拠にできない）")
 
     for index, session in enumerate(sessions):
         # ⓪ 再学習（この時点までに確定した情報だけで学習する）
@@ -242,9 +316,13 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                     "to_session": sessions[index - 1],
                     "n_train_events": current_n_train,
                 })
-            current_model, current_n_train = train_model(session)
-            current_model_id = str(current_model)
-            model_since = session
+            try:
+                current_model, current_n_train = train_model(session)
+                current_model_id = str(current_model)
+                model_since = session
+            except Exception as e:
+                degraded_reasons.append(f"{session}: 再学習に失敗しました: {e}")
+                logger.warning(f"バックテスト中の再学習に失敗: {session} {e}")
 
         realized = 0.0
         closes = closes_at(md, session)
@@ -337,7 +415,12 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
         rows = {s: _row_for(md, s, session) for s in md.bars}
         rows = {s: r for s, r in rows.items() if r is not None}
         ctx = {"sectors": md.sectors, "portfolio": state, "closes": closes}
-        candidates = decide(session, rows, current_model, ctx)
+        try:
+            candidates = decide(session, rows, current_model, ctx)
+        except Exception as e:
+            degraded_reasons.append(f"{session}: 判断に失敗しました: {e}")
+            logger.warning(f"バックテスト中の判断に失敗: {session} {e}")
+            candidates = []
         if candidates:
             orders, rejects = pf.allocate(state, candidates, sizing, closes)
             pending_buys = orders
@@ -355,8 +438,8 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
         daily=pd.DataFrame([vars(r) for r in daily], columns=_DAILY_COLUMNS),
         trades=pd.DataFrame(trades, columns=_TRADE_COLUMNS),
         rejected=pd.DataFrame(rejected, columns=_REJECTED_COLUMNS),
-        degraded=False,
-        degraded_reasons=[],
+        degraded=bool(degraded_reasons),
+        degraded_reasons=degraded_reasons,
         model_usage=pd.DataFrame(model_usage, columns=_MODEL_USAGE_COLUMNS),
     )
 

@@ -372,6 +372,19 @@ class BacktestRun(Base):
     sell_threshold = Column(Float)  # この実行で実際に使われた売り閾値
     archived = Column(Integer, default=0)  # 1=アーカイブ済み（一覧から除外。履歴は保持）
 
+    # ─── 再現用の来歴（段階D。レビュー Backtest）────────────────────
+    # 現行は閾値とコストしか持たず、どの設定・どのモデル・どの入力データで
+    # 出した成績かを後から辿れなかった。config_hash は同一性の確認には使えるが
+    # 復元には使えないため、設定の実体も併せて持つ。
+    strategy_version = Column(String(32))
+    config_hash = Column(String(64))
+    config_json = Column(Text)
+    dataset_id = Column(String(64))
+    code_version = Column(String(64))
+    execution_model_version = Column(String(32))
+    # 推論例外が1件でも発生した実行は 1。比較とモデル昇格から除外する
+    degraded = Column(Integer, default=0)
+
 
 class SchemaVersion(Base):
     """DBスキーマのバージョンを記録する1行テーブル（P2-4）。

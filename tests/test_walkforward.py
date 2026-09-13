@@ -10,10 +10,14 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 import pytest
+from sqlalchemy import select
 
 from src.backtest import execution
 from src.backtest import portfolio as pf
 from src.backtest import walkforward as wf
+from src.core import config as cfg
+from src.data import database as db
+from src.data.database import get_session
 from src.strategy import policy
 
 
@@ -638,3 +642,232 @@ class TestWeeklyRetrain:
             retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
             train_model=None)
         assert res.model_usage.empty
+
+
+@pytest.fixture
+def isolated_db(tmp_path):
+    cfg.load("config.yaml")
+    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
+    db.init()
+    return tmp_path
+
+
+class TestDegraded:
+    def test_decide_exception_marks_degraded(self):
+        """判断規則で例外が出たら握り潰さずdegradedを立てる"""
+        md = _market(symbols=("A",), n=10)
+
+        def broken(session, rows, model, ctx):
+            raise RuntimeError("推論に失敗しました")
+
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=1_000_000.0, decide=broken,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        assert res.degraded is True
+        assert len(res.degraded_reasons) > 0
+        assert "推論に失敗しました" in res.degraded_reasons[0]
+
+    def test_run_continues_after_a_failure(self):
+        """失敗しても最後まで進む（どこまで進んだかを残すため）"""
+        md = _market(symbols=("A",), n=10)
+
+        def broken(session, rows, model, ctx):
+            raise RuntimeError("boom")
+
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=1_000_000.0, decide=broken,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        assert len(res.daily) == 10
+
+    def test_training_exception_marks_degraded(self):
+        md = _market(symbols=("A",), n=20)
+
+        def broken_train(as_of):
+            raise RuntimeError("学習に失敗しました")
+
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=broken_train)
+        assert res.degraded is True
+
+    def test_clean_run_is_not_degraded(self):
+        md = _market(symbols=("A",), n=10)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        assert res.degraded is False
+
+
+class TestSaveRun:
+    def _result(self):
+        md = _market(symbols=("A",), n=10)
+        return wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+
+    def _snapshot(self):
+        return wf.RunSnapshot(
+            strategy_version="rule_then_ml_v1", config_hash="abc123",
+            config_json='{"buy_threshold": 0.25}', dataset_id="ds0001",
+            code_version="deadbeef", execution_model_version="t1_open_v1")
+
+    def test_records_the_full_snapshot(self, isolated_db):
+        run_id = wf.save_run(
+            self._result(), self._snapshot(), symbol_label="PORTFOLIO",
+            start=date(2026, 1, 5), end=date(2026, 1, 14),
+            initial_capital=1_000_000.0, costs=_costs(slip=0.001, comm=0.0005))
+
+        with get_session() as session:
+            row = session.scalar(select(db.BacktestRun))
+        assert row.id == run_id
+        assert row.strategy_version == "rule_then_ml_v1"
+        assert row.config_hash == "abc123"
+        assert row.dataset_id == "ds0001"
+        assert row.code_version == "deadbeef"
+        assert row.execution_model_version == "t1_open_v1"
+        assert row.slippage_pct == pytest.approx(0.001)
+        assert row.commission_pct == pytest.approx(0.0005)
+
+    def test_stores_the_config_body_not_just_the_hash(self, isolated_db):
+        """config_hash は同一性の確認には使えるが復元には使えない"""
+        wf.save_run(
+            self._result(), self._snapshot(), symbol_label="PORTFOLIO",
+            start=date(2026, 1, 5), end=date(2026, 1, 14),
+            initial_capital=1_000_000.0, costs=_costs())
+        with get_session() as session:
+            row = session.scalar(select(db.BacktestRun))
+        assert "buy_threshold" in row.config_json
+
+    def test_degraded_flag_is_persisted(self, isolated_db):
+        md = _market(symbols=("A",), n=10)
+
+        def broken(session, rows, model, ctx):
+            raise RuntimeError("boom")
+
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=1_000_000.0, decide=broken,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        wf.save_run(res, self._snapshot(), symbol_label="PORTFOLIO",
+                    start=date(2026, 1, 5), end=date(2026, 1, 14),
+                    initial_capital=1_000_000.0, costs=_costs())
+        with get_session() as session:
+            row = session.scalar(select(db.BacktestRun))
+        assert row.degraded == 1
+
+    def test_model_usage_rows_are_linked_to_the_run(self, isolated_db):
+        md = _market(symbols=("A",), n=20)
+
+        def train(as_of):
+            return f"m@{as_of:%Y%m%d}", 50
+
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=train)
+        run_id = wf.save_run(
+            res, self._snapshot(), symbol_label="PORTFOLIO",
+            start=date(2026, 1, 5), end=date(2026, 1, 24),
+            initial_capital=1_000_000.0, costs=_costs())
+
+        with get_session() as session:
+            usages = list(session.scalars(select(db.RunModelUsage)).all())
+        assert len(usages) == len(res.model_usage)
+        assert all(u.run_id == run_id for u in usages)
+
+    def test_daily_nav_is_stored_as_the_equity_curve(self, isolated_db):
+        wf.save_run(
+            self._result(), self._snapshot(), symbol_label="PORTFOLIO",
+            start=date(2026, 1, 5), end=date(2026, 1, 14),
+            initial_capital=1_000_000.0, costs=_costs())
+        with get_session() as session:
+            row = session.scalar(select(db.BacktestRun))
+        assert row.equity_curve_json is not None
+        assert "2026-01-05" in row.equity_curve_json
+
+
+class TestPastPredictionsAreNotAffectedByFutureData:
+    """過去の判断が、その後に足されたデータで変わらないこと（外部レビューR04）。"""
+
+    def _trainer(self, events_by_session):
+        """as_of までのイベント数だけをモデルIDに焼き込む学習関数"""
+        def train(as_of):
+            n = sum(1 for d in events_by_session if d <= as_of)
+            return f"model-n{n}", n
+        return train
+
+    def test_same_past_decisions_when_future_bars_are_appended(self):
+        short = _market(symbols=("A",), n=20)
+        long_ = _market(symbols=("A",), n=40)
+        events = sorted(set(short.bars["A"].index.date)
+                        | set(long_.bars["A"].index.date))
+        seen_short, seen_long = [], []
+
+        def make_decide(sink):
+            def decide(session, rows, model, ctx):
+                sink.append((session, model))
+                return []
+            return decide
+
+        common_end = date(2026, 1, 24)
+        for md, sink in ((short, seen_short), (long_, seen_long)):
+            wf.run_walkforward(
+                md, date(2026, 1, 5), common_end,
+                initial_capital=1_000_000.0, decide=make_decide(sink),
+                policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+                liquidity=execution.LiquidityConfig(),
+                retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+                train_model=self._trainer(events))
+
+        # 共通期間の判断は、後ろにデータを足しても同一
+        assert seen_short == seen_long
+
+    def test_a_run_without_retrain_is_degraded(self):
+        """固定モデル実行は診断用。昇格の根拠にはできない"""
+        md = _market(symbols=("A",), n=20)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            model="fixed-model")
+        assert res.degraded is True
+        assert any("再学習が結線されていない" in r for r in res.degraded_reasons)
+
+    def test_a_retrained_run_is_not_degraded_for_that_reason(self):
+        md = _market(symbols=("A",), n=20)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=self._trainer([]))
+        assert not any("再学習が結線されていない" in r
+                       for r in res.degraded_reasons)
+
+    def test_no_model_and_no_retrain_is_not_degraded(self):
+        """ルールのみの実行は劣化ではない（意図したML無効）"""
+        md = _market(symbols=("A",), n=20)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        assert res.degraded is False
