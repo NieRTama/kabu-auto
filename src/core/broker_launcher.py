@@ -20,12 +20,13 @@ kabu-auto はデスクトップセッション内で動いているため、そ�
 """
 import os
 import subprocess
-import threading
 import time
 from datetime import date
 from typing import Optional
 
 from loguru import logger
+
+from src.core import broker_process_lock
 
 DEFAULT_EXE_PATH = os.path.join(
     os.environ.get("LOCALAPPDATA", ""), "kabuStation", "KabuS.exe"
@@ -38,7 +39,10 @@ DEFAULT_MAX_ATTEMPTS_PER_DAY = 3
 # Discord の launch コマンド等）がそこを踏むと二重起動になる。
 RELAUNCH_COOLDOWN_SECONDS = 60
 
-_lock = threading.Lock()
+# KabuS.exe の起動・再起動を行う全モジュールで共有するロック（broker_process_lock.py 参照）。
+# 別々のロックを持つと、broker_full_login.py の完全自動ログインと同時に有効化した際
+# 互いを知らずに二重起動しうる（2026-09-13 に発見）。
+_lock = broker_process_lock.lock
 _attempts: int = 0
 _attempts_date: Optional[date] = None
 _last_launch_at: float = 0.0

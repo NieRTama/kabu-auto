@@ -26,12 +26,13 @@ kabu-auto は従来、Kabuステーションの起動のみを自動化し、2�
 日次試行回数上限を持つ。
 """
 import subprocess
-import threading
 import time
 from datetime import date
 from typing import Optional
 
 from loguru import logger
+
+from src.core import broker_process_lock
 
 DEFAULT_WSL_DISTRO = "Ubuntu"
 DEFAULT_PROJECT_DIR = "~/projects/kabusapi-auto-login-template"
@@ -44,7 +45,10 @@ DEFAULT_MAX_ATTEMPTS_PER_DAY = 3
 # 走ると起動直後のプロセスをまた落とすことになる）。
 RERUN_COOLDOWN_SECONDS = 60
 
-_lock = threading.Lock()
+# KabuS.exe の起動・再起動を行う全モジュールで共有するロック（broker_process_lock.py 参照）。
+# 別々のロックを持つと、broker_launcher.py の生存監視自動起動と同時に有効化した際
+# 互いを知らずに二重起動しうる（2026-09-13 に発見）。
+_lock = broker_process_lock.lock
 _attempts: int = 0
 _attempts_date: Optional[date] = None
 _last_run_at: float = -float('inf')
