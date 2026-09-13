@@ -539,3 +539,102 @@ class TestVolumeLimit:
             liquidity=execution.LiquidityConfig(max_volume_share=0.1))
         assert res.daily["n_holdings"].eq(0).all()
         assert res.rejected["reason"].str.contains("出来高").any()
+
+
+class TestWeeklyRetrain:
+    def _recording_trainer(self):
+        """呼ばれた as_of を記録する学習関数"""
+        calls = []
+
+        def train(as_of):
+            calls.append(as_of)
+            return f"model@{as_of:%Y%m%d}", 100
+        return train, calls
+
+    def test_retrains_on_the_configured_interval(self):
+        md = _market(symbols=("A",), n=20)
+        train, calls = self._recording_trainer()
+        wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=train)
+        # 助走5営業日のあと、5営業日ごとに学習する
+        assert len(calls) == 3
+
+    def test_model_usage_records_each_period(self):
+        md = _market(symbols=("A",), n=20)
+        train, _ = self._recording_trainer()
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=train)
+        assert list(res.model_usage.columns) == ["model_id", "from_session",
+                                                 "to_session", "n_train_events"]
+        assert len(res.model_usage) == 3
+        assert res.model_usage["from_session"].is_monotonic_increasing
+
+    def test_model_is_passed_to_decide(self):
+        """decide はその時点で有効なモデルを受け取る"""
+        md = _market(symbols=("A",), n=20)
+        train, _ = self._recording_trainer()
+        seen = []
+
+        def decide(session, rows, model, ctx):
+            seen.append(model)
+            return []
+
+        wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=decide,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=train)
+        assert seen[0] is None                      # 助走中はモデル無し
+        # 助走5・間隔5なので index 5/10/15 で学習し、index15 は 2026-01-20
+        assert seen[-1] == "model@20260120"          # 最後の学習が効いている
+
+    def test_as_of_never_looks_ahead(self):
+        """学習の基準日は、その時点のセッションを超えない"""
+        md = _market(symbols=("A",), n=20)
+        train, calls = self._recording_trainer()
+        wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=train)
+        sessions = wf.sessions_between(md, date(2026, 1, 5), date(2026, 1, 24))
+        for as_of in calls:
+            assert as_of in sessions
+
+    def test_disabled_when_interval_is_zero(self):
+        md = _market(symbols=("A",), n=20)
+        train, calls = self._recording_trainer()
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=0, warmup_sessions=5),
+            train_model=train)
+        assert calls == []
+        assert res.model_usage.empty
+
+    def test_no_retrain_without_a_trainer(self):
+        md = _market(symbols=("A",), n=20)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=None)
+        assert res.model_usage.empty

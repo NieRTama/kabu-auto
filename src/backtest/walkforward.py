@@ -29,7 +29,7 @@ _DAILY_COLUMNS = ["session", "nav", "cash", "n_holdings", "realized_pnl"]
 _TRADE_COLUMNS = ["symbol", "entry_at", "entry_price", "exit_at", "exit_price",
                   "quantity", "pnl", "reason"]
 _REJECTED_COLUMNS = ["session", "symbol", "reason"]
-_MODEL_USAGE_COLUMNS = ["model_id", "from_session", "to_session"]
+_MODEL_USAGE_COLUMNS = ["model_id", "from_session", "to_session", "n_train_events"]
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,18 @@ class WalkForwardResult:
     degraded_reasons: list
     model_usage: pd.DataFrame
     run_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RetrainConfig:
+    """期間中の再学習スケジュール。
+
+    every_sessions は再学習の間隔（営業日）。0で無効。
+    warmup_sessions は最初の学習までに必要な助走期間。
+    実運用が週次で再学習するなら every_sessions=5 で同じ周期になる。
+    """
+    every_sessions: int = 0
+    warmup_sessions: int = 0
 
 
 def sessions_between(md: MarketData, start: date, end: date) -> list:
@@ -174,6 +186,8 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                     liquidity: execution.LiquidityConfig,
                     model=None,
                     exit_score_fn: Optional[Callable] = None,
+                    retrain: Optional[RetrainConfig] = None,
+                    train_model: Optional[Callable] = None,
                     ) -> WalkForwardResult:
     """日次5フェーズでポートフォリオを進める。
 
@@ -187,14 +201,20 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
     `decide(session, rows, model, ctx) -> list[portfolio.Candidate]`。
 
     **model は「その判断時点で利用可能だったモデル」でなければならない。**
-    本タスクの時点では引数の `model` を全期間で使う。これは**診断用の
-    固定モデル実行**であり、採否の根拠にできる walk-forward 成績ではない。
-    再学習の結線（`retrain` / `train_model`）は後続タスクで足す。
-    固定モデル実行を昇格の根拠に使わせないための degraded 判定も
-    そのタスクで入れる（外部レビューR04）。
+    `retrain`/`train_model` を渡さない場合は引数の `model` を全期間で使う
+    （診断用の固定モデル実行）。`retrain` と `train_model` を両方渡すと、
+    助走期間のあとは `train_model(as_of)` が返すモデルへ順次切り替わる。
+    締切の適用（`validation.training_inputs()` を通すこと）は `train_model`
+    の実装側の責任であり、この関数はいつ呼ぶかだけを管理する。
 
     exit_score_fn は保有銘柄の売りスコア。`exit_score_fn(symbol, row) -> float|None`。
     渡さないと policy の SIGNAL_SELL が一度も成立しない（外部レビューR10）。
+
+    retrain は期間中の再学習スケジュール（`RetrainConfig`）。
+    train_model は `train_model(as_of: date) -> tuple[object, int]`。
+    その時点までに確定した情報だけで学習し `(モデル, 学習イベント数)` を
+    返す関数。どちらか一方でも省略すると再学習しない
+    （固定モデル実行のまま）。
     """
     sessions = sessions_between(md, start, end)
     state = pf.empty_portfolio(initial_capital)
@@ -204,7 +224,28 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
     pending_buys: list = []
     pending_exits: list = []
 
-    for session in sessions:
+    model_usage: list = []
+    current_model = model
+    current_model_id: Optional[str] = None
+    model_since: Optional[date] = None
+    current_n_train = 0
+
+    for index, session in enumerate(sessions):
+        # ⓪ 再学習（この時点までに確定した情報だけで学習する）
+        if (retrain is not None and train_model is not None
+                and retrain.every_sessions > 0
+                and index >= retrain.warmup_sessions
+                and (index - retrain.warmup_sessions) % retrain.every_sessions == 0):
+            if current_model_id is not None:
+                model_usage.append({
+                    "model_id": current_model_id, "from_session": model_since,
+                    "to_session": sessions[index - 1],
+                    "n_train_events": current_n_train,
+                })
+            current_model, current_n_train = train_model(session)
+            current_model_id = str(current_model)
+            model_since = session
+
         realized = 0.0
         closes = closes_at(md, session)
         # 出来高の枠はこの営業日ぶん。買いと売りで共有する（外部レビューR09）
@@ -296,7 +337,7 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
         rows = {s: _row_for(md, s, session) for s in md.bars}
         rows = {s: r for s, r in rows.items() if r is not None}
         ctx = {"sectors": md.sectors, "portfolio": state, "closes": closes}
-        candidates = decide(session, rows, model, ctx)
+        candidates = decide(session, rows, current_model, ctx)
         if candidates:
             orders, rejects = pf.allocate(state, candidates, sizing, closes)
             pending_buys = orders
@@ -304,13 +345,19 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                 rejected.append({"session": session, "symbol": r.symbol,
                                  "reason": r.reason})
 
+    if current_model_id is not None:
+        model_usage.append({
+            "model_id": current_model_id, "from_session": model_since,
+            "to_session": sessions[-1], "n_train_events": current_n_train,
+        })
+
     return WalkForwardResult(
         daily=pd.DataFrame([vars(r) for r in daily], columns=_DAILY_COLUMNS),
         trades=pd.DataFrame(trades, columns=_TRADE_COLUMNS),
         rejected=pd.DataFrame(rejected, columns=_REJECTED_COLUMNS),
         degraded=False,
         degraded_reasons=[],
-        model_usage=pd.DataFrame(columns=_MODEL_USAGE_COLUMNS),
+        model_usage=pd.DataFrame(model_usage, columns=_MODEL_USAGE_COLUMNS),
     )
 
 

@@ -121,6 +121,23 @@ class Prediction(Base):
     )
 
 
+class RunModelUsage(Base):
+    """バックテスト実行の中で、どのモデルをいつからいつまで使ったか。
+
+    期間中に週次で再学習する実行は `BacktestRun.model_id` 一つでは表せない。
+    「この成績はどのモデルが出したのか」を後から辿るために別テーブルに持つ。
+    """
+    __tablename__ = "run_model_usage"
+    id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, nullable=False)
+    model_id = Column(String(64))
+    from_session = Column(Date)
+    to_session = Column(Date)
+    n_train_events = Column(Integer)
+
+    __table_args__ = (Index("ix_run_model_usage_run_id", "run_id"),)
+
+
 class PredictionOutcome(Base):
     """イベントの実績。予測より後に確定するため別テーブルに持つ。
 
