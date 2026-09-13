@@ -799,6 +799,29 @@ class TestFitInner:
         assert cal.model is None
         assert thr == 0.5
 
+    def test_does_not_swallow_a_genuine_fold_invariant_violation(self, monkeypatch):
+        """`inner_folds()` 呼び出しは、セッション数不足という無害なケースだけを
+        事前チェックで弾く。`Fold.__post_init__`（R23の不変条件強制）も同じ
+        `ValueError` を送出するため、もし `except ValueError` で広く拾う実装に
+        戻すと、walk-forwardの不変条件が壊れているという重大なバグまで
+        「校正なしの既定値」に丸めて隠してしまう（最終ブランチレビューN-3）。
+
+        ここでは `validation.inner_folds` 自体が（セッション数不足以外の理由で）
+        `ValueError` を送出するケースを模擬し、`fit_inner` がそれを飲み込まず
+        外へ伝播させることを確認する。
+        """
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+
+        def _broken_inner_folds(train_events, n_splits=3):
+            raise ValueError("Fold不変条件違反のシミュレーション（セッション数不足ではない）")
+
+        monkeypatch.setattr(evaluation.validation, "inner_folds", _broken_inner_folds)
+
+        with pytest.raises(ValueError, match="不変条件違反"):
+            evaluation.fit_inner(
+                events, fold, evaluation.ConstantProbability, feature_cols=FEATURES)
+
 
 class TestEvaluateFold:
     def test_returns_predictions_for_every_validation_event(self):

@@ -505,14 +505,22 @@ def fit_inner(events: pd.DataFrame, fold, make_model, *,
         return Calibrator(kind="identity", model=None), 0.5
 
     cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
-    try:
-        inner_fold_list = validation.inner_folds(outer_train, n_splits=inner_splits)
-    except ValueError:
-        # 内側に分割するだけのセッション数が無い。evaluate_fold が退化foldに
-        # 対して return None（skip）する規約を既に持っているのと同じ扱いで、
-        # ここでは例外を外へ漏らさず「校正なし・閾値0.5」の既存の退化パスへ
-        # 合流する（外側fold自体は続行させる。外部レビューI-1）。
+    # 内側に分割するだけのセッション数があるか、calendar_folds() が内部で
+    # 行うのと同じ判定を先に行う（`validation.sessions_of` + `n_splits+1` 区画）。
+    # 例外を送出させてから except ValueError で拾う設計にはしない——
+    # Fold.__post_init__（R23の不変条件強制）も同じ ValueError を送出するため、
+    # 広く except すると「セッション数が足りない」という無害なケースと
+    # 「walk-forward の不変条件が壊れている」という重大なバグを区別できず、
+    # 後者まで黙って「校正なしの既定値」に丸めてしまう恐れがある
+    # （最終ブランチレビュー N-3）。ここでは前者だけを事前チェックで弾き、
+    # 万一 inner_folds() が他の理由で ValueError を送出した場合はそのまま
+    # 呼び出し元に伝播させる。
+    if len(validation.sessions_of(outer_train)) < inner_splits + 1:
+        # evaluate_fold が退化foldに対して return None（skip）する規約を
+        # 既に持っているのと同じ扱いで、「校正なし・閾値0.5」の既存の
+        # 退化パスへ合流する（外側fold自体は続行させる。外部レビューI-1）。
         return Calibrator(kind="identity", model=None), 0.5
+    inner_fold_list = validation.inner_folds(outer_train, n_splits=inner_splits)
 
     raw_parts, y_parts, ret_parts = [], [], []
     for inner in inner_fold_list:
