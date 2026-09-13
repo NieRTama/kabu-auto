@@ -165,53 +165,6 @@ class FillResult:
     unfilled_reason: Optional[str]
 
 
-def entry_fill_limited(next_bar: Observation, quantity: int, costs: CostConfig,
-                       liquidity: LiquidityConfig, *, volume: int) -> FillResult:
-    """出来高の制約を織り込んでエントリーを約定させる。
-
-    約定価格の規約は entry_fill() と同じ（T+1の寄り × (1+slip)）。違うのは
-    「いくつ約定できたか」だけ。段階B前半の entry_fill() は挙動を変えない
-    （段階B後半の dataset.py がその挙動に依存しているため）。
-
-    部分約定も単元単位に切り捨てる。1単元にも満たなければ未約定とする。
-    """
-    if liquidity.max_volume_share <= 0:
-        return FillResult(
-            fill=entry_fill(next_bar, quantity, costs),
-            requested_quantity=quantity,
-            filled_quantity=quantity,
-            unfilled_reason=None,
-        )
-
-    allowed = int(volume * liquidity.max_volume_share)
-    allowed_lots = (allowed // LOT_SIZE) * LOT_SIZE
-    fillable = min(quantity, allowed_lots)
-
-    if fillable < LOT_SIZE:
-        return FillResult(
-            fill=None,
-            requested_quantity=quantity,
-            filled_quantity=0,
-            unfilled_reason=(
-                f"出来高{volume:,}株の{liquidity.max_volume_share:.0%}では"
-                f"単元({LOT_SIZE}株)に満たないため約定できません"
-            ),
-        )
-
-    reason = None
-    if fillable < quantity:
-        reason = (
-            f"出来高{volume:,}株の{liquidity.max_volume_share:.0%}まで"
-            f"（{quantity:,}株のうち{fillable:,}株を約定）"
-        )
-    return FillResult(
-        fill=entry_fill(next_bar, fillable, costs),
-        requested_quantity=quantity,
-        filled_quantity=fillable,
-        unfilled_reason=reason,
-    )
-
-
 class VolumeBudget:
     """同じ営業日・同じ銘柄の出来高枠を、買いと売りで共有する台帳。
 
@@ -260,6 +213,45 @@ class VolumeBudget:
             return None
         return self._remaining.get(symbol)
 
+    def refund(self, symbol: str, quantity: int) -> None:
+        """消費した枠を戻す。約定が最終的に成立しなかったとき
+        （exit_fill()がNoneを返した等）に使う。無制限のときは何もしない。
+        """
+        if self.unlimited():
+            return
+        if symbol in self._remaining:
+            self._remaining[symbol] += quantity
+
+
+def entry_fill_limited(next_bar: Observation, quantity: int, costs: CostConfig,
+                       budget: "VolumeBudget", *, symbol: str, volume: int) -> FillResult:
+    """出来高の制約を織り込んでエントリーを約定させる。
+
+    約定価格の規約は entry_fill() と同じ（T+1の寄り × (1+slip)）。違うのは
+    「いくつ約定できたか」だけ。段階B前半の entry_fill() は挙動を変えない。
+
+    枠は exit_fill_limited() と同じ VolumeBudget を共有する（外部レビューR09:
+    買い専用の枠で売りを無制限にすると、大量保有・薄商いの銘柄で全量売却が
+    起きてしまう。逆に言えば、買いも同じ枠を消費しないと「共有」にならない）。
+    """
+    fillable = budget.allow(symbol, volume, quantity)
+    if fillable < LOT_SIZE:
+        return FillResult(
+            fill=None, requested_quantity=quantity, filled_quantity=0,
+            unfilled_reason=(
+                f"出来高{volume:,}株の枠では単元({LOT_SIZE}株)に満たないため"
+                f"約定できません"
+            ),
+        )
+    reason = None
+    if fillable < quantity:
+        reason = f"出来高の枠まで（{quantity:,}株のうち{fillable:,}株を約定）"
+    return FillResult(
+        fill=entry_fill(next_bar, fillable, costs),
+        requested_quantity=quantity, filled_quantity=fillable,
+        unfilled_reason=reason,
+    )
+
 
 def exit_fill_limited(intent: ExitIntent, bar: Observation,
                       next_bar: Optional[Observation], quantity: int,
@@ -292,6 +284,9 @@ def exit_fill_limited(intent: ExitIntent, bar: Observation,
 
     fill = exit_fill(intent, bar, next_bar, fillable, costs)
     if fill is None:
+        # 枠は消費済みだが約定は成立していない。消費したぶんを戻さないと、
+        # 実際には売れていないのに枠だけ減った状態が残ってしまう。
+        budget.refund(symbol, fillable)
         return FillResult(
             fill=None, requested_quantity=quantity, filled_quantity=0,
             unfilled_reason="翌営業日の足が無く成行退出を約定できません",
