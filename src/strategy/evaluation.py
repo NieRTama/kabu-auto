@@ -21,6 +21,9 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score, brier_score_loss, log_loss, roc_auc_score,
+)
 
 from src.core import clock
 from src.strategy.dataset import STATUS_RESOLVED
@@ -326,4 +329,58 @@ def default_model_factories() -> dict:
         "logistic_regression": LogisticRegressionModel,
         "small_lightgbm": SmallLightGBM,
         "current_lightgbm": CurrentLightGBM,
+    }
+
+
+_EPS = 1e-15
+
+
+def _log_loss_safe(y_true: np.ndarray, p: np.ndarray) -> float:
+    """確率を刈り込んでから log loss を計算する（0/1予測で無限大にしない）。"""
+    clipped = np.clip(p, _EPS, 1.0 - _EPS)
+    return float(log_loss(y_true, clipped, labels=[0, 1]))
+
+
+def compute_metrics(y_true, p, *, baseline_rate: float) -> dict:
+    """確率予測の質を測る。**定数モデルとの差**を併せて返す。
+
+    「Brier 0.2476 は 0.25 未満だから採用可能」とは判断しない。二値ラベルに
+    常に 0.5 を予測すれば二乗誤差は 0.25 である（レビュー ML）。
+    クラス比率を予測する定数モデルを基準に置き、その差で見る。
+    基準の確率は**学習側の正例率**を使う（検証側の正例率を使うと、
+    検証側の情報が基準へ入る）。
+
+    検証データが片側クラスのみだと ROC-AUC と平均適合率は未定義になるため
+    None を返す（例外にしない）。
+    """
+    y = np.asarray(pd.Series(y_true).astype(float))
+    prob = np.asarray(p, dtype=float)
+    n = len(y)
+    if n == 0:
+        return {
+            "n": 0, "positive_rate": None, "roc_auc": None,
+            "average_precision": None, "log_loss": None, "brier": None,
+            "brier_vs_constant": None, "log_loss_vs_constant": None,
+        }
+
+    both_classes = len(np.unique(y)) > 1
+    const = np.full(n, float(baseline_rate))
+
+    # pos_label を明示する。片側クラスのみの検証データでも版によっては
+    # 「どちらが正例か決められない」と拒否されうるため。
+    brier = float(brier_score_loss(y, prob, pos_label=1))
+    brier_const = float(brier_score_loss(y, const, pos_label=1))
+    ll = _log_loss_safe(y, prob)
+    ll_const = _log_loss_safe(y, const)
+
+    return {
+        "n": n,
+        "positive_rate": float(y.mean()),
+        "roc_auc": float(roc_auc_score(y, prob)) if both_classes else None,
+        "average_precision": float(average_precision_score(y, prob)) if both_classes else None,
+        "log_loss": ll,
+        "brier": brier,
+        # 正なら定数モデルより良い（誤差が小さい）
+        "brier_vs_constant": brier_const - brier,
+        "log_loss_vs_constant": ll_const - ll,
     }

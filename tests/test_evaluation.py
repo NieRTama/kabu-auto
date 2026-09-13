@@ -452,3 +452,74 @@ class TestDefaultModelFactories:
             a, b = make(), make()
             assert a is not b
             assert a.name == name
+
+class TestComputeMetrics:
+    def test_perfect_prediction_has_auc_one(self):
+        y = pd.Series([0, 0, 1, 1])
+        p = np.array([0.1, 0.2, 0.8, 0.9])
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["roc_auc"] == pytest.approx(1.0)
+
+    def test_reversed_prediction_has_auc_zero(self):
+        y = pd.Series([0, 0, 1, 1])
+        p = np.array([0.9, 0.8, 0.2, 0.1])
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["roc_auc"] == pytest.approx(0.0)
+
+    def test_auc_is_none_when_single_class(self):
+        """検証foldが片側クラスのみだとAUCは未定義。例外にせずNoneにする"""
+        y = pd.Series([1, 1, 1])
+        p = np.array([0.2, 0.5, 0.9])
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["roc_auc"] is None
+
+    def test_brier_matches_mean_squared_error(self):
+        y = pd.Series([0, 1])
+        p = np.array([0.25, 0.75])
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["brier"] == pytest.approx(0.0625)
+
+    def test_constant_half_gives_brier_quarter(self):
+        """常に0.5を予測すれば二乗誤差は0.25。単独では採用根拠にならない"""
+        y = pd.Series([0, 1, 0, 1])
+        p = np.full(4, 0.5)
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["brier"] == pytest.approx(0.25)
+        assert m["brier_vs_constant"] == pytest.approx(0.0)
+
+    def test_better_than_constant_is_positive(self):
+        """定数モデルより良ければ差は正になる"""
+        y = pd.Series([0, 0, 1, 1])
+        p = np.array([0.1, 0.2, 0.8, 0.9])
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["brier_vs_constant"] > 0
+        assert m["log_loss_vs_constant"] > 0
+
+    def test_worse_than_constant_is_negative(self):
+        y = pd.Series([0, 0, 1, 1])
+        p = np.array([0.9, 0.8, 0.2, 0.1])
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["brier_vs_constant"] < 0
+
+    def test_baseline_uses_training_rate_not_validation_rate(self):
+        """定数モデルの確率は学習側の正例率。検証側の正例率を使わない"""
+        y = pd.Series([1, 1, 1, 0])
+        p = np.full(4, 0.3)
+        with_train_rate = evaluation.compute_metrics(y, p, baseline_rate=0.3)
+        with_val_rate = evaluation.compute_metrics(y, p, baseline_rate=0.75)
+        assert with_train_rate["brier_vs_constant"] != pytest.approx(
+            with_val_rate["brier_vs_constant"])
+        assert with_train_rate["brier_vs_constant"] == pytest.approx(0.0)
+
+    def test_records_counts_and_positive_rate(self):
+        y = pd.Series([0, 1, 1, 1])
+        p = np.full(4, 0.5)
+        m = evaluation.compute_metrics(y, p, baseline_rate=0.5)
+        assert m["n"] == 4
+        assert m["positive_rate"] == pytest.approx(0.75)
+
+    def test_empty_input_returns_zero_count(self):
+        m = evaluation.compute_metrics(pd.Series([], dtype=int), np.array([]),
+                                       baseline_rate=0.5)
+        assert m["n"] == 0
+        assert m["roc_auc"] is None
