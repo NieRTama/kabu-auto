@@ -156,10 +156,12 @@ def split_events(events: pd.DataFrame, fold: Fold, *,
 
     if embargo_sessions > 0:
         # 検証開始の直前セッションを学習側から落とす（前方ギャップ）。
-        # 特徴量の系列相関は purge を通した後でも残るため、境界に空白を置く。
-        sessions = sessions_of(resolved)
-        before = [s for s in sessions if s < fold.val_start]
-        embargoed = set(before[-embargo_sessions:])
+        # 基準は purge 適用後の学習集合自身のセッション列にする。
+        # 全解決済みイベントの全期間を基準にすると、embargo_sessions が
+        # 保有期間（holding）以下のとき、対象セッションは既にpurgeで
+        # 消えており無言のno-opになる（最終ブランチレビュー指摘）。
+        train_sessions = sessions_of(train)
+        embargoed = set(train_sessions[-embargo_sessions:])
         if embargoed:
             train = train[~train["decision_at"].isin(embargoed)]
 
@@ -210,9 +212,20 @@ def fit_preprocessor(train_events: pd.DataFrame,
 
     標準化の平均・標準偏差、欠損補完に使う平均、クラス比率をここで固定する。
     検証側の値は一切見ない。閾値選択と確率校正も段階C後半で同じ規約に従う。
+
+    学習集合が空の場合、meansをNaN・positive_rateもNaNで返す
+    （n_fitted=0と併せて判定できるが、値そのものが「fit不能」と分かるように
+    NaNにする。0.0/1.0を返すと統計的に正常なfitと見分けがつかず、
+    0行で学習したことに下流が気づけない — 最終ブランチレビュー指摘）。
     """
     cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
     X = train_events.reindex(columns=cols).astype("float64")
+    if len(train_events) == 0:
+        nan_series = pd.Series(float("nan"), index=cols)
+        return Preprocessor(
+            means=nan_series, stds=nan_series,
+            positive_rate=float("nan"), n_fitted=0,
+        )
     means = X.mean()
     stds = X.std(ddof=0)
     # 分散0の列はゼロ除算になるため1として扱う（変換後は全て0になる）

@@ -308,6 +308,20 @@ class TestEmbargo:
         _, val_on = validation.split_events(events, fold, embargo_sessions=2)
         assert list(val_off["event_id"]) == list(val_on["event_id"])
 
+    def test_embargo_still_works_when_holding_period_exceeds_it(self):
+        """保有期間(holding)がembargo_sessions以上でも、embargoは効く
+
+        embargoの基準をpurge前の全期間セッション列にすると、embargo対象の
+        セッションが既にpurgeで消えている場合に無言のno-opになる
+        （最終ブランチレビュー指摘）。
+        """
+        events = _daily_events(["7203"], date(2026, 1, 5), 60, holding=5)
+        fold = validation.calendar_folds(events, n_splits=5)[2]
+        without_embargo, _ = validation.split_events(events, fold)
+        with_embargo, _ = validation.split_events(events, fold, embargo_sessions=2)
+        # embargoの有無で学習件数が実際に変わること（no-opになっていない）
+        assert len(with_embargo) < len(without_embargo)
+
 
 class TestInnerFolds:
     def _outer(self):
@@ -506,6 +520,19 @@ class TestPreprocessor:
         pre = validation.fit_preprocessor(events)
         assert list(pre.means.index) == list(indicators.FEATURE_COLS)
 
+    def test_empty_training_set_gives_nan_statistics_not_plausible_zeros(self):
+        """学習集合が空のとき、means/stdsはNaN（0.0/1.0の"正常に見える"値ではない）
+
+        0.0/1.0を返すと統計的に正常なfitと見分けがつかず、0行で学習した
+        ことに下流が気づけない（最終ブランチレビュー指摘）。
+        """
+        empty = pd.DataFrame(columns=["f1", "f2", "label"])
+        pre = validation.fit_preprocessor(empty, feature_cols=["f1", "f2"])
+        assert pre.n_fitted == 0
+        assert pre.means.isna().all()
+        assert pre.stds.isna().all()
+        assert pd.isna(pre.positive_rate)
+
 
 class TestTrainingWindow:
     def _train(self):
@@ -579,13 +606,13 @@ class TestTrainingInputs:
         assert windowed.preprocessor.n_fitted == len(windowed.events)
         assert windowed.preprocessor.means["f1"] != pytest.approx(
             full.preprocessor.means["f1"])
-        # 重みも窓で絞った後の集合に対して計算されていること。
-        # 窓適用前の集合に対して計算していると長さが合わない。
-        assert len(windowed.weights) == len(windowed.events)
-        # 窓で絞ると重なり相手の集合が変わるため、全期間の重みとは
-        # 値も変わる（training_weights()がfull.eventsではなくwindowed.events
-        # を見ていることの直接証拠）
-        assert list(windowed.weights) != pytest.approx(list(full.weights[:len(windowed.weights)]))
+        # 重みは窓適用後の集合から直接再計算した値と厳密に一致するはず。
+        # 「窓適用前の集合で計算した重みを末尾から切って行数だけ合わせる」
+        # ような退行（tail-slice型）は、長さと値の不一致だけでは検出できない
+        # （最終ブランチレビュー指摘）。窓適用後の集合から独立に計算した値と
+        # 直接照合することで、行・値の両方を固定する。
+        assert windowed.weights == pytest.approx(
+            validation.training_weights(windowed.events))
 
 
 class TestOuterFoldIsUntouchable:
