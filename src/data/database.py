@@ -85,6 +85,101 @@ class Dataset(Base):
     __table_args__ = (Index("ix_datasets_dataset_id", "dataset_id"),)
 
 
+class Prediction(Base):
+    """イベント単位の予測明細。
+
+    サンプル単位の明細を残しておけば、指標も売買判断も後から再計算できる。
+    集計済みの数値だけでは「AUC 0.5085 が何を意味するか」を後から検証できない。
+
+    実績ラベルはここに持たない。予測時点では確定していない場合があるため
+    （shadow運用が該当する）、PredictionOutcome へ後から関連付ける。
+
+    関連付けのキーは `event_id` 単独ではなく
+    **`(label_contract_id, event_id)`** である。同じ銘柄・同じ判断日でも
+    退出ポリシーやコストが違えば実績ラベルは別物になるため（外部レビューR07）。
+    """
+    __tablename__ = "predictions"
+    id = Column(Integer, primary_key=True)
+    event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
+    evaluation_run_id = Column(String(64), nullable=False)
+    model_id = Column(String(64), nullable=False)
+    predicted_at = Column(DateTime, default=clock.now)
+    raw_probability = Column(Float)
+    calibrated_probability = Column(Float)
+    fold_index = Column(Integer)      # 出所fold。shadow等は -1
+    purpose = Column(String(16))      # "validation" / "shadow"
+
+    __table_args__ = (
+        Index("ix_predictions_run_model", "evaluation_run_id", "model_id"),
+        Index("ix_predictions_event_id", "label_contract_id", "event_id"),
+    )
+
+
+class PredictionOutcome(Base):
+    """イベントの実績。予測より後に確定するため別テーブルに持つ。
+
+    **一意キーは `(label_contract_id, event_id)`。** `event_id` だけを一意に
+    すると、同じ銘柄・同じ判断日を別のコストや退出条件で評価し直したときに、
+    過去runの実績が新しい実績で上書きされる。上書きされれば保存済みの
+    予測明細と結合し直したときの指標まで後から変わってしまい、
+    「あの時どう測ったか」を復元できなくなる（外部レビューR07）。
+
+    `dataset_id` ではなく `label_contract_id` を使う理由は
+    `dataset.make_label_contract_id()` の docstring を参照。
+    """
+    __tablename__ = "prediction_outcomes"
+    id = Column(Integer, primary_key=True)
+    event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
+    actual_label = Column(Integer)
+    net_return = Column(Float)
+    resolved_at = Column(DateTime, default=clock.now)
+
+    __table_args__ = (
+        Index("ix_prediction_outcomes_key",
+              "label_contract_id", "event_id", unique=True),
+    )
+
+
+class EvaluationRun(Base):
+    """評価実行そのものの記録。
+
+    **これが「その評価が昇格の根拠に使えるか」の唯一の根拠である。**
+    段階Eの `check_promotable()` は呼び出し側から渡された `degraded` を
+    信じず、この行を読む。呼び出し側の bool を信じると、degraded な実行の
+    成績でも引数を `False` にすれば昇格できてしまう（外部レビューR13）。
+
+    実行条件は**開始時に固定して保存する**。終了後に `config.yaml` を
+    読み直すと、実行中に設定が変わっていた場合に「実際に使った設定」と
+    ずれる（外部レビューの残件「評価実行の再現用記録」）。
+    """
+    __tablename__ = "evaluation_runs"
+    id = Column(Integer, primary_key=True)
+    evaluation_run_id = Column(String(64), nullable=False)
+    started_at = Column(DateTime, default=clock.now)
+    finished_at = Column(DateTime)
+    purpose = Column(String(16))            # "validation" / "shadow"
+    model_id = Column(String(64))           # 単一モデルの評価なら埋める
+    # 入力の来歴
+    dataset_id = Column(String(64))
+    label_contract_id = Column(String(32))
+    feature_version = Column(String(16))
+    execution_model_version = Column(String(32))
+    code_version = Column(String(64))
+    # 実行条件一式（戦略節だけでなくリスク・手数料・数量制限・分割設定を含む）
+    config_hash = Column(String(64))
+    config_json = Column(Text)
+    n_folds = Column(Integer)
+    n_predictions = Column(Integer)
+    degraded = Column(Integer, default=0)
+    degraded_reasons = Column(Text)         # JSON配列
+
+    __table_args__ = (
+        Index("ix_evaluation_runs_run_id", "evaluation_run_id", unique=True),
+    )
+
+
 class OrderIntent(Base):
     """発注の「意図」（Phase 5 / 4.2）。
 
