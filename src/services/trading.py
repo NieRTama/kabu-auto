@@ -216,6 +216,26 @@ class TradingServices:
         expected = bar_status.as_of_session(clock.now())
         return st.last_bar_session == expected
 
+    def _engine_version(self) -> str:
+        """評価基盤のどの世代で動くか。未知の値は安全側（legacy）に倒す。
+
+        legacy = 従来の挙動（既定）。v2 = 段階B〜Dで作り直した執行仮定。
+        旧方式へいつでも戻せることが段階投入の前提（設計書 §10）。
+        """
+        value = cfg.get_section("strategy").get("engine_version", "legacy")
+        return "v2" if value == "v2" else "legacy"
+
+    def _paper_uses_v2_execution(self) -> bool:
+        """paper経路で新しい執行仮定（翌営業日の寄り）を使うか。
+
+        stop_loss_check は paper モードで日足終値を使って損切りを判定しており、
+        同一終値での判断・約定という問題が paper 運用にも及んでいた
+        （レビューF04）。**過去の日足を再生する paper と、現在の市場を観測する
+        paper は入力契約が違う**。前者は日足による約定の近似であり、既存の
+        翌朝9:05運用と同じ約定モデルとしては扱わない。
+        """
+        return self._engine_version() == "v2"
+
     # ─── ML週次再学習 ───────────────────────────────────
     def ml_retrain(self) -> None:
         logger.info("MLモデル週次再学習を開始...")
@@ -361,7 +381,14 @@ class TradingServices:
                 if is_paper:
                     # ペーパーモードはリアルタイム板が無いため日足終値で損切り判定する
                     df = load_ohlcv(sym)
-                    price = float(df["close"].iloc[-1]) if len(df) else 0
+                    if self._paper_uses_v2_execution():
+                        # v2: 当日の終値で判断して同じ終値で約定する経路を作らない。
+                        # 日足しか無い時点では「翌営業日の寄りで退出する」近似に留め、
+                        # 判断だけをこの日に行う（実際の退出は翌営業日の
+                        # morning_execution が拾う）。
+                        price = float(df["open"].iloc[-1]) if len(df) else 0
+                    else:
+                        price = float(df["close"].iloc[-1]) if len(df) else 0
                 else:
                     board = self.client.get_board(sym)
                     price = board.get("CurrentPrice", 0)
@@ -429,6 +456,11 @@ class TradingServices:
                     continue
                 logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")
                 if is_paper:
+                    if self._paper_uses_v2_execution():
+                        # v2: 引けで判断した注文をその日の終値で約定させない。
+                        # 翌営業日の morning_execution が拾うシグナルとして
+                        # 保存するだけに留める（判断と執行のセッションを分ける）。
+                        continue
                     # ペーパーモード: 当日終値でシミュレート
                     close_price = float(df["close"].iloc[-1])
                     if sig.action == "BUY":
