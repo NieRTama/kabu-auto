@@ -158,9 +158,79 @@ class TestDryRunProductionDataWarning:
         assert chk["ok"] is True
 
 
+class TestBrokerLaunchExclusivity:
+    """2026-09-13: auto_launch_broker と broker_full_login_enabled を両方有効化すると、
+    互いを知らない2つのロックが同じKabuS.exeを同時に起動/再起動しうる（統合テストで発見）。
+    根本対応（共有ロック）に加え、設定ミスをここで機械的に検知して起動を止める。"""
+
+    def test_both_enabled_is_critical(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "live",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+                runtime={"auto_launch_broker": True, "broker_full_login_enabled": True},
+            )
+        assert result["ok"] is False
+        chk = next(c for c in result["checks"] if c["name"] == "起動経路の排他性")
+        assert chk["ok"] is False and chk["level"] == pf.CRITICAL
+
+    def test_only_auto_launch_broker_enabled_is_ok(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "live",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+                runtime={"auto_launch_broker": True, "broker_full_login_enabled": False},
+            )
+        chk = next(c for c in result["checks"] if c["name"] == "起動経路の排他性")
+        assert chk["ok"] is True
+
+    def test_only_broker_full_login_enabled_is_ok(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "live",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+                runtime={"auto_launch_broker": False, "broker_full_login_enabled": True},
+            )
+        chk = next(c for c in result["checks"] if c["name"] == "起動経路の排他性")
+        assert chk["ok"] is True
+
+    def test_neither_enabled_is_ok(self, no_halt):
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "live",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+                runtime={"auto_launch_broker": False, "broker_full_login_enabled": False},
+            )
+        chk = next(c for c in result["checks"] if c["name"] == "起動経路の排他性")
+        assert chk["ok"] is True
+
+    def test_runtime_omitted_defaults_to_ok(self, no_halt):
+        """既存の呼び出し元（runtime未指定）との後方互換性。"""
+        with _patch_db(unresolved=0):
+            result = pf.run_preflight(
+                _good_client(), "live",
+                base_url="http://localhost:18080/kabusapi",
+                dash_host="127.0.0.1", dash_port=_free_port(),
+            )
+        chk = next(c for c in result["checks"] if c["name"] == "起動経路の排他性")
+        assert chk["ok"] is True
+
+
 class TestMainPyPreflightWiring:
     def test_main_calls_preflight(self):
         with open("main.py", encoding="utf-8") as f:
             src = f.read()
         assert "run_preflight" in src
         assert "places_real_orders" in src
+
+    def test_main_passes_runtime_section(self):
+        """起動経路の排他性チェックのため、runtimeセクションが渡されていること。"""
+        with open("main.py", encoding="utf-8") as f:
+            src = f.read()
+        i = src.index("run_preflight(")
+        call_block = src[i:i + 400]
+        assert "runtime=" in call_block

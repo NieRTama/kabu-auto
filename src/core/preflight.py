@@ -112,6 +112,30 @@ def _check_dry_run_production_data(mode: str, base_url: str) -> dict:
     return _check("dry_run 本番口座データ読み取り警告", True, WARNING)
 
 
+def _check_broker_launch_exclusivity(runtime: Optional[dict]) -> dict:
+    """KabuS.exeを起動する2つの独立した経路を同時に有効化していないか確認する。
+
+    broker_launcher.py（5分毎の生存監視による自動起動）と broker_full_login.py
+    （完全自動ログイン、平日06:45の定時実行）は、それぞれ独立にKabuS.exeの起動/再起動を
+    行う。両モジュールは起動操作自体は共有ロック（broker_process_lock.py）で排他するが、
+    「両方の自動実行を同時に有効化する」という運用そのものが、意図しないタイミングでの
+    二重の起動判断（例: 一方が『落ちている』と判断して起動を試みている間に、もう一方が
+    定時ジョブで再起動を試みる）を招きうるため、設定ミスとして起動時に検知する
+    （2026-09-13、統合テストで発見）。
+    """
+    rt = runtime or {}
+    auto_launch = bool(rt.get("auto_launch_broker", False))
+    full_login = bool(rt.get("broker_full_login_enabled", False))
+    if auto_launch and full_login:
+        return _check(
+            "起動経路の排他性", False, CRITICAL,
+            "runtime.auto_launch_broker と runtime.broker_full_login_enabled が"
+            "両方trueです。KabuS.exeの起動経路が2つ同時に有効になり、互いを知らずに"
+            "同時起動/再起動しうるため、どちらか一方をfalseにしてください",
+        )
+    return _check("起動経路の排他性", True, CRITICAL)
+
+
 def _check_halt() -> dict:
     if halt.is_halted():
         state = halt.get_state()
@@ -125,7 +149,8 @@ def _check_halt() -> dict:
 
 def run_preflight(client, mode: str, *, base_url: str,
                   dash_host: str, dash_port: int,
-                  skip_api: bool = False) -> dict:
+                  skip_api: bool = False,
+                  runtime: Optional[dict] = None) -> dict:
     """プリフライトチェックを実行し {"ok": bool, "checks": [...]} を返す。
 
     ok は level==CRITICAL の失敗が1つも無ければ True。
@@ -148,6 +173,7 @@ def run_preflight(client, mode: str, *, base_url: str,
     checks.append(_check_port(dash_host, dash_port))
     checks.append(_check_endpoint_mode_consistency(mode, base_url))
     checks.append(_check_dry_run_production_data(mode, base_url))
+    checks.append(_check_broker_launch_exclusivity(runtime))
     checks.append(_check_halt())
 
     ok = all(c["ok"] for c in checks if c["level"] == CRITICAL)

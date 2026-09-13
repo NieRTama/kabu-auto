@@ -209,6 +209,7 @@ def main() -> None:
             dash_port=dash_conf.get("port", 8080),
             # 休場日は未ログインが通常なので疎通は見ない（設定ミスの検査は続ける）
             skip_api=is_closed_today,
+            runtime=cfg.get_section("runtime"),
         )
         preflight.log_results(result)
         if not result["ok"] and tm.places_real_orders(mode):
