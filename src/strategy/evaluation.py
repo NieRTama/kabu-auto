@@ -744,3 +744,105 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
         "fold_results": results,
         "summary": summary,
     }
+
+
+def recompute_metrics(details: pd.DataFrame, *, baseline_rate: float,
+                      model_id: Optional[str] = None) -> dict:
+    """保存した予測明細だけから指標を計算し直す。
+
+    実績が未確定の行（shadow等）は除外する。集計済みの数値しか無い状態では
+    「その数字が何を意味するか」を後から検証できないため、明細から同じ指標を
+    再現できることを保証する（spec §14 段階C完了条件）。
+    """
+    sub = details if model_id is None else details[details["model_id"] == model_id]
+    sub = sub[sub["actual_label"].notna()]
+    return compute_metrics(
+        sub["actual_label"].astype(int),
+        sub["calibrated_probability"].astype(float).values,
+        baseline_rate=baseline_rate,
+    )
+
+
+def select_training_window(events: pd.DataFrame, fold, make_model,
+                           candidates: list, *,
+                           feature_cols: Optional[list] = None,
+                           inner_splits: int = 3) -> Optional[int]:
+    """学習窓を**内側foldだけ**で選ぶ。
+
+    外側成績を見て窓を選び、同じ成績を最終証拠として使わない（spec §7）。
+
+    **内側の検証期間は全候補で共通にする。** 候補窓は各内側foldの**学習側にだけ**
+    適用し、検証側には触らない。窓で外側集合を先に切ってから内側foldを作り直すと、
+    短い窓と拡大窓で検証日も件数も変わる。比較値がコスト控除後の収益の**総和**で
+    ある以上、件数が多い候補がそれだけで有利になり、「学習窓の効果」と
+    「評価期間・件数の差」が混ざる（外部レビューR19）。
+
+    比較値は総和ではなく**1イベントあたりの平均**にする。共通の検証集合を使えば
+    件数は揃うが、採用閾値を超えた件数は候補ごとに変わるため、総和のままだと
+    「多く拾う窓」が有利に出る。
+
+    候補が空なら None（拡大窓）を返す。
+    """
+    if not candidates:
+        return None
+
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+
+    # 内側foldは「窓を適用する前の外側学習集合」から一度だけ作る。
+    # これで検証側の event_id が全候補で同一になる。
+    base = validation.training_inputs(events, fold, feature_cols=cols)
+    if len(base.events) == 0:
+        return None
+    inner_folds = list(validation.inner_folds(base.events, n_splits=inner_splits))
+    if not inner_folds:
+        return None
+
+    best_window, best_score = None, -np.inf
+    for window in candidates:
+        total, n_taken, scored = 0.0, 0, False
+        for inner in inner_folds:
+            # 窓は学習側にだけ掛ける
+            inner_inputs = validation.training_inputs(
+                base.events, inner, window_sessions=window, feature_cols=cols)
+            # 検証側は窓に依存しない（window_sessions を渡さない）
+            _, inner_val = validation.split_events(base.events, inner)
+            if len(inner_inputs.events) == 0 or len(inner_val) == 0:
+                continue
+            model = make_model()
+            model.fit(inner_inputs.events[cols].astype("float64"),
+                      inner_inputs.events["label"].astype(int),
+                      inner_inputs.weights)
+            p = model.predict_proba(inner_val[cols].astype("float64"))
+            ret = inner_val["net_return"].astype(float).values
+            threshold = select_threshold(p, ret)
+            taken = ret[p >= threshold]
+            total += float(taken.sum())
+            n_taken += int(len(taken))
+            scored = True
+
+        if not scored:
+            continue
+        # 1件も採らない窓は「収益0」ではなく比較対象外にする。
+        # 総和0が負の窓に勝ってしまうのを避ける。
+        if n_taken == 0:
+            continue
+        score = total / n_taken
+        if score > best_score:
+            best_score, best_window = score, window
+    return best_window
+
+
+def inner_validation_event_ids(events: pd.DataFrame, fold, *,
+                               feature_cols: Optional[list] = None,
+                               inner_splits: int = 3) -> list:
+    """select_training_window が使う内側検証集合の event_id を返す（検証用）。
+
+    「全候補窓で検証集合が同一である」ことをテストから確かめるために切り出す。
+    """
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    base = validation.training_inputs(events, fold, feature_cols=cols)
+    out = []
+    for inner in validation.inner_folds(base.events, n_splits=inner_splits):
+        _, inner_val = validation.split_events(base.events, inner)
+        out.extend(list(inner_val["event_id"]))
+    return out

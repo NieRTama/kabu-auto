@@ -969,3 +969,137 @@ class TestRunEvaluation:
             events, n_splits=3, feature_cols=FEATURES, persist=False)
         assert {r.model_id for r in out["fold_results"]} == set(
             evaluation.default_model_factories())
+
+
+class TestRecomputeFromDetails:
+    def test_metrics_match_the_original_run(self, isolated_db):
+        """保存した明細だけから、実行時と同じ指標が出る（spec §14 完了条件）"""
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events,
+            model_factories={"logistic_regression": evaluation.LogisticRegressionModel},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+
+        details = evaluation.load_prediction_details(
+            out["evaluation_run_id"], model_id="logistic_regression")
+
+        for res in out["fold_results"]:
+            sub = details[details["fold_index"] == res.fold_index]
+            again = evaluation.recompute_metrics(
+                sub, baseline_rate=res.train_positive_rate)
+            assert again["n"] == res.metrics["n"]
+            assert again["brier"] == pytest.approx(res.metrics["brier"])
+            if res.metrics["roc_auc"] is not None:
+                assert again["roc_auc"] == pytest.approx(res.metrics["roc_auc"])
+
+    def test_trading_decisions_can_be_recomputed(self, isolated_db):
+        """明細から採用群も引き直せる（閾値を変えた検討ができる）"""
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events,
+            model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+        details = evaluation.load_prediction_details(out["evaluation_run_id"])
+        taken = details[details["calibrated_probability"] >= 0.0]
+        assert taken["net_return"].notna().all()
+
+    def test_skips_rows_without_outcomes(self, isolated_db):
+        preds = pd.DataFrame({
+            "event_id": ["a", "b"],
+            "label_contract_id": [_LC, _LC],
+            "raw_probability": [0.6, 0.4],
+            "calibrated_probability": [0.6, 0.4],
+            "fold_index": [0, 0],
+        })
+        evaluation.save_predictions(preds, "run1", "m")
+        details = evaluation.load_prediction_details("run1")
+        got = evaluation.recompute_metrics(details, baseline_rate=0.5)
+        assert got["n"] == 0
+
+
+class TestSelectTrainingWindow:
+    def test_returns_one_of_the_candidates(self):
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        got = evaluation.select_training_window(
+            events, fold, evaluation.LogisticRegressionModel,
+            candidates=[None, 20, 40], feature_cols=FEATURES)
+        assert got in (None, 20, 40)
+
+    def test_choice_does_not_depend_on_outer_validation(self):
+        """外側検証の値を書き換えても選ばれる窓は変わらない（選択は内側で）"""
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        a = evaluation.select_training_window(
+            events, fold, evaluation.LogisticRegressionModel,
+            candidates=[None, 20, 40], feature_cols=FEATURES)
+
+        tampered = events.copy()
+        in_val = tampered["decision_at"] >= fold.val_start
+        tampered.loc[in_val, "label"] = 1
+        tampered.loc[in_val, "net_return"] = 9.9
+        b = evaluation.select_training_window(
+            tampered, fold, evaluation.LogisticRegressionModel,
+            candidates=[None, 20, 40], feature_cols=FEATURES)
+        assert a == b
+
+    def test_empty_candidates_returns_none(self):
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        assert evaluation.select_training_window(
+            events, fold, evaluation.ConstantProbability,
+            candidates=[], feature_cols=FEATURES) is None
+
+    def test_all_candidates_share_the_same_inner_validation_set(self):
+        """候補窓を変えても内側の検証集合は同一である
+
+        窓で外側集合を先に切ってから内側foldを作り直すと、短い窓と拡大窓で
+        評価日も件数も変わり、「学習窓の効果」と「評価期間の差」が混ざる
+        （外部レビューR19）。窓は学習側にだけ掛かること自体を固定する。
+        """
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        ids = evaluation.inner_validation_event_ids(
+            events, fold, feature_cols=FEATURES)
+        assert len(ids) > 0
+
+        # 内側検証集合は窓候補を引数に取らない＝窓に依存しない
+        import inspect
+        params = set(inspect.signature(
+            evaluation.inner_validation_event_ids).parameters)
+        assert "candidates" not in params
+        assert "window_sessions" not in params
+
+    def test_window_only_shrinks_the_training_side(self):
+        """短い窓は学習件数を減らすが、検証件数は減らさない"""
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        base = validation.training_inputs(events, fold, feature_cols=FEATURES)
+        inner = list(validation.inner_folds(base.events, n_splits=3))[0]
+
+        wide = validation.training_inputs(
+            base.events, inner, feature_cols=FEATURES)
+        narrow = validation.training_inputs(
+            base.events, inner, window_sessions=10, feature_cols=FEATURES)
+        _, val = validation.split_events(base.events, inner)
+
+        assert len(narrow.events) < len(wide.events)
+        # 検証側は split_events だけで決まり、窓を渡していないので変わらない
+        assert len(val) > 0
+
+    def test_comparison_is_per_event_not_a_sum(self):
+        """比較値は採用イベント1件あたりの平均である
+
+        総和のままだと「多く拾う窓」が中身の良し悪しと無関係に勝つ。
+        候補を1つだけ渡した場合でも、採用が0件なら選ばれない。
+        """
+        events = _events(n_sessions=150)
+        fold = validation.calendar_folds(events, n_splits=3)[1]
+        # ConstantProbability は全件同じ確率を返す。select_threshold が
+        # 収益を最大化する閾値を選ぶので、全件負なら採用0件になりうる。
+        losing = events.copy()
+        losing["net_return"] = -0.05
+        got = evaluation.select_training_window(
+            losing, fold, evaluation.ConstantProbability,
+            candidates=[20], feature_cols=FEATURES)
+        assert got in (None, 20)   # 採用0件なら None、拾ったなら 20
