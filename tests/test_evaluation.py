@@ -324,3 +324,76 @@ class TestLogisticRegressionModel:
 
     def test_has_a_name(self):
         assert evaluation.LogisticRegressionModel().name == "logistic_regression"
+
+
+class TestLightGbmModels:
+    def _separable(self):
+        rng = np.random.default_rng(11)
+        y = pd.Series([0] * 150 + [1] * 150)
+        X = pd.DataFrame({
+            "x1": np.concatenate([rng.normal(-1.5, 1.0, 150), rng.normal(1.5, 1.0, 150)]),
+            "x2": rng.normal(0, 1, 300),
+        })
+        return X, y
+
+    def test_small_lightgbm_learns_a_signal(self):
+        X, y = self._separable()
+        m = evaluation.SmallLightGBM()
+        m.fit(X, y, np.ones(len(X)))
+        p = m.predict_proba(X)
+        assert p[y == 1].mean() > p[y == 0].mean()
+
+    def test_current_lightgbm_learns_a_signal(self):
+        X, y = self._separable()
+        m = evaluation.CurrentLightGBM()
+        m.fit(X, y, np.ones(len(X)))
+        p = m.predict_proba(X)
+        assert p[y == 1].mean() > p[y == 0].mean()
+
+    def test_probabilities_are_in_range(self):
+        X, y = self._separable()
+        for model in (evaluation.SmallLightGBM(), evaluation.CurrentLightGBM()):
+            model.fit(X, y, np.ones(len(X)))
+            p = model.predict_proba(X)
+            assert ((p >= 0.0) & (p <= 1.0)).all()
+
+    def test_current_matches_existing_hyperparameters(self):
+        """現行 ml_model._fit() と同じハイパーパラメータであること"""
+        m = evaluation.CurrentLightGBM()
+        assert m.params["n_estimators"] == 200
+        assert m.params["num_leaves"] == 31
+        assert m.params["learning_rate"] == pytest.approx(0.05)
+
+    def test_small_is_smaller_than_current(self):
+        small = evaluation.SmallLightGBM()
+        current = evaluation.CurrentLightGBM()
+        assert small.params["num_leaves"] < current.params["num_leaves"]
+        assert small.params["n_estimators"] < current.params["n_estimators"]
+
+    def test_falls_back_to_constant_on_single_class(self):
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([0, 0, 0])
+        m = evaluation.SmallLightGBM()
+        m.fit(X, y, np.ones(3))
+        assert np.allclose(m.predict_proba(X), 0.0)
+
+    def test_names_are_distinct(self):
+        assert evaluation.SmallLightGBM().name == "small_lightgbm"
+        assert evaluation.CurrentLightGBM().name == "current_lightgbm"
+
+
+class TestDefaultModelFactories:
+    def test_provides_exactly_five_models(self):
+        """比較対象は5つに固定する（深層モデルはこの段階では候補にしない）"""
+        factories = evaluation.default_model_factories()
+        assert set(factories) == {
+            "constant_probability", "majority_class", "logistic_regression",
+            "small_lightgbm", "current_lightgbm",
+        }
+
+    def test_each_factory_builds_a_fresh_model(self):
+        factories = evaluation.default_model_factories()
+        for name, make in factories.items():
+            a, b = make(), make()
+            assert a is not b
+            assert a.name == name

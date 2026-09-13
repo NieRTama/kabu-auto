@@ -16,6 +16,7 @@ import hashlib
 import json
 from typing import Optional
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -223,3 +224,106 @@ class LogisticRegressionModel:
             return np.full(len(X), self._constant, dtype=float)
         Z = apply_preprocessor(self._pre, X, feature_cols=self._feature_cols)
         return self._model.predict_proba(Z)[:, 1]
+
+
+class _LightGbmBase:
+    """LightGBM分類器の共通部。
+
+    現行 ml_model._fit() は fold ごとの best_iteration_ の平均を最終モデルの
+    木数にしているが、その fold は early stopping と指標報告を兼ねており
+    報告値が楽観に寄る。本計画はその二重利用をやめる。
+
+    **木数は候補ごとに固定し、early stopping は本段階では実装しない
+    （意図的な設計差分・外部レビュー残件2026-09-12）。** spec §7 は
+    「early stopping は内側foldで決める」としているが、本段階の `fit_inner()`
+    は通常の `fit()` を呼ぶだけで、木数は 50（Small）/ 200（Current）に固定する。
+    現時点で内側foldが担うのは**閾値選択と確率校正**であり、木数選択は
+    含まれない。固定木数どうしの比較は公平（同じ内側集合・同じ検証集合）なので
+    段階Cの目的である「正しく測る」は満たすが、
+    **「木数を内側で選んだ」とは書かないこと**。
+
+    木数選択を入れる場合は、`_LightGbmBase.fit()` に `eval_set` を渡す
+    `fit_with_early_stopping()` を別メソッドとして足し、`fit_inner()` から
+    内側検証で `best_iteration_` を決め、外側学習ではその木数を固定値として
+    使う形にする。外側検証を eval_set に使うと元の問題に戻るので、
+    その経路だけは絶対に作らないこと。
+    """
+    name = "lightgbm"
+    params: dict = {}
+
+    def __init__(self) -> None:
+        self._model = None
+        self._constant: Optional[float] = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series, sample_weight: np.ndarray) -> None:
+        if y.nunique() < 2:
+            self._constant = float(y.iloc[0]) if len(y) else 0.5
+            self._model = None
+            return
+        self._constant = None
+        self._model = lgb.LGBMClassifier(**self.params)
+        self._model.fit(X, y, sample_weight=sample_weight)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        if self._constant is not None:
+            return np.full(len(X), self._constant, dtype=float)
+        return self._model.predict_proba(X)[:, 1]
+
+    # ─── 保存のための契約（段階Eの model_store が使う）─────────────────
+    # このラッパーは `_model` と `predict_proba()` しか持たないため、
+    # `getattr(model, "booster_", model).save_model(...)` のような
+    # 書き方では保存できず AttributeError になる（外部レビューR02）。
+    # 「二値がそろったモデル」と「単一クラス時の定数モデル」は保存形式が
+    # 違うので、どちらであるかを型として公開する。
+
+    @property
+    def is_constant(self) -> bool:
+        """単一クラスしか見なかったため定数を返すモデルか。"""
+        return self._constant is not None
+
+    @property
+    def constant_probability(self) -> Optional[float]:
+        """定数モデルのときの確率。二値モデルなら None。"""
+        return self._constant
+
+    @property
+    def booster(self):
+        """LightGBM の Booster。定数モデルなら None。
+
+        `lgb.LGBMClassifier.booster_` を取り出したもの。model_store は
+        これを `save_model()` でネイティブ形式へ書く。
+        """
+        return None if self._model is None else self._model.booster_
+
+
+class SmallLightGBM(_LightGbmBase):
+    """小さいLightGBM。現行より表現力を抑えた比較対象。"""
+    name = "small_lightgbm"
+    params = {
+        "n_estimators": 50, "num_leaves": 7, "learning_rate": 0.05,
+        "random_state": 42, "verbose": -1,
+    }
+
+
+class CurrentLightGBM(_LightGbmBase):
+    """現行 ml_model._fit() と同じハイパーパラメータのLightGBM。"""
+    name = "current_lightgbm"
+    params = {
+        "n_estimators": 200, "num_leaves": 31, "learning_rate": 0.05,
+        "random_state": 42, "verbose": -1,
+    }
+
+
+def default_model_factories() -> dict:
+    """比較対象5つの生成関数。
+
+    **深層モデルはこの段階では候補にしない。** 同じ入力・同じ分割で
+    追加価値を示せるかを先に確かめる（spec §7）。
+    """
+    return {
+        "constant_probability": ConstantProbability,
+        "majority_class": MajorityClass,
+        "logistic_regression": LogisticRegressionModel,
+        "small_lightgbm": SmallLightGBM,
+        "current_lightgbm": CurrentLightGBM,
+    }
