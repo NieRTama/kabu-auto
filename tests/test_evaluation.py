@@ -670,3 +670,130 @@ class TestFitInner:
         # スパイが実際に呼ばれたことを保証する（空集合同士の比較は自明にPASSしてしまう）
         assert len(captured_train_event_ids) > 0
         assert captured_train_event_ids.isdisjoint(outer_val_ids)
+
+
+class TestEvaluateFold:
+    def test_returns_predictions_for_every_validation_event(self):
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        _, val = validation.split_events(events, fold)
+
+        res = evaluation.evaluate_fold(
+            events, fold, "logistic_regression",
+            evaluation.LogisticRegressionModel, feature_cols=FEATURES)
+        assert res is not None
+        assert len(res.predictions) == len(val)
+        assert set(res.predictions["event_id"]) == set(val["event_id"])
+
+    def test_prediction_columns_are_complete(self):
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        res = evaluation.evaluate_fold(
+            events, fold, "const", evaluation.ConstantProbability,
+            feature_cols=FEATURES)
+        for col in ("event_id", "raw_probability", "calibrated_probability", "fold_index"):
+            assert col in res.predictions.columns
+        assert (res.predictions["fold_index"] == fold.index).all()
+
+    def test_baseline_rate_comes_from_training_side(self):
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        inputs = validation.training_inputs(events, fold, feature_cols=FEATURES)
+        res = evaluation.evaluate_fold(
+            events, fold, "const", evaluation.ConstantProbability,
+            feature_cols=FEATURES)
+        assert res.train_positive_rate == pytest.approx(
+            inputs.events["label"].astype(int).mean())
+
+    def test_outer_validation_values_do_not_change_training(self):
+        """外側の検証側を書き換えても学習件数と学習側正例率は変わらない"""
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        a = evaluation.evaluate_fold(
+            events, fold, "const", evaluation.ConstantProbability, feature_cols=FEATURES)
+
+        tampered = events.copy()
+        in_val = tampered["decision_at"] >= fold.val_start
+        tampered.loc[in_val, "label"] = 1
+        b = evaluation.evaluate_fold(
+            tampered, fold, "const", evaluation.ConstantProbability, feature_cols=FEATURES)
+
+        assert a.n_train == b.n_train
+        assert a.train_positive_rate == pytest.approx(b.train_positive_rate)
+
+    def test_returns_none_when_fold_has_no_data(self):
+        events = _events(n_sessions=120)
+        empty_fold = validation.Fold(
+            index=9, train_start=date(2030, 1, 1), train_end=date(2030, 1, 2),
+            val_start=date(2030, 1, 3), val_end=date(2030, 1, 4))
+        assert evaluation.evaluate_fold(
+            events, empty_fold, "const", evaluation.ConstantProbability,
+            feature_cols=FEATURES) is None
+
+
+class TestRunEvaluation:
+    def test_evaluates_every_model_on_every_fold(self, isolated_db):
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events, model_factories={
+                "constant_probability": evaluation.ConstantProbability,
+                "logistic_regression": evaluation.LogisticRegressionModel,
+            },
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        models = {r.model_id for r in out["fold_results"]}
+        assert models == {"constant_probability", "logistic_regression"}
+
+    def test_all_models_see_the_same_folds(self, isolated_db):
+        """同じ分割で比較する（モデルごとに分割を変えない）"""
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events, model_factories={
+                "constant_probability": evaluation.ConstantProbability,
+                "logistic_regression": evaluation.LogisticRegressionModel,
+            },
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        by_model = {}
+        for r in out["fold_results"]:
+            by_model.setdefault(r.model_id, []).append((r.fold_index, r.n_train, r.n_val))
+        values = list(by_model.values())
+        assert all(v == values[0] for v in values)
+
+    def test_persists_predictions_and_outcomes(self, isolated_db):
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+
+        details = evaluation.load_prediction_details(out["evaluation_run_id"])
+        assert len(details) > 0
+        assert details["actual_label"].notna().all()
+
+    def test_evaluation_run_id_is_recorded_on_every_row(self, isolated_db):
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+        details = evaluation.load_prediction_details(out["evaluation_run_id"])
+        assert (details["evaluation_run_id"] == out["evaluation_run_id"]).all()
+
+    def test_summary_frame_has_one_row_per_model_and_fold(self, isolated_db):
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events, model_factories={
+                "constant_probability": evaluation.ConstantProbability,
+                "small_lightgbm": evaluation.SmallLightGBM,
+            },
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        summary = out["summary"]
+        assert len(summary) == len(out["fold_results"])
+        for col in ("fold_index", "model_id", "n_train", "n_val",
+                    "train_positive_rate", "threshold", "roc_auc", "brier",
+                    "brier_vs_constant"):
+            assert col in summary.columns
+
+    def test_defaults_to_the_five_comparison_models(self, isolated_db):
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events, n_splits=3, feature_cols=FEATURES, persist=False)
+        assert {r.model_id for r in out["fold_results"]} == set(
+            evaluation.default_model_factories())

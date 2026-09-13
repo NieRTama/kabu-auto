@@ -484,3 +484,247 @@ def fit_inner(events: pd.DataFrame, fold, make_model, *,
     cal = fit_calibrator(raw, y)
     threshold = select_threshold(apply_calibrator(cal, raw), ret)
     return cal, threshold
+
+
+@dataclass(frozen=True)
+class FoldResult:
+    """1つの外側foldで1モデルを評価した結果。"""
+    fold_index: int
+    model_id: str
+    n_train: int
+    n_val: int
+    train_positive_rate: float
+    threshold: float
+    metrics: dict
+    predictions: pd.DataFrame
+
+
+def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
+                  window_sessions: Optional[int] = None,
+                  feature_cols: Optional[list] = None,
+                  inner_splits: int = 3) -> Optional[FoldResult]:
+    """1つの外側foldでモデルを学習し、検証側で評価する。
+
+    学習入力は必ず validation.training_inputs() から取る（独自に events を
+    絞り込まない）。校正と閾値は内側foldで決めてから外側検証へ適用する。
+    """
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    inputs = validation.training_inputs(
+        events, fold, window_sessions=window_sessions, feature_cols=cols)
+    _, val = validation.split_events(events, fold)
+    if len(inputs.events) == 0 or len(val) == 0:
+        return None
+
+    calibrator, threshold = fit_inner(
+        events, fold, make_model, window_sessions=window_sessions,
+        feature_cols=cols, inner_splits=inner_splits)
+
+    model = make_model()
+    y_train = inputs.events["label"].astype(int)
+    model.fit(inputs.events[cols].astype("float64"), y_train, inputs.weights)
+
+    raw = model.predict_proba(val[cols].astype("float64"))
+    calibrated = apply_calibrator(calibrator, raw)
+    train_rate = float(y_train.mean())
+
+    predictions = pd.DataFrame({
+        "event_id": val["event_id"].values,
+        # 実績との結合キー。イベント表から持ち回り、ここで作り直さない
+        "label_contract_id": val["label_contract_id"].values,
+        "raw_probability": raw,
+        "calibrated_probability": calibrated,
+        "fold_index": fold.index,
+    })
+    metrics = compute_metrics(
+        val["label"].astype(int), calibrated, baseline_rate=train_rate)
+
+    return FoldResult(
+        fold_index=fold.index, model_id=model_id,
+        n_train=len(inputs.events), n_val=len(val),
+        train_positive_rate=train_rate, threshold=threshold,
+        metrics=metrics, predictions=predictions,
+    )
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """評価実行の条件一式。**開始時に固定する。**
+
+    終了後に `config.yaml` を読み直すと、実行中に設定が変わっていた場合に
+    「実際に使った設定」とずれる。戦略節だけでなく、リスク・手数料・
+    数量制限・分割設定まで含める（外部レビューの残件「評価実行の再現用記録」）。
+    """
+    dataset_id: Optional[str]
+    label_contract_id: Optional[str]
+    feature_version: str
+    execution_model_version: str
+    code_version: Optional[str]
+    config_json: str
+    config_hash: str
+
+
+def _code_version() -> Optional[str]:
+    """現在のコード版（git の短縮SHA）。取れなければ None。"""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=True)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def capture_run_config(events: pd.DataFrame, *, n_splits: int,
+                       window_sessions: Optional[int],
+                       feature_cols: Optional[list]) -> RunConfig:
+    """実行条件を今この瞬間の値で固めて返す。"""
+    from src.core import config as cfg
+
+    payload = {
+        "n_splits": n_splits,
+        "window_sessions": window_sessions,
+        "feature_cols": list(feature_cols) if feature_cols else list(FEATURE_COLS),
+        "n_events": int(len(events)),
+        # 実行条件は戦略節だけでは足りない。約定コスト・リスク・数量制限まで含める
+        "strategy": cfg.get_section("strategy"),
+        "trading": cfg.get_section("trading"),
+        "backtest": cfg.get_section("backtest"),
+    }
+    config_json = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), default=str)
+    config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()[:16]
+
+    def _one(col):
+        if col not in events.columns or len(events) == 0:
+            return None
+        values = set(events[col].dropna().astype(str))
+        return values.pop() if len(values) == 1 else None
+
+    return RunConfig(
+        dataset_id=_one("dataset_id"),
+        label_contract_id=_one("label_contract_id"),
+        feature_version=_one("feature_version") or "",
+        execution_model_version=_one("execution_model_version") or "",
+        code_version=_code_version(),
+        config_json=config_json,
+        config_hash=config_hash,
+    )
+
+
+def save_evaluation_run(evaluation_run_id: str, run_config: RunConfig, *,
+                        purpose: str, model_id: Optional[str],
+                        n_folds: int, n_predictions: int,
+                        degraded_reasons: Optional[list] = None) -> None:
+    """評価実行そのものを保存する（同じIDなら上書き）。
+
+    段階Eの `check_promotable()` はこの行を昇格可否の根拠にする。
+    """
+    from src.data.database import EvaluationRun, get_session
+    from sqlalchemy import select as sa_select
+
+    reasons = list(degraded_reasons or [])
+    now = clock.now()
+    with get_session() as session:
+        row = session.scalar(sa_select(EvaluationRun).where(
+            EvaluationRun.evaluation_run_id == evaluation_run_id))
+        if row is None:
+            row = EvaluationRun(evaluation_run_id=evaluation_run_id,
+                                started_at=now)
+            session.add(row)
+        row.finished_at = now
+        row.purpose = purpose
+        row.model_id = model_id
+        row.dataset_id = run_config.dataset_id
+        row.label_contract_id = run_config.label_contract_id
+        row.feature_version = run_config.feature_version
+        row.execution_model_version = run_config.execution_model_version
+        row.code_version = run_config.code_version
+        row.config_hash = run_config.config_hash
+        row.config_json = run_config.config_json
+        row.n_folds = int(n_folds)
+        row.n_predictions = int(n_predictions)
+        row.degraded = 1 if reasons else 0
+        row.degraded_reasons = json.dumps(reasons, ensure_ascii=False)
+        session.commit()
+
+
+def load_evaluation_run(evaluation_run_id: str):
+    """保存済みの評価実行を返す（無ければ None）。"""
+    from src.data.database import EvaluationRun, get_session
+    from sqlalchemy import select as sa_select
+
+    with get_session() as session:
+        row = session.scalar(sa_select(EvaluationRun).where(
+            EvaluationRun.evaluation_run_id == evaluation_run_id))
+        if row is None:
+            return None
+        session.expunge(row)
+        return row
+
+
+def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = None,
+                   n_splits: int = 5, window_sessions: Optional[int] = None,
+                   feature_cols: Optional[list] = None,
+                   evaluation_run_id: Optional[str] = None,
+                   persist: bool = True) -> dict:
+    """全モデルを**同じ分割**で評価する。
+
+    戻り値: {"evaluation_run_id", "fold_results", "summary"}
+    persist=True なら予測明細と実績をDBへ保存する。
+    """
+    factories = model_factories or default_model_factories()
+    if evaluation_run_id is None:
+        evaluation_run_id = f"{clock.now():%Y%m%dT%H%M%S}"
+
+    # 実行条件は**開始時に固定する**。終了後に読み直すと、実行中に設定が
+    # 変わっていた場合に「実際に使った設定」とずれる。
+    run_config = capture_run_config(
+        events, n_splits=n_splits, window_sessions=window_sessions,
+        feature_cols=feature_cols)
+    degraded_reasons: list = []
+
+    folds = validation.calendar_folds(events, n_splits=n_splits)
+    results = []
+    for model_id, make_model in factories.items():
+        for fold in folds:
+            res = evaluate_fold(
+                events, fold, model_id, make_model,
+                window_sessions=window_sessions, feature_cols=feature_cols)
+            if res is None:
+                continue
+            results.append(res)
+            if persist:
+                save_predictions(res.predictions, evaluation_run_id, model_id)
+
+    if persist:
+        save_outcomes(events)
+        save_evaluation_run(
+            evaluation_run_id, run_config,
+            purpose=PURPOSE_VALIDATION,
+            model_id=(list(factories)[0] if len(factories) == 1 else None),
+            n_folds=len(folds),
+            n_predictions=sum(len(r.predictions) for r in results),
+            degraded_reasons=degraded_reasons)
+
+    rows = []
+    for r in results:
+        row = {
+            "fold_index": r.fold_index, "model_id": r.model_id,
+            "n_train": r.n_train, "n_val": r.n_val,
+            "train_positive_rate": r.train_positive_rate,
+            "threshold": r.threshold,
+        }
+        row.update(r.metrics)
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+
+    logger.info(
+        f"評価実行 {evaluation_run_id}: モデル{len(factories)}件 × fold{len(folds)}件 "
+        f"→ 結果{len(results)}件"
+    )
+    return {
+        "evaluation_run_id": evaluation_run_id,
+        "fold_results": results,
+        "summary": summary,
+    }
