@@ -204,3 +204,147 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
         degraded_reasons=[],
         model_usage=pd.DataFrame(columns=_MODEL_USAGE_COLUMNS),
     )
+
+
+def _holding_state(h: pf.Holding) -> policy.HoldingState:
+    """ポートフォリオの保有から、退出ポリシーが使う状態を作る。"""
+    return policy.HoldingState(
+        symbol=h.symbol, entry_at=h.entry_at, avg_cost=h.avg_cost,
+        quantity=h.quantity, peak_price=h.peak_price,
+        sessions_held=h.sessions_held,
+    )
+
+
+def _drive_exits(portfolio_state: pf.Portfolio, md: MarketData, session: date,
+                 policy_conf: policy.PolicyConfig,
+                 costs: execution.CostConfig,
+                 budget: Optional[execution.VolumeBudget] = None,
+                 exit_score_fn: Optional[Callable] = None) -> tuple:
+    """保有ごとに退出ポリシーを1営業日ぶん進める。
+
+    戻り値: (次のポートフォリオ, 当日約定した取引のリスト, 翌営業日へ繰り越す退出意図)
+
+    保有の peak_price / sessions_held は **policy.step() が返す次の状態で更新する**。
+    portfolio.advance_session() は「その日の足が無くポリシーを回せない保有」にだけ
+    使う。同じ規則（未来のピークを遡ってストップに使わない）の実装を2つ
+    持たないため。
+
+    STOP の意図はその日のうちに約定する（execution.exit_fill が
+    min(open, trigger) で処理する）。MARKET の意図（売りシグナル・満了）は
+    翌営業日の寄りで約定するので繰越キューへ入れる。
+
+    budget を省略した場合は無制限（`LiquidityConfig()`既定）の
+    `VolumeBudget`を都度作る。単体テストや出来高制約を検証しない呼び出しで
+    毎回`VolumeBudget`を組み立てずに済ませるため。日次ループ本体
+    （`run_walkforward`）は約定が起きる営業日単位で明示的に共有インスタンスを
+    渡すこと（`execution.VolumeBudget`のクラスdocstring参照）。
+    """
+    if budget is None:
+        budget = execution.VolumeBudget(execution.LiquidityConfig())
+    trades: list = []
+    pending_exits: list = []
+    holdings = dict(portfolio_state.holdings)
+    current = portfolio_state
+
+    for symbol, holding in list(portfolio_state.holdings.items()):
+        # 売りスコアを繋ぐ。None のままだと policy の SIGNAL_SELL 条件が
+        # 一度も成立しない（外部レビューR10）
+        score = _exit_score(md, symbol, session, exit_score_fn)
+        obs = _observation(md, symbol, session, score=score)
+        if obs is None:
+            # 足が無い日はポリシーを回せない。経過だけ進めて持ち越す
+            holdings[symbol] = replace(
+                holding, sessions_held=holding.sessions_held + 1)
+            continue
+
+        next_state, intent = policy.step(_holding_state(holding), obs, policy_conf)
+        holdings[symbol] = replace(
+            holding, peak_price=next_state.peak_price,
+            sessions_held=next_state.sessions_held)
+
+        if intent is None:
+            continue
+        if intent.order_type == "MARKET":
+            pending_exits.append((symbol, intent))
+            continue
+
+        # ストップ退出にも出来高の枠を掛ける。掛けないと900株保有・
+        # 当日出来高1,000株・参加率10%でも全量売れてしまう（外部レビューR09）
+        bar = _bar_of(md, symbol, session)
+        volume = int(bar["volume"]) if bar is not None else 0
+        result = execution.exit_fill_limited(
+            intent, obs, None, holding.quantity, costs, budget,
+            symbol=symbol, volume=volume)
+        if result.fill is None:
+            # 売れなかった。保有はそのまま残し、退出意図を翌営業日へ持ち越す
+            pending_exits.append((symbol, intent))
+            continue
+
+        sold = result.filled_quantity
+        current = replace(current, holdings=holdings)
+        current, realized = pf.apply_sell(
+            current, symbol, sold, result.fill.price, costs.commission_pct)
+        holdings = dict(current.holdings)
+        trades.append({
+            "symbol": symbol, "entry_at": holding.entry_at,
+            "entry_price": holding.avg_cost,
+            # 実現損益はこちらの原価から出ている（買付手数料込み・外部レビューR20）
+            "entry_cost_basis": holding.avg_cost_with_fees,
+            "exit_at": result.fill.at,
+            "exit_price": result.fill.price, "quantity": sold,
+            "pnl": realized, "reason": intent.reason,
+        })
+        if sold < holding.quantity:
+            # 売れ残りは保有に残っている。同じ意図を翌営業日へ持ち越す
+            pending_exits.append((symbol, intent))
+
+    current = replace(current, holdings=holdings)
+    return current, trades, pending_exits
+
+
+def _settle_pending_exits(portfolio_state: pf.Portfolio, md: MarketData,
+                          session: date, pending_exits: list,
+                          costs: execution.CostConfig,
+                          budget: execution.VolumeBudget) -> tuple:
+    """前営業日に決まった成行退出を、この日の寄りで約定させる。
+
+    戻り値: (次のポートフォリオ, 約定した取引のリスト, 約定できなかった意図)
+
+    出来高の枠は買いと共有する（`VolumeBudget`）。売り切れなかったぶんは
+    保有に残し、同じ意図を翌営業日へ持ち越す（外部レビューR09）。
+    退出フェーズを買いより先に置いているので、枠は退出が先に取る。
+    """
+    trades: list = []
+    carried: list = []
+    current = portfolio_state
+
+    for symbol, intent in pending_exits:
+        holding = current.holdings.get(symbol)
+        obs = _observation(md, symbol, session)
+        if holding is None:
+            continue
+        if obs is None:
+            carried.append((symbol, intent))
+            continue
+        bar = _bar_of(md, symbol, session)
+        volume = int(bar["volume"]) if bar is not None else 0
+        result = execution.exit_fill_limited(
+            intent, obs, obs, holding.quantity, costs, budget,
+            symbol=symbol, volume=volume)
+        if result.fill is None:
+            carried.append((symbol, intent))
+            continue
+        sold = result.filled_quantity
+        current, realized = pf.apply_sell(
+            current, symbol, sold, result.fill.price, costs.commission_pct)
+        trades.append({
+            "symbol": symbol, "entry_at": holding.entry_at,
+            "entry_price": holding.avg_cost,
+            "entry_cost_basis": holding.avg_cost_with_fees,
+            "exit_at": session,
+            "exit_price": result.fill.price, "quantity": sold,
+            "pnl": realized, "reason": intent.reason,
+        })
+        if sold < holding.quantity:
+            carried.append((symbol, intent))
+    return current, trades, carried
