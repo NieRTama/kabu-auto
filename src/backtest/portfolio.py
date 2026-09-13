@@ -291,3 +291,82 @@ def check_sector_concentration(pf: Portfolio, sector: str,
             f"（{same_sector_value:,.0f}円 / 総資金{total_value:,.0f}円 = {ratio:.0%}）"
         )
     return True, ""
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """その日の買い候補。"""
+    symbol: str
+    sector: str
+    price: float
+    score: float
+
+
+@dataclass(frozen=True)
+class PlannedOrder:
+    """資金競合を解決したあとの、実際に出す注文。"""
+    symbol: str
+    sector: str
+    price: float
+    quantity: int
+    notional: float
+
+
+@dataclass(frozen=True)
+class RejectedCandidate:
+    """採用しなかった候補と、その理由。
+
+    理由を残さないと、成績が資金制約によるものか戦略によるものか
+    判別できない（spec §8）。
+    """
+    symbol: str
+    reason: str
+
+
+def allocate(pf: Portfolio, candidates: list, conf: SizingConfig,
+             prices: dict) -> tuple:
+    """同じ日の複数候補に資金を割り当てる。(採用した注文, 除外した候補) を返す。
+
+    **スコアの高い順に1件ずつ確定させる。** 実運用では発注のたびに現金が減り、
+    2件目以降の枠は自動的に小さくなる（position_budget が残余力ベースのため）。
+    現行 engine.py は単一銘柄しか扱わずこの競合が存在しなかった。
+
+    引数のポートフォリオは変更しない（割り当ての試算用に複製して進める）。
+    採用されなかった候補には必ず理由を付けて返す。
+    """
+    working = pf
+    orders: list = []
+    rejected: list = []
+
+    for cand in sorted(candidates, key=lambda c: c.score, reverse=True):
+        ok, reason = check_max_positions(working, cand.symbol, conf)
+        if not ok:
+            rejected.append(RejectedCandidate(symbol=cand.symbol, reason=reason))
+            continue
+
+        quantity = calc_quantity(working, cand.symbol, cand.price, conf)
+        if quantity < LOT_SIZE:
+            budget = position_budget(working, conf)
+            rejected.append(RejectedCandidate(
+                symbol=cand.symbol,
+                reason=(f"単元({LOT_SIZE}株)の必要額 {cand.price * LOT_SIZE:,.0f}円 が"
+                        f"1銘柄上限の残り枠 {budget:,.0f}円 を超過"),
+            ))
+            continue
+
+        notional = cand.price * quantity
+        ok, reason = check_sector_concentration(
+            working, cand.sector, notional, prices, conf)
+        if not ok:
+            rejected.append(RejectedCandidate(symbol=cand.symbol, reason=reason))
+            continue
+
+        orders.append(PlannedOrder(
+            symbol=cand.symbol, sector=cand.sector, price=cand.price,
+            quantity=quantity, notional=notional,
+        ))
+        # 次の候補の枠を正しく縮めるため、確定したぶんを反映して進める
+        working = apply_buy(working, cand.symbol, quantity, cand.price,
+                            cand.sector, date.min, commission_pct=0.0)
+
+    return orders, rejected

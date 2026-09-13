@@ -475,3 +475,117 @@ class TestCheckSectorConcentration:
         ok, _ = pf.check_sector_concentration(
             p, "自動車", 240_000.0, {}, _sizing(sector_ratio=0.40))
         assert ok is False
+
+
+def _candidate(symbol="7203", sector="自動車", price=1000.0, score=0.5):
+    return pf.Candidate(symbol=symbol, sector=sector, price=price, score=score)
+
+
+class TestAllocate:
+    def test_takes_candidates_in_score_order(self):
+        p = pf.empty_portfolio(1_000_000.0)
+        cands = [
+            _candidate("A", "自動車", 1000.0, score=0.10),
+            _candidate("B", "機械", 1000.0, score=0.90),
+            _candidate("C", "情報通信", 1000.0, score=0.50),
+        ]
+        orders, _ = pf.allocate(p, cands, _sizing(ratio=0.25), {})
+        assert [o.symbol for o in orders] == ["B", "C", "A"]
+
+    def test_cash_shrinks_for_later_candidates(self):
+        """発注のたびに現金が減るので2件目以降の枠は小さくなる。
+
+        株価1,200円で検証する。1,000円だと枠が250,000→200,000と縮んでも
+        単元切り捨てでどちらも200株になり、差が観測できない。
+        """
+        p = pf.empty_portfolio(1_000_000.0)
+        cands = [
+            _candidate("A", "自動車", 1200.0, score=0.90),
+            _candidate("B", "機械", 1200.0, score=0.80),
+        ]
+        orders, _ = pf.allocate(p, cands, _sizing(ratio=0.25), {})
+        assert orders[0].quantity == 200
+        assert orders[1].quantity == 100
+
+    def test_budget_shrinks_even_when_lot_rounding_hides_it(self):
+        """単元切り捨てで数量が同じでも、枠そのものは縮んでいる"""
+        p = pf.empty_portfolio(1_000_000.0)
+        conf = _sizing(ratio=0.25)
+        before = pf.position_budget(p, conf)
+        orders, _ = pf.allocate(p, [_candidate("A", "自動車", 1000.0, score=0.9)],
+                                conf, {})
+        after_buy = pf.apply_buy(p, "A", orders[0].quantity, 1000.0, "自動車",
+                                 date(2026, 9, 2), commission_pct=0.0)
+        assert pf.position_budget(after_buy, conf) < before
+
+    def test_total_notional_never_exceeds_cash(self):
+        p = pf.empty_portfolio(300_000.0)
+        cands = [_candidate(s, "自動車", 1000.0, score=0.9 - i * 0.1)
+                 for i, s in enumerate("ABCDEFGH")]
+        orders, _ = pf.allocate(p, cands, _sizing(ratio=0.50, sector_ratio=1.0), {})
+        assert sum(o.notional for o in orders) <= 300_000.0
+
+    def test_rejects_beyond_max_positions(self):
+        p = pf.empty_portfolio(10_000_000.0)
+        cands = [_candidate(s, f"S{i}", 1000.0, score=0.9 - i * 0.01)
+                 for i, s in enumerate("ABCDEFG")]
+        orders, rejected = pf.allocate(
+            p, cands, _sizing(ratio=0.10, max_positions=3, sector_ratio=1.0), {})
+        assert len(orders) == 3
+        assert {r.symbol for r in rejected} == {"D", "E", "F", "G"}
+        assert all("最大保有銘柄数" in r.reason for r in rejected)
+
+    def test_rejects_on_sector_concentration(self):
+        p = pf.empty_portfolio(1_000_000.0)
+        cands = [
+            _candidate("A", "自動車", 1000.0, score=0.90),
+            _candidate("B", "自動車", 1000.0, score=0.80),
+            _candidate("C", "自動車", 1000.0, score=0.70),
+        ]
+        orders, rejected = pf.allocate(
+            p, cands, _sizing(ratio=0.25, sector_ratio=0.30), {})
+        assert len(orders) < 3
+        assert any("セクター集中率" in r.reason for r in rejected)
+
+    def test_rejects_when_one_lot_is_unaffordable(self):
+        p = pf.empty_portfolio(100_000.0)
+        cands = [_candidate("9983", "小売", 3000.0, score=0.90)]
+        orders, rejected = pf.allocate(p, cands, _sizing(ratio=0.25), {})
+        assert orders == []
+        assert len(rejected) == 1
+        assert "単元" in rejected[0].reason
+
+    def test_every_candidate_is_either_taken_or_explained(self):
+        """採用されなかった候補には必ず理由が残る"""
+        p = pf.empty_portfolio(500_000.0)
+        cands = [_candidate(s, f"S{i}", 1000.0, score=0.9 - i * 0.1)
+                 for i, s in enumerate("ABCDE")]
+        orders, rejected = pf.allocate(p, cands, _sizing(ratio=0.25), {})
+        assert len(orders) + len(rejected) == len(cands)
+        assert {o.symbol for o in orders} | {r.symbol for r in rejected} == set("ABCDE")
+
+    def test_does_not_mutate_the_input_portfolio(self):
+        p = pf.empty_portfolio(1_000_000.0)
+        before_cash = p.cash
+        pf.allocate(p, [_candidate("A", "自動車", 1000.0, score=0.9)],
+                    _sizing(ratio=0.25), {})
+        assert p.cash == pytest.approx(before_cash)
+        assert p.holdings == {}
+
+    def test_empty_candidates_gives_empty_result(self):
+        p = pf.empty_portfolio(1_000_000.0)
+        orders, rejected = pf.allocate(p, [], _sizing(), {})
+        assert orders == []
+        assert rejected == []
+
+    def test_existing_holdings_constrain_new_orders(self):
+        p = pf.Portfolio(
+            cash=200_000.0,
+            holdings={s: _holding(symbol=s, sector=f"S{i}")
+                      for i, s in enumerate("ABCD")},
+            reserved=0.0)
+        orders, rejected = pf.allocate(
+            p, [_candidate("E", "新規", 1000.0, score=0.9)],
+            _sizing(ratio=0.25, max_positions=4, sector_ratio=1.0), {})
+        assert orders == []
+        assert "最大保有銘柄数" in rejected[0].reason
