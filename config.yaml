@@ -164,13 +164,15 @@ runtime:
   # WSL2/Docker側 ~/projects/kabusapi-auto-login-template に導入済み）を使って
   # Kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化できるように
   # した。false の間は broker_full_login は一切動かず、従来通り人がログインする。
-  # 段階導入のため既定は false。実運用で安全性を確認してから true にする。
-  broker_full_login_enabled: false
+  # 段階導入のため既定は false だったが、2026-09-13 に実運用へ切り替えた
+  # （共有ロックの二重起動レース修正・起動経路排他性のpreflight検知・実行スケジュール
+  # の8:30/8:35整理を済ませた上で有効化）。
+  broker_full_login_enabled: true
   # WSL側スクリプトのタイムアウト秒数。ハングしても親プロセス(kabu-auto本体)を
   # 巻き込まない。
   broker_full_login_timeout_seconds: 180
   # 1日の完全自動ログイン試行上限。broker起動と同じ考え方で、無意味な
-  # リトライの暴走を防ぐ。**自動実行(平日06:45)にだけ効く**。Discordの
+  # リトライの暴走を防ぐ。**自動実行(平日08:30)にだけ効く**。Discordの
   # full_login（人の明示操作）は上限で止めない。
   broker_full_login_max_attempts_per_day: 3
 

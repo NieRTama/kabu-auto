@@ -354,8 +354,8 @@ class TestSchedulerWiring:
         call = calls["broker_full_login"]
         assert call.args[1] == "cron"
         assert call.kwargs.get("day_of_week") == "mon-fri"
-        assert call.kwargs.get("hour") == 6
-        assert call.kwargs.get("minute") == 45
+        assert call.kwargs.get("hour") == 8
+        assert call.kwargs.get("minute") == 30
 
     def test_omitted_when_not_registered(self):
         sched = scheduler_mod.TradingScheduler()
