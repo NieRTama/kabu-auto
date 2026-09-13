@@ -95,3 +95,113 @@ def held_value(pf: Portfolio, symbol: str, price: float) -> float:
     """
     h = pf.holdings.get(symbol)
     return h.quantity * price if h else 0.0
+
+
+def apply_buy(pf: Portfolio, symbol: str, quantity: int, price: float,
+              sector: str, at: date, commission_pct: float) -> Portfolio:
+    """買い約定を反映する。
+
+    手数料は約定代金に対して掛かる。スリッページは execution.py の約定価格に
+    織り込み済みなのでここでは扱わない（二重に引かないため）。
+    買い増しの場合は取得単価を加重平均し、**保有開始日は動かさない**
+    （保有期間の数え方を保つため）。
+    """
+    if quantity <= 0:
+        raise ValueError(f"quantity は正の整数: {quantity}")
+    amount = price * quantity
+    commission = amount * commission_pct
+    outlay = amount + commission
+    cash = pf.cash - outlay
+
+    # 現金が足りない買いは成立させない。数量は前日終値で決めるのに約定は
+    # 翌朝の寄りなので、ギャップアップすると必要額が枠を超える。ここを
+    # 通すと現金が負のままバックテストが進み、NAVも成績も意味を失う
+    # （外部レビューR08）。縮小するか諦めるかは呼び出し側の判断なので、
+    # ここでは拒否だけする。
+    if cash < 0:
+        raise InsufficientCash(
+            f"現金が足りません: {symbol} {quantity}株 × {price} "
+            f"＋手数料{commission:,.1f} = {outlay:,.1f} > 現金{pf.cash:,.1f}")
+
+    existing = pf.holdings.get(symbol)
+    if existing is None:
+        holding = Holding(
+            symbol=symbol, quantity=quantity, avg_cost=price, sector=sector,
+            entry_at=at, peak_price=price, sessions_held=0,
+            avg_cost_with_fees=outlay / quantity,
+        )
+    else:
+        total_qty = existing.quantity + quantity
+        avg_cost = (existing.avg_cost * existing.quantity + amount) / total_qty
+        # 手数料込み原価も同じ加重平均で積む
+        avg_fees = (existing.avg_cost_with_fees * existing.quantity
+                    + outlay) / total_qty
+        holding = replace(existing, quantity=total_qty, avg_cost=avg_cost,
+                          avg_cost_with_fees=avg_fees)
+
+    holdings = dict(pf.holdings)
+    holdings[symbol] = holding
+    return replace(pf, cash=cash, holdings=holdings)
+
+
+def apply_sell(pf: Portfolio, symbol: str, quantity: int, price: float,
+               commission_pct: float) -> tuple:
+    """売り約定を反映し、(次の状態, 実現損益) を返す。
+
+    実現損益は**往復の手数料控除後**。買付手数料は `avg_cost_with_fees`
+    （1株あたり原価）として保有に積んであり、売却数量ぶんを按分して引く。
+
+    買付手数料を現金からだけ引いて原価に含めないと、同値で往復したときに
+    現金は往復ぶん減るのに実現損益は片道ぶんしか減らない。10万円ぶんを
+    片道0.1%で往復すると、現金 −200円に対し実現損益 −100円になる
+    （外部レビューR20）。日次明細・取引明細にもこの値を書くので、
+    ここがずれると成績表が現金と合わなくなる。
+
+    部分決済では残りの取得単価（`avg_cost` も `avg_cost_with_fees` も）を
+    変えない。按分は数量比で行われる。
+    """
+    existing = pf.holdings.get(symbol)
+    if existing is None or existing.quantity < quantity:
+        held = existing.quantity if existing else 0
+        raise ValueError(f"保有数量が足りません: {symbol} 保有{held}株 < 売却{quantity}株")
+
+    proceeds = price * quantity
+    commission = proceeds * commission_pct
+    cash = pf.cash + proceeds - commission
+    realized = (price - existing.avg_cost_with_fees) * quantity - commission
+
+    holdings = dict(pf.holdings)
+    remaining = existing.quantity - quantity
+    if remaining > 0:
+        holdings[symbol] = replace(existing, quantity=remaining)
+    else:
+        del holdings[symbol]
+    return replace(pf, cash=cash, holdings=holdings), realized
+
+
+def max_affordable_quantity(cash: float, price: float, commission_pct: float,
+                           lot: int = LOT_SIZE) -> int:
+    """現金・手数料・単元を満たす最大数量（0 なら見送り）。"""
+    if cash <= 0 or price <= 0:
+        return 0
+    # qty * price * (1 + commission_pct) <= cash を満たす最大の qty を単元ぶんで求める
+    # qty = floor(cash / (price * (1 + commission_pct)) / lot) * lot
+    max_qty = int(cash / (price * (1 + commission_pct)))
+    return (max_qty // lot) * lot
+
+
+def advance_session(pf: Portfolio, prices: dict) -> Portfolio:
+    """1営業日ぶん保有を進める（ピーク更新と経過営業日数の加算）。
+
+    退出ポリシーが「当日の基準線は前営業日終了時点のピークで固定する」
+    規約を持つため、ピークの反映はその日の判定が終わった後に行う
+    （src/strategy/policy.py の step() と同じ順序）。
+    価格が取れない銘柄のピークは動かさない。
+    """
+    holdings = {}
+    for symbol, h in pf.holdings.items():
+        price = prices.get(symbol)
+        peak = max(h.peak_price, price) if price else h.peak_price
+        holdings[symbol] = replace(h, peak_price=peak,
+                                   sessions_held=h.sessions_held + 1)
+    return replace(pf, holdings=holdings)
