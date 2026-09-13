@@ -871,3 +871,106 @@ class TestPastPredictionsAreNotAffectedByFutureData:
             policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
             liquidity=execution.LiquidityConfig())
         assert res.degraded is False
+
+def _strategy(buy_thr=0.25, rule_w=0.5, ml_w=0.5,
+              on_failure=None):
+    return wf.StrategyConfig(
+        buy_threshold=buy_thr, rule_weight=rule_w, ml_weight=ml_w,
+        on_model_failure=on_failure or wf.ON_FAILURE_RULE_ONLY)
+
+
+def _scores(rule: float, ml):
+    def score_fn(symbol, row):
+        return rule, ml
+    return score_fn
+
+
+class TestWeightedBlend:
+    def test_buys_when_blended_score_reaches_the_threshold(self):
+        decide = wf.make_weighted_blend(_strategy(buy_thr=0.25), _scores(0.4, 0.6))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        # 0.4*0.5 + (0.6-0.5)*2*0.5 = 0.2 + 0.1 = 0.30 >= 0.25
+        assert [c.symbol for c in decide(date(2026, 1, 5), rows, "m", ctx)] == ["A"]
+
+    def test_skips_below_the_threshold(self):
+        decide = wf.make_weighted_blend(_strategy(buy_thr=0.25), _scores(0.2, 0.5))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        assert decide(date(2026, 1, 5), rows, "m", ctx) == []
+
+
+class TestRuleOnly:
+    def test_uses_the_rule_score_directly(self):
+        """縮尺を明示する。重みで割り引かない"""
+        decide = wf.make_rule_only(_strategy(buy_thr=0.25), _scores(0.3, None))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        assert [c.symbol for c in decide(date(2026, 1, 5), rows, None, ctx)] == ["A"]
+
+    def test_ignores_the_model(self):
+        decide = wf.make_rule_only(_strategy(buy_thr=0.25), _scores(0.3, 0.01))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        assert len(decide(date(2026, 1, 5), rows, "m", ctx)) == 1
+
+
+class TestRuleThenMl:
+    def test_rule_gates_and_ml_ranks(self):
+        """ルールが候補を決め、MLは順位だけを決める"""
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.30, "C": 0.10}[symbol],
+                    {"A": 0.40, "B": 0.80, "C": 0.99}[symbol])
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {s: "S" for s in "ABC"}, "portfolio": None, "closes": {}}
+        rows = {s: pd.Series({"close": 1000.0}) for s in "ABC"}
+        got = decide(date(2026, 1, 5), rows, "m", ctx)
+        # Cはルールで落ちる。A/Bは残り、ML確率の高いBが上位
+        assert [c.symbol for c in got] == ["B", "A"]
+        assert got[0].score > got[1].score
+
+    def test_falls_back_to_rule_only_when_the_model_is_missing(self):
+        decide = wf.make_rule_then_ml(
+            _strategy(buy_thr=0.25, on_failure=wf.ON_FAILURE_RULE_ONLY),
+            _scores(0.30, None))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        assert len(decide(date(2026, 1, 5), rows, None, ctx)) == 1
+
+    def test_halts_new_candidates_when_configured(self):
+        """モデル失敗時に新規候補生成を止める設定"""
+        decide = wf.make_rule_then_ml(
+            _strategy(buy_thr=0.25, on_failure=wf.ON_FAILURE_HALT_NEW),
+            _scores(0.30, None))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        assert decide(date(2026, 1, 5), rows, None, ctx) == []
+
+    def test_failure_mode_is_explicit_not_implicit(self):
+        """同じ入力でも設定によって結果が変わる＝暗黙の縮尺変更ではない"""
+        rows = {"A": pd.Series({"close": 1000.0})}
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        keep = wf.make_rule_then_ml(
+            _strategy(on_failure=wf.ON_FAILURE_RULE_ONLY), _scores(0.30, None))
+        halt = wf.make_rule_then_ml(
+            _strategy(on_failure=wf.ON_FAILURE_HALT_NEW), _scores(0.30, None))
+        assert len(keep(date(2026, 1, 5), rows, None, ctx)) != len(
+            halt(date(2026, 1, 5), rows, None, ctx))
+
+
+class TestThreeStrategiesShareTheSameLoop:
+    def test_all_three_run_on_the_same_market_data(self):
+        md = _market(symbols=("A", "B"), n=15)
+        results = {}
+        for name, maker in (("blend", wf.make_weighted_blend),
+                            ("rule", wf.make_rule_only),
+                            ("rule_ml", wf.make_rule_then_ml)):
+            decide = maker(_strategy(buy_thr=0.25), _scores(0.30, 0.70))
+            results[name] = wf.run_walkforward(
+                md, date(2026, 1, 5), date(2026, 1, 19),
+                initial_capital=1_000_000.0, decide=decide,
+                policy_conf=_policy_conf(max_holding=50), costs=_costs(),
+                sizing=_sizing(ratio=0.25), liquidity=execution.LiquidityConfig())
+        assert all(len(r.daily) == 15 for r in results.values())
+        assert all(r.degraded is False for r in results.values())

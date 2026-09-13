@@ -157,6 +157,82 @@ def save_run(result: WalkForwardResult, snapshot: RunSnapshot, *,
     return run_id
 
 
+ON_FAILURE_RULE_ONLY = "rule_only"
+ON_FAILURE_HALT_NEW = "halt_new"
+
+
+@dataclass(frozen=True)
+class StrategyConfig:
+    """判断規則の設定。
+
+    on_model_failure は「MLが無い・推論に失敗したとき」の動作を**明示する**。
+    現行 signal.py:90 は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって
+    同じ閾値でも売買判断が変わっていた（レビューF08）。
+    """
+    buy_threshold: float
+    rule_weight: float = 0.5
+    ml_weight: float = 0.5
+    on_model_failure: str = ON_FAILURE_RULE_ONLY
+
+
+def _candidate(symbol: str, row, ctx: dict, score: float) -> pf.Candidate:
+    return pf.Candidate(symbol=symbol, sector=ctx["sectors"].get(symbol, ""),
+                        price=float(row["close"]), score=score)
+
+
+def make_weighted_blend(conf: StrategyConfig, score_fn: Callable) -> Callable:
+    """案1: 既存の加重合成。`rule × rule_weight + (p−0.5)×2 × ml_weight`。"""
+    def decide(session, rows, model, ctx):
+        out = []
+        for symbol, row in rows.items():
+            rule, proba = score_fn(symbol, row)
+            ml = (proba - 0.5) * 2 if proba is not None else 0.0
+            blended = rule * conf.rule_weight + ml * conf.ml_weight
+            if blended >= conf.buy_threshold:
+                out.append(_candidate(symbol, row, ctx, blended))
+        return out
+    return decide
+
+
+def make_rule_only(conf: StrategyConfig, score_fn: Callable) -> Callable:
+    """案2: 縮尺を明示したルール単独。重みで割り引かない。"""
+    def decide(session, rows, model, ctx):
+        out = []
+        for symbol, row in rows.items():
+            rule, _ = score_fn(symbol, row)
+            if rule >= conf.buy_threshold:
+                out.append(_candidate(symbol, row, ctx, rule))
+        return out
+    return decide
+
+
+def make_rule_then_ml(conf: StrategyConfig, score_fn: Callable) -> Callable:
+    """案3: ルールで候補を作り、MLで買う・見送るの順位を決める。
+
+    **まず試すのはこれ。** 全日付を機械的に買い・売りへ変換せず、
+    ルールが候補としたイベントに対してのみMLの追加効果を測るため（spec §8）。
+    MLが無い・失敗した場合の動作は on_model_failure で明示する。
+    """
+    def decide(session, rows, model, ctx):
+        gated = []
+        for symbol, row in rows.items():
+            rule, proba = score_fn(symbol, row)
+            if rule < conf.buy_threshold:
+                continue
+            gated.append((symbol, row, rule, proba))
+
+        usable = [g for g in gated if g[3] is not None]
+        if len(usable) < len(gated):
+            if conf.on_model_failure == ON_FAILURE_HALT_NEW:
+                return []
+            # rule_only: ML無しの候補はルールスコアで順位付けする
+            return [_candidate(s, r, ctx, rule) for s, r, rule, _ in gated]
+
+        ranked = sorted(usable, key=lambda g: g[3], reverse=True)
+        return [_candidate(s, r, ctx, proba) for s, r, _, proba in ranked]
+    return decide
+
+
 def sessions_between(md: MarketData, start: date, end: date) -> list:
     """全銘柄共通の営業日（各銘柄の足の日付の和集合）を昇順で返す。"""
     all_sessions = set()

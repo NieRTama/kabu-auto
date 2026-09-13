@@ -98,6 +98,18 @@ strategy:
   # 既定 false = fail-closed（メタが無ければロード拒否。改ざん検知の迂回を防ぐため）。
   # 既存モデルを一度だけ移行したい場合のみ true にし、移行後は false に戻すこと。
   allow_unverified_model_load: false
+  # ─── 評価基盤の段階投入（2026-09-12〜）────────────────────────
+  # 学習データの生成元・CV分割・バックテストの実行主体を切り替える。
+  # legacy = 従来（labeling.build_training_set / TimeSeriesSplit / backtest.engine）
+  # v2     = 新方式（dataset.build_events / validation.calendar_split / walkforward）
+  # 既定は legacy。旧方式へいつでも戻せることが段階投入の前提（設計書§10）。
+  engine_version: "legacy"
+  # MLモデルが無い・推論に失敗したときの新規候補の扱い。
+  # rule_only = ルール単独の定義済み戦略へ切り替える
+  # halt_new  = 新規候補の生成を止める（既存ポジションの退出管理は続ける）
+  # 現行は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって同じ閾値でも
+  # 売買判断が変わっていた。どちらの動作を採るかを設定として明示する。
+  on_model_failure: "rule_only"
 
 # ─── 流動性フィルタ（レビュー P0-6）──────────────────────────────────────────
 # 薄商い銘柄への新規BUYは「約定しない/不利約定/退出時に売り抜けられない」リスクが
