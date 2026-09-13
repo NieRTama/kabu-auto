@@ -1050,18 +1050,89 @@ class TestSelectTrainingWindow:
             events, fold, evaluation.ConstantProbability,
             candidates=[], feature_cols=FEATURES) is None
 
-    def test_all_candidates_share_the_same_inner_validation_set(self):
+    def test_all_candidates_share_the_same_inner_validation_set(self, monkeypatch):
         """候補窓を変えても内側の検証集合は同一である
 
         窓で外側集合を先に切ってから内側foldを作り直すと、短い窓と拡大窓で
         評価日も件数も変わり、「学習窓の効果」と「評価期間の差」が混ざる
-        （外部レビューR19）。窓は学習側にだけ掛かること自体を固定する。
+        （外部レビューR19）。
+
+        シグネチャ検査（candidates/window_sessions引数が無いこと）と戻り値の
+        非空チェックだけでは、この退行を実際に注入してもPASSしたまま検知
+        できないことが外部レビューの実験で確認された。ここでは
+        select_training_window() に実際に複数の候補窓を渡し、
+        validation.split_events() をスパイして**各候補の評価で実際に使われた
+        検証event_id集合**を捕捉し、候補をまたいで完全一致することを直接
+        アサートする。
+
+        select_training_window は最初に `validation.training_inputs(events,
+        fold, ...)` を1回呼んで外側学習側 `base.events` を作る（この呼び出しは
+        `events` そのものを渡すので `ev is events` で区別できる）。内側の
+        呼び出しはすべて `base.events`（別オブジェクト）を渡すので、
+        それだけを候補間比較の対象にする。
+
+        内側foldは3つあり（fold自体はそれぞれ検証期間が異なる）、1候補の中では
+        当然それぞれ違う検証集合を持つ。R19の不変条件は「**同じ内側fold**は
+        **どの候補でも**同じ検証集合を使う」ことなので、(1)全ての内側呼び出しが
+        同一の events オブジェクト（`base.events`）から作られていること、
+        (2) 同じ検証期間（val_start, val_end）の呼び出しは常に同じ
+        event_id集合を返すこと、の両方を確かめる。学習窓を先に適用してから
+        内側foldを作り直す退行が混入すると、候補ごとに**別のevents
+        オブジェクト**（windowedフレーム）から内側foldが再構築されるため、
+        (1)が候補の数だけ複数のオブジェクトIDに割れてFAILする
+        （実際に注入して確認済み。報告書参照）。
         """
         events = _events(n_sessions=150)
         fold = validation.calendar_folds(events, n_splits=3)[1]
+
+        captured_inner: list = []  # (id(ev), val_start, val_end, event_idの集合)
+        real_split_events = evaluation.validation.split_events
+
+        def spy_split_events(ev, f, **kwargs):
+            train, val = real_split_events(ev, f, **kwargs)
+            if ev is not events:
+                # 外側の base.events を作るための最初の1回（ev is events）は
+                # 除外し、内側fold用の呼び出しだけを候補間比較の対象にする。
+                captured_inner.append(
+                    (id(ev), f.val_start, f.val_end, frozenset(val["event_id"])))
+            return train, val
+
+        monkeypatch.setattr(evaluation.validation, "split_events", spy_split_events)
+
+        got = evaluation.select_training_window(
+            events, fold, evaluation.LogisticRegressionModel,
+            candidates=[None, 20, 40], feature_cols=FEATURES)
+
+        assert got in (None, 20, 40)
+        # スパイが実際に呼ばれたことを保証する（空リスト同士の比較は自明にPASSしてしまう）
+        assert len(captured_inner) > 0
+
+        # (1) 内側fold用の呼び出しは、候補（窓）が変わっても常に同一の
+        #     events オブジェクトから行われている＝内側foldを候補ごとに
+        #     作り直していない。
+        distinct_event_objects = {c[0] for c in captured_inner}
+        assert len(distinct_event_objects) == 1, (
+            "候補ごとに異なる events オブジェクトから内側foldが作られている"
+            "（学習窓を先に適用してから内側foldを作り直す退行の兆候）"
+        )
+
+        # (2) 同じ検証期間（＝同じ内側fold）を指す呼び出しは、候補をまたいでも
+        #     常に同じ検証event_id集合を返す。
+        by_bounds: dict = {}
+        for _, val_start, val_end, ids in captured_inner:
+            by_bounds.setdefault((val_start, val_end), []).append(ids)
+        assert len(by_bounds) >= 2  # 内側foldが複数あることを確認（自明なPASSを避ける）
+        for (val_start, val_end), id_sets in by_bounds.items():
+            assert all(s == id_sets[0] for s in id_sets), (
+                f"内側fold({val_start}~{val_end})の検証集合が候補間で一致しない"
+            )
+
+        # inner_validation_event_ids() が返す値とも一致する
+        all_captured_ids = set().union(*(c[3] for c in captured_inner))
         ids = evaluation.inner_validation_event_ids(
             events, fold, feature_cols=FEATURES)
         assert len(ids) > 0
+        assert set(ids) == all_captured_ids
 
         # 内側検証集合は窓候補を引数に取らない＝窓に依存しない
         import inspect
@@ -1088,18 +1159,95 @@ class TestSelectTrainingWindow:
         assert len(val) > 0
 
     def test_comparison_is_per_event_not_a_sum(self):
-        """比較値は採用イベント1件あたりの平均である
+        """比較値は採用イベント1件あたりの平均である（総和ではない）
 
-        総和のままだと「多く拾う窓」が中身の良し悪しと無関係に勝つ。
-        候補を1つだけ渡した場合でも、採用が0件なら選ばれない。
+        候補を1つしか渡さないテストでは実際には「比較」が起きず、
+        `score = total`（総和）に書き換えても全件PASSしてしまうことが
+        外部レビューの実験で確認された。ここでは意図的に
+
+        - 候補A（窓=5・少数訓練データ）: 検証集合の中でもごく少数の
+          「極上」イベント（net_return=+3.0）だけを拾う→件数は少ないが
+          1件あたりの平均は非常に高い
+        - 候補B（窓=None・多数訓練データ）: 「極上」に加えて多数の
+          「並」イベント（net_return=+0.1）も拾う→合計netreturnは
+          候補Aより大きいが、1件あたりの平均は低い
+
+        という状況を作り、select_training_window() が候補Aを選ぶことを
+        検証する。総和で比較すると候補Bの合計(10.8)が候補Aの合計(6.0)を
+        上回るため誤って候補Bが選ばれ、このテストはFAILする
+        （実際に `score = total` へ書き換えてFAILを確認済み。報告書参照）。
+
+        検証集合（60件: 極上2件+並48件+不良10件）は候補間で共通（R19の
+        不変条件）。モデルは学習データの件数（n_train）だけを見て、
+        件数が少ない（<15件）ときは「極上」だけに高確率、多い（>=15件）
+        ときは「極上+並」に高確率を返す──窓が小さいほど学習データが
+        少なくなるので、これは学習窓の効果を模したふるまいになる。
         """
-        events = _events(n_sessions=150)
-        fold = validation.calendar_folds(events, n_splits=3)[1]
-        # ConstantProbability は全件同じ確率を返す。select_threshold が
-        # 収益を最大化する閾値を選ぶので、全件負なら採用0件になりうる。
-        losing = events.copy()
-        losing["net_return"] = -0.05
+        start = date(2026, 1, 5)
+        rows = []
+
+        # 内側学習側（低密度・20セッション・symbol A0）
+        # 窓=5 なら直近5セッション、窓=None なら20セッション全部が学習に入る。
+        for i in range(20):
+            d = start + timedelta(days=i)
+            rows.append({
+                "event_id": f"A0:{d:%Y%m%d}", "label_contract_id": _LC,
+                "symbol": "A0", "decision_at": d, "entry_at": d,
+                "label_end_at": d, "status": dataset.STATUS_RESOLVED,
+                "label": 0, "net_return": 0.0, "x1": 0.0,
+            })
+
+        # 内側検証側（高密度・20セッション x 3銘柄=60件、候補間で共通）
+        combos = []
+        for i in range(20):
+            d = start + timedelta(days=20 + i)
+            for sym in ("V0", "V1", "V2"):
+                combos.append((d, sym))
+        assert len(combos) == 60
+        # 先頭2件=極上、続く10件=不良、残り48件=並
+        groups = ["excellent"] * 2 + ["bad"] * 10 + ["good"] * 48
+        ret_map = {"excellent": 3.0, "good": 0.1, "bad": -1.0}
+        x1_map = {"excellent": 2.0, "good": 1.0, "bad": 0.0}
+        for (d, sym), g in zip(combos, groups):
+            rows.append({
+                "event_id": f"{sym}:{d:%Y%m%d}", "label_contract_id": _LC,
+                "symbol": sym, "decision_at": d, "entry_at": d,
+                "label_end_at": d, "status": dataset.STATUS_RESOLVED,
+                "label": 1 if ret_map[g] > 0 else 0,
+                "net_return": ret_map[g], "x1": x1_map[g],
+            })
+        events = pd.DataFrame(rows)
+
+        fold = validation.Fold(
+            index=0,
+            train_start=start,
+            train_end=start + timedelta(days=39),
+            val_start=start + timedelta(days=40),
+            val_end=start + timedelta(days=41),
+        )
+
+        class WindowSensitiveModel:
+            """学習データ件数だけを見て、窓の広さに応じて拾う対象を変える
+            テスト専用の模型。件数が少ないほど「極上」だけに絞り込む。"""
+            name = "window_sensitive"
+
+            def __init__(self) -> None:
+                self._n_train = None
+
+            def fit(self, X, y, sample_weight) -> None:
+                self._n_train = len(X)
+
+            def predict_proba(self, X):
+                marker = X["x1"].to_numpy()
+                if self._n_train is not None and self._n_train < 15:
+                    return np.where(marker >= 2.0, 0.9, 0.1)
+                return np.where(marker >= 1.0, 0.9, 0.1)
+
         got = evaluation.select_training_window(
-            losing, fold, evaluation.ConstantProbability,
-            candidates=[20], feature_cols=FEATURES)
-        assert got in (None, 20)   # 採用0件なら None、拾ったなら 20
+            events, fold, WindowSensitiveModel,
+            candidates=[5, None], feature_cols=["x1"], inner_splits=1)
+
+        # 候補A（窓=5）: 極上2件のみ採用、合計=6.0、平均=3.0
+        # 候補B（窓=None）: 極上+並=50件採用、合計=10.8、平均=0.216
+        # 総和なら候補Bが勝つが、平均なら候補Aが勝つ。
+        assert got == 5
