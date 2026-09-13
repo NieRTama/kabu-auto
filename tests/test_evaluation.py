@@ -627,3 +627,36 @@ class TestFitInner:
         _, thr = evaluation.fit_inner(
             events, fold, evaluation.ConstantProbability, feature_cols=FEATURES)
         assert 0.0 <= thr <= 1.0
+
+    def test_inner_training_and_threshold_events_are_disjoint_from_outer_validation(self):
+        """校正・閾値選択に使われたevent_idは、外側検証のevent_idと完全に排他
+
+        tests/test_validation.py の TestOuterFoldIsUntouchable/TestInnerFolds が
+        確立した流儀に合わせ、tamper-invariance だけでなく event_id 集合の
+        直接比較でもリークがないことを検証する。fit_inner() は内部で
+        training_inputs/inner_folds/split_events を組み合わせて内側foldの
+        学習・検証イベントを作るので、同じ公開APIで同じ手順を再構成し、
+        そこで実際に使われたevent_id集合が外側検証のevent_id集合と
+        1件も重ならないことを set の交差が空集合であることで直接確認する。
+        """
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+
+        _, outer_val = validation.split_events(events, fold)
+        outer_val_ids = set(outer_val["event_id"])
+        assert len(outer_val_ids) > 0
+
+        outer = validation.training_inputs(events, fold, feature_cols=FEATURES)
+        outer_train = outer.events
+
+        # fit_inner() が内側foldごとに学習・閾値選択へ実際に使うevent_idの集合
+        # （src/strategy/evaluation.py の fit_inner 実装と同じ手順で再構成する）
+        inner_ids: set = set()
+        for inner in validation.inner_folds(outer_train, n_splits=3):
+            inner_inputs = validation.training_inputs(outer_train, inner, feature_cols=FEATURES)
+            _, inner_val = validation.split_events(outer_train, inner)
+            inner_ids.update(inner_inputs.events["event_id"])
+            inner_ids.update(inner_val["event_id"])
+
+        assert len(inner_ids) > 0
+        assert inner_ids.isdisjoint(outer_val_ids)
