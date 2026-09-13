@@ -171,35 +171,143 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                     policy_conf: policy.PolicyConfig,
                     costs: execution.CostConfig,
                     sizing: pf.SizingConfig,
-                    liquidity: execution.LiquidityConfig) -> WalkForwardResult:
+                    liquidity: execution.LiquidityConfig,
+                    model=None,
+                    exit_score_fn: Optional[Callable] = None,
+                    ) -> WalkForwardResult:
     """日次5フェーズでポートフォリオを進める。
 
+      ①前日までに決まった注文の執行 → ②保有と現金の更新 →
+      ③退出ポリシーの逐次駆動 → ④日末のNAV記録 → ⑤翌日の候補生成
+
+    **Tの終値の情報はT+1以降の注文にしか使えない。** decide() が返した候補は
+    その日には約定せず、翌営業日の寄りで執行される。
+
     decide は判断規則（戦略バージョン）。
-    `decide(session, rows, model, ctx) -> list[portfolio.Candidate]` の形で、
-    その日の引けの情報から**翌営業日に出す**候補を返す。
+    `decide(session, rows, model, ctx) -> list[portfolio.Candidate]`。
+
+    **model は「その判断時点で利用可能だったモデル」でなければならない。**
+    本タスクの時点では引数の `model` を全期間で使う。これは**診断用の
+    固定モデル実行**であり、採否の根拠にできる walk-forward 成績ではない。
+    再学習の結線（`retrain` / `train_model`）は後続タスクで足す。
+    固定モデル実行を昇格の根拠に使わせないための degraded 判定も
+    そのタスクで入れる（外部レビューR04）。
+
+    exit_score_fn は保有銘柄の売りスコア。`exit_score_fn(symbol, row) -> float|None`。
+    渡さないと policy の SIGNAL_SELL が一度も成立しない（外部レビューR10）。
     """
     sessions = sessions_between(md, start, end)
-    portfolio_state = pf.empty_portfolio(initial_capital)
+    state = pf.empty_portfolio(initial_capital)
     daily: list = []
+    trades: list = []
+    rejected: list = []
+    pending_buys: list = []
+    pending_exits: list = []
 
     for session in sessions:
         realized = 0.0
         closes = closes_at(md, session)
+        # 出来高の枠はこの営業日ぶん。買いと売りで共有する（外部レビューR09）
+        budget = execution.VolumeBudget(liquidity)
 
-        # ④ 日末評価（①②③⑤は後続タスクで足す）
-        portfolio_state = pf.advance_session(portfolio_state, closes)
+        # ① 前日までに決まった成行退出を、この日の寄りで約定させる
+        state, exit_trades, pending_exits = _settle_pending_exits(
+            state, md, session, pending_exits, costs, budget)
+        for t in exit_trades:
+            realized += t["pnl"]
+        trades.extend(exit_trades)
+
+        # ① 前日までに決まった買いを、この日の寄りで約定させる（②保有と現金の更新）
+        #
+        # 数量は**前日の終値**で決めてある。約定は翌朝の寄りなので、
+        # ギャップアップすると必要額が枠を超える。約定時点の価格で
+        # 買える株数まで縮め、それでも1単元に届かなければ見送る。
+        # ここを飛ばすと現金が負のままバックテストが進み、NAVも成績も
+        # 意味を失う（外部レビューR08）。
+        for order in pending_buys:
+            bar = _bar_of(md, order.symbol, session)
+            if bar is None:
+                rejected.append({"session": session, "symbol": order.symbol,
+                                 "reason": "この営業日の足が無く約定できません"})
+                continue
+            obs = _observation(md, order.symbol, session)
+
+            # 約定価格（寄り×(1+slip)）を先に求めてから数量を決める
+            fill_price = execution.buy_fill_price(obs.open, costs)
+            affordable = pf.max_affordable_quantity(
+                state.cash, fill_price, costs.commission_pct)
+            # 1銘柄あたりの上限・セクター集中の上限も約定価格で引き直す
+            capped = min(
+                order.quantity,
+                affordable,
+                pf.calc_quantity(state, order.symbol, fill_price, sizing),
+            )
+            capped = (capped // pf.LOT_SIZE) * pf.LOT_SIZE
+            if capped < pf.LOT_SIZE:
+                rejected.append({
+                    "session": session, "symbol": order.symbol,
+                    "reason": (
+                        f"約定価格{fill_price:,.1f}では買付余力・上限を満たせません"
+                        f"（予定{order.quantity:,}株／現金{state.cash:,.0f}円）"
+                    )})
+                continue
+            if capped < order.quantity:
+                rejected.append({
+                    "session": session, "symbol": order.symbol,
+                    "reason": (
+                        f"約定価格{fill_price:,.1f}で数量を縮小"
+                        f"（{order.quantity:,}株→{capped:,}株）"
+                    )})
+
+            result = execution.entry_fill_limited(
+                obs, capped, costs, budget,
+                symbol=order.symbol, volume=int(bar["volume"]))
+            if result.unfilled_reason:
+                rejected.append({"session": session, "symbol": order.symbol,
+                                 "reason": result.unfilled_reason})
+            if result.fill is None:
+                continue
+            # 出来高の枠は entry_fill_limited() へ渡した budget が既に
+            # 退出（①③フェーズ）と共有した状態で消費している（外部レビューR09）。
+            # ここで budget.allow() を再度呼ぶと同じ枠を二重に消費してしまうので
+            # 呼ばない。実際に約定した数量は result.filled_quantity。
+            state = pf.apply_buy(
+                state, order.symbol, result.filled_quantity, result.fill.price,
+                order.sector, session, costs.commission_pct)
+        pending_buys = []
+
+        # ③ 退出ポリシーの逐次駆動
+        state, stop_trades, new_pending_exits = _drive_exits(
+            state, md, session, policy_conf, costs, budget, exit_score_fn)
+        for t in stop_trades:
+            realized += t["pnl"]
+        trades.extend(stop_trades)
+        pending_exits = pending_exits + new_pending_exits
+
+        # ④ 日末のNAV記録
         daily.append(DailyRow(
-            session=session,
-            nav=pf.nav(portfolio_state, closes),
-            cash=portfolio_state.cash,
-            n_holdings=len(portfolio_state.holdings),
-            realized_pnl=realized,
+            session=session, nav=pf.nav(state, closes), cash=state.cash,
+            n_holdings=len(state.holdings), realized_pnl=realized,
         ))
+
+        # ⑤ 翌日の候補生成（この日の引けの情報だけを使う）
+        # 判断へ渡すのは**特徴量を重ねた行**。生OHLCVだけを渡すと
+        # rule_score も特徴量も無い行になる（外部レビューR03）
+        rows = {s: _row_for(md, s, session) for s in md.bars}
+        rows = {s: r for s, r in rows.items() if r is not None}
+        ctx = {"sectors": md.sectors, "portfolio": state, "closes": closes}
+        candidates = decide(session, rows, model, ctx)
+        if candidates:
+            orders, rejects = pf.allocate(state, candidates, sizing, closes)
+            pending_buys = orders
+            for r in rejects:
+                rejected.append({"session": session, "symbol": r.symbol,
+                                 "reason": r.reason})
 
     return WalkForwardResult(
         daily=pd.DataFrame([vars(r) for r in daily], columns=_DAILY_COLUMNS),
-        trades=pd.DataFrame(columns=_TRADE_COLUMNS),
-        rejected=pd.DataFrame(columns=_REJECTED_COLUMNS),
+        trades=pd.DataFrame(trades, columns=_TRADE_COLUMNS),
+        rejected=pd.DataFrame(rejected, columns=_REJECTED_COLUMNS),
         degraded=False,
         degraded_reasons=[],
         model_usage=pd.DataFrame(columns=_MODEL_USAGE_COLUMNS),

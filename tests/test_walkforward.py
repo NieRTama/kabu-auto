@@ -269,3 +269,273 @@ class TestDriveExitsUnit:
             p, md, date(2026, 3, 1), _policy_conf(), _costs())   # 足が無い日
         assert trades == []
         assert nxt.holdings["A"].sessions_held == 1
+
+
+class TestFillTimeAffordability:
+    """約定時点で現金・上限を引き直すこと（外部レビューR08）。"""
+
+    def _gap_up_market(self):
+        """前日終値100円、翌朝112円へギャップアップする足"""
+        bars = _bars(6, price=100.0)
+        idx = bars.index[1]
+        bars.loc[idx, ["open", "high", "low", "close"]] = [112.0, 115.0, 111.0, 113.0]
+        return wf.MarketData(bars={"A": bars}, sectors={"A": "S"})
+
+    def test_cash_never_goes_negative_on_a_gap_up(self):
+        """現金10万・前日100円で枠いっぱい→翌朝112円。全量買うと残高−900.8円
+
+        sector_ratio を明示的に上げているのは、max_position_ratio=1.0（残余力の
+        100%）と _sizing() の既定 max_sector_ratio=1.0 が同じ値だと、単一セクター・
+        単一候補では候補金額が総資金にちょうど一致し、check_sector_concentration()
+        の `ratio >= max_ratio` 判定（境界含む・src/risk/manager.py と同じ規約）で
+        本テストが検証したい約定時点の現金制約より先にセクター集中で却下されて
+        しまうため（このテストの意図はギャップアップ時の現金縮小の検証）。
+        """
+        md = self._gap_up_market()
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=100_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=20),
+            costs=_costs(comm=0.001), sizing=_sizing(ratio=1.0, sector_ratio=2.0),
+            liquidity=execution.LiquidityConfig())
+        assert (res.daily["cash"] >= 0).all()
+        assert (res.daily["nav"] > 0).all()
+
+    def test_shrunk_order_is_recorded_with_a_reason(self):
+        """sector_ratio を上げる理由は test_cash_never_goes_negative_on_a_gap_up と同じ。"""
+        md = self._gap_up_market()
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=100_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=20),
+            costs=_costs(comm=0.001), sizing=_sizing(ratio=1.0, sector_ratio=2.0),
+            liquidity=execution.LiquidityConfig())
+        reasons = " ".join(res.rejected["reason"].astype(str))
+        assert "縮小" in reasons or "買付余力" in reasons
+
+    def test_multiple_orders_share_the_same_cash(self):
+        """同じ日に複数の買いが出ても、合計が現金を超えない"""
+        bars_a, bars_b = _bars(6, price=1000.0), _bars(6, price=1000.0)
+        md = wf.MarketData(bars={"A": bars_a, "B": bars_b},
+                           sectors={"A": "S1", "B": "S2"})
+
+        def decide(session, rows, model, ctx):
+            if session != date(2026, 1, 5):
+                return []
+            return [pf.Candidate(symbol=s, sector=ctx["sectors"][s],
+                                 price=float(rows[s]["close"]), score=0.9)
+                    for s in ("A", "B")]
+
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=150_000.0, decide=decide,
+            policy_conf=_policy_conf(max_holding=20),
+            costs=_costs(comm=0.001), sizing=_sizing(ratio=1.0),
+            liquidity=execution.LiquidityConfig())
+        assert (res.daily["cash"] >= 0).all()
+
+
+class TestExitLiquidity:
+    """売りにも出来高の制限が掛かること（外部レビューR09）。"""
+
+    def _stop_market(self):
+        # 出来高1,000株・参加率10% → 1日100株まで。
+        # エントリー約定日（index[1]）だけは出来高を大きくして、買い自体が
+        # 同じ出来高枠で縮まないようにする（このクラスが検証したいのは
+        # 「売り」側の出来高制約であり、買いを縮めると保有数量が売りの
+        # 1日枠ちょうどになり、損切りが1日で全量約定してしまって
+        # 「売り切れずに残る」状態を再現できない）。
+        bars = _bars(12, price=1000.0, volume=1_000)
+        bars.loc[bars.index[1], "volume"] = 1_000_000
+        idx = bars.index[4]
+        bars.loc[idx, ["open", "high", "low", "close"]] = [1000.0, 1000.0, 850.0, 860.0]
+        return wf.MarketData(bars={"A": bars}, sectors={"A": "S"})
+
+    def test_stop_exit_cannot_sell_more_than_the_volume_allows(self):
+        res = wf.run_walkforward(
+            self._stop_market(), date(2026, 1, 5), date(2026, 1, 16),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(ratio=0.3),
+            liquidity=execution.LiquidityConfig(max_volume_share=0.1))
+        assert len(res.trades) >= 1
+        assert (res.trades["quantity"] <= 100).all()
+
+    def test_unsold_shares_stay_in_the_portfolio(self):
+        """損切りを出しても売り切れない。残りは保有に残る
+
+        sizing を ratio=0.3（300株）にしているのは、1日の売り枠100株の
+        ちょうど2倍だと損切り発生日の翌営業日で全量を売り切ってしまい、
+        「売れ残りが保有に残る」状態を1営業日も観測できないため
+        （300株なら3営業日に分かれて約定するので、間の営業日で必ず残数が残る）。
+        """
+        res = wf.run_walkforward(
+            self._stop_market(), date(2026, 1, 5), date(2026, 1, 16),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(ratio=0.3),
+            liquidity=execution.LiquidityConfig(max_volume_share=0.1))
+        after_stop = res.daily[res.daily["session"] > date(2026, 1, 9)]
+        assert (after_stop["n_holdings"] > 0).any()
+
+    def test_exit_and_entry_share_the_same_day_budget(self):
+        """同日・同銘柄で退出が枠を使うと、買いはその残りしか約定できない"""
+        budget = execution.VolumeBudget(
+            execution.LiquidityConfig(max_volume_share=0.1))
+        assert budget.allow("A", 1_000, 100) == 100     # 退出が使い切る
+        assert budget.allow("A", 1_000, 100) == 0       # 買いは約定できない
+
+
+class TestSignalSellExit:
+    """売りスコアによる退出が実際に効くこと（外部レビューR10）。"""
+
+    def _flat_market(self, n=12):
+        # 値動きが無いのでストップにも満了にも掛からない
+        return wf.MarketData(bars={"A": _bars(n, price=1000.0)},
+                             sectors={"A": "S"})
+
+    def test_sell_signal_exits_before_stop_or_time_limit(self):
+        def exit_score_fn(symbol, row):
+            # 1/8以降は強い売りシグナル
+            return -0.9 if row.name >= pd.Timestamp(date(2026, 1, 8)) else 0.5
+
+        res = wf.run_walkforward(
+            self._flat_market(), date(2026, 1, 5), date(2026, 1, 16),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(sell_thr=-0.25, max_holding=30),
+            costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            exit_score_fn=exit_score_fn)
+
+        assert len(res.trades) == 1
+        t = res.trades.iloc[0]
+        assert t["reason"] == policy.SIGNAL_SELL
+        # 成行なので翌営業日の寄りで約定する
+        assert t["exit_at"] == date(2026, 1, 9)
+
+    def test_without_a_score_function_the_position_is_held(self):
+        """結線しないと売りシグナル退出は一度も起きない（回帰の見張り）"""
+        res = wf.run_walkforward(
+            self._flat_market(), date(2026, 1, 5), date(2026, 1, 16),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(sell_thr=-0.25, max_holding=30),
+            costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        assert len(res.trades) == 0
+
+    def test_score_reaches_the_policy_observation(self):
+        """score が Observation まで届いていること（Noneで素通りしない）"""
+        seen = []
+
+        def exit_score_fn(symbol, row):
+            seen.append(symbol)
+            return 0.5
+
+        wf.run_walkforward(
+            self._flat_market(), date(2026, 1, 5), date(2026, 1, 16),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=30), costs=_costs(),
+            sizing=_sizing(), liquidity=execution.LiquidityConfig(),
+            exit_score_fn=exit_score_fn)
+        assert "A" in seen
+
+
+class TestEntryTiming:
+    def test_order_decided_on_t_fills_on_the_next_session(self):
+        """Tの終値で判断した注文はT+1の寄りで約定する（F04の回帰防止）"""
+        md = wf.MarketData(bars={"A": _bars(6, price=1000.0)}, sectors={"A": "S"})
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        # 1/5の引けで判断 → 1/6の寄りで約定
+        assert res.daily[res.daily["session"] == date(2026, 1, 5)]["n_holdings"].iloc[0] == 0
+        assert res.daily[res.daily["session"] == date(2026, 1, 6)]["n_holdings"].iloc[0] == 1
+
+    def test_no_fill_when_there_is_no_next_session(self):
+        """最終営業日に決めた注文は執行されない（翌営業日が無い）"""
+        md = wf.MarketData(bars={"A": _bars(3, price=1000.0)}, sectors={"A": "S"})
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 7),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=2),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig())
+        assert res.daily["n_holdings"].eq(0).all()
+
+    def test_cash_decreases_on_the_fill_session(self):
+        md = wf.MarketData(bars={"A": _bars(6, price=1000.0)}, sectors={"A": "S"})
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(), sizing=_sizing(ratio=0.25),
+            liquidity=execution.LiquidityConfig())
+        first = res.daily[res.daily["session"] == date(2026, 1, 5)]["cash"].iloc[0]
+        second = res.daily[res.daily["session"] == date(2026, 1, 6)]["cash"].iloc[0]
+        assert first == pytest.approx(1_000_000.0)
+        assert second < first
+
+
+class TestCapitalCompetition:
+    def _buy_all(self):
+        def decide(session, rows, model, ctx):
+            return [pf.Candidate(symbol=s, sector=ctx["sectors"][s],
+                                 price=float(r["close"]), score=1.0 / (i + 1))
+                    for i, (s, r) in enumerate(sorted(rows.items()))]
+        return decide
+
+    def test_respects_max_positions(self):
+        md = _market(symbols=tuple("ABCDEFG"), n=10)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=10_000_000.0, decide=self._buy_all(),
+            policy_conf=_policy_conf(max_holding=50), costs=_costs(),
+            sizing=_sizing(ratio=0.10, max_positions=3),
+            liquidity=execution.LiquidityConfig())
+        assert res.daily["n_holdings"].max() <= 3
+
+    def test_records_rejection_reasons(self):
+        md = _market(symbols=tuple("ABCDEFG"), n=10)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 14),
+            initial_capital=10_000_000.0, decide=self._buy_all(),
+            policy_conf=_policy_conf(max_holding=50), costs=_costs(),
+            sizing=_sizing(ratio=0.10, max_positions=3),
+            liquidity=execution.LiquidityConfig())
+        assert len(res.rejected) > 0
+        assert list(res.rejected.columns) == ["session", "symbol", "reason"]
+        assert res.rejected["reason"].str.contains("最大保有銘柄数").any()
+
+    def test_cash_never_goes_negative(self):
+        md = _market(symbols=tuple("ABCDE"), n=15)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 19),
+            initial_capital=500_000.0, decide=self._buy_all(),
+            policy_conf=_policy_conf(max_holding=50), costs=_costs(comm=0.001),
+            sizing=_sizing(ratio=0.50), liquidity=execution.LiquidityConfig())
+        assert (res.daily["cash"] >= -1e-6).all()
+
+
+class TestVolumeLimit:
+    def test_partial_fill_reduces_the_quantity(self):
+        md = wf.MarketData(bars={"A": _bars(6, price=1000.0, volume=1000)},
+                           sectors={"A": "S"})
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(),
+            sizing=_sizing(ratio=0.25),
+            liquidity=execution.LiquidityConfig(max_volume_share=0.1))
+        # 出来高1,000株の10% = 100株までしか買えない
+        held_cash = res.daily[res.daily["session"] == date(2026, 1, 6)]["cash"].iloc[0]
+        assert held_cash == pytest.approx(1_000_000.0 - 100_000.0)
+
+    def test_unfilled_is_recorded_as_rejected(self):
+        md = wf.MarketData(bars={"A": _bars(6, price=1000.0, volume=500)},
+                           sectors={"A": "S"})
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(),
+            sizing=_sizing(ratio=0.25),
+            liquidity=execution.LiquidityConfig(max_volume_share=0.1))
+        assert res.daily["n_holdings"].eq(0).all()
+        assert res.rejected["reason"].str.contains("出来高").any()
