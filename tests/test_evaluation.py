@@ -16,6 +16,7 @@ from src.data import database as db
 from src.data.database import get_session
 from src.strategy import dataset
 from src.strategy import evaluation
+from src.strategy import validation
 
 
 @pytest.fixture
@@ -523,3 +524,106 @@ class TestComputeMetrics:
                                        baseline_rate=0.5)
         assert m["n"] == 0
         assert m["roc_auc"] is None
+
+
+class TestCalibrator:
+    def test_identity_when_too_few_samples(self):
+        raw = np.array([0.1, 0.9])
+        cal = evaluation.fit_calibrator(raw, pd.Series([0, 1]), min_samples=50)
+        assert cal.kind == "identity"
+        assert np.allclose(evaluation.apply_calibrator(cal, raw), raw)
+
+    def test_identity_when_single_class(self):
+        raw = np.linspace(0.1, 0.9, 100)
+        cal = evaluation.fit_calibrator(raw, pd.Series([1] * 100), min_samples=50)
+        assert cal.kind == "identity"
+
+    def test_isotonic_pulls_overconfident_probabilities_toward_truth(self):
+        """実際の正例率が0.5なのに0.9を出していたら、校正後は下がる"""
+        rng = np.random.default_rng(5)
+        y = pd.Series(rng.integers(0, 2, 400))
+        raw = np.where(y == 1, 0.95, 0.9)  # 常に自信過剰
+        cal = evaluation.fit_calibrator(raw, y, min_samples=50)
+        assert cal.kind == "isotonic"
+        out = evaluation.apply_calibrator(cal, raw)
+        assert out.mean() < raw.mean()
+
+    def test_calibrated_values_stay_in_range(self):
+        rng = np.random.default_rng(6)
+        y = pd.Series(rng.integers(0, 2, 300))
+        raw = rng.random(300)
+        cal = evaluation.fit_calibrator(raw, y, min_samples=50)
+        out = evaluation.apply_calibrator(cal, raw)
+        assert ((out >= 0.0) & (out <= 1.0)).all()
+
+    def test_is_monotonic(self):
+        """校正は順序を壊さない（AUCを変えない）"""
+        rng = np.random.default_rng(7)
+        y = pd.Series(rng.integers(0, 2, 300))
+        raw = rng.random(300)
+        cal = evaluation.fit_calibrator(raw, y, min_samples=50)
+        grid = np.linspace(0.0, 1.0, 50)
+        out = evaluation.apply_calibrator(cal, grid)
+        assert np.all(np.diff(out) >= -1e-12)
+
+
+class TestSelectThreshold:
+    def test_picks_threshold_that_excludes_losers(self):
+        """低い確率のイベントが損失なら、それを外す閾値を選ぶ"""
+        p = np.array([0.1, 0.2, 0.8, 0.9])
+        ret = np.array([-0.05, -0.04, 0.03, 0.06])
+        t = evaluation.select_threshold(p, ret)
+        selected = p >= t
+        assert selected.tolist() == [False, False, True, True]
+
+    def test_takes_everything_when_all_profitable(self):
+        p = np.array([0.1, 0.5, 0.9])
+        ret = np.array([0.01, 0.02, 0.03])
+        t = evaluation.select_threshold(p, ret)
+        assert (p >= t).all()
+
+    def test_boundary_is_not_always_half(self):
+        """利益と損失が非対称なら境界は0.5にならない（spec §8）"""
+        p = np.array([0.3, 0.45, 0.55, 0.7])
+        # 0.45 の取引まで採った方が総和が大きい非対称な収益
+        ret = np.array([-0.01, 0.05, 0.01, 0.02])
+        t = evaluation.select_threshold(p, ret)
+        assert t != pytest.approx(0.5)
+        assert (p >= t).sum() == 3
+
+    def test_returns_a_value_even_when_nothing_is_profitable(self):
+        p = np.array([0.1, 0.5, 0.9])
+        ret = np.array([-0.01, -0.02, -0.03])
+        t = evaluation.select_threshold(p, ret)
+        assert 0.0 <= t <= 1.0
+
+    def test_empty_input_returns_half(self):
+        assert evaluation.select_threshold(np.array([]), np.array([])) == pytest.approx(0.5)
+
+
+class TestFitInner:
+    def test_uses_only_inner_folds(self):
+        """外側の検証期間を書き換えても、内側で決めた校正と閾値は変わらない"""
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+
+        cal_a, thr_a = evaluation.fit_inner(
+            events, fold, evaluation.LogisticRegressionModel, feature_cols=FEATURES)
+
+        tampered = events.copy()
+        in_val = tampered["decision_at"] >= fold.val_start
+        tampered.loc[in_val, "label"] = 1
+        tampered.loc[in_val, "net_return"] = 5.0
+        tampered.loc[in_val, "x1"] = -99.0
+        cal_b, thr_b = evaluation.fit_inner(
+            tampered, fold, evaluation.LogisticRegressionModel, feature_cols=FEATURES)
+
+        assert thr_a == pytest.approx(thr_b)
+        assert cal_a.kind == cal_b.kind
+
+    def test_returns_usable_threshold(self):
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        _, thr = evaluation.fit_inner(
+            events, fold, evaluation.ConstantProbability, feature_cols=FEATURES)
+        assert 0.0 <= thr <= 1.0

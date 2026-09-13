@@ -14,19 +14,23 @@
 """
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Optional
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from loguru import logger
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score, brier_score_loss, log_loss, roc_auc_score,
 )
 
 from src.core import clock
+from src.strategy import validation
 from src.strategy.dataset import STATUS_RESOLVED
+from src.strategy.indicators import FEATURE_COLS
 from src.strategy.validation import Preprocessor, apply_preprocessor, fit_preprocessor
 
 PURPOSE_VALIDATION = "validation"
@@ -384,3 +388,99 @@ def compute_metrics(y_true, p, *, baseline_rate: float) -> dict:
         "brier_vs_constant": brier_const - brier,
         "log_loss_vs_constant": ll_const - ll,
     }
+
+
+@dataclass(frozen=True)
+class Calibrator:
+    """確率校正。**内側foldの予測から作る。** 外側foldの値は使わない。"""
+    kind: str                 # "identity" / "isotonic"
+    model: Optional[object]
+
+
+def fit_calibrator(raw_p: np.ndarray, y: pd.Series, *,
+                   min_samples: int = 50) -> Calibrator:
+    """等調回帰で確率を校正する。データが足りない／片側クラスなら恒等にする。
+
+    校正は順序を変えないため AUC は動かない。動くのは Brier と log loss。
+    """
+    y_arr = np.asarray(pd.Series(y).astype(float))
+    if len(y_arr) < min_samples or len(np.unique(y_arr)) < 2:
+        return Calibrator(kind="identity", model=None)
+    iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+    iso.fit(np.asarray(raw_p, dtype=float), y_arr)
+    return Calibrator(kind="isotonic", model=iso)
+
+
+def apply_calibrator(cal: Calibrator, raw_p: np.ndarray) -> np.ndarray:
+    if cal.kind == "identity" or cal.model is None:
+        return np.asarray(raw_p, dtype=float)
+    return np.clip(cal.model.predict(np.asarray(raw_p, dtype=float)), 0.0, 1.0)
+
+
+def select_threshold(p: np.ndarray, net_return: np.ndarray, *,
+                     candidates: Optional[np.ndarray] = None) -> float:
+    """コスト控除後の総収益を最大にする採用閾値を返す。
+
+    期待値は `p × 平均利益 − (1−p) × 平均損失` で扱う。**コストは net_return に
+    織り込み済みなので、ここで再度引かない**（spec §8）。利益側と損失側が
+    非対称なら、採用確率の境界は 0.5 にならない。
+
+    どの閾値でも総収益が正にならない場合も最良の点を返す。「そもそも取引するか」
+    の判断は呼び出し側が行う。
+    """
+    prob = np.asarray(p, dtype=float)
+    ret = np.asarray(net_return, dtype=float)
+    if len(prob) == 0:
+        return 0.5
+    grid = np.unique(prob) if candidates is None else np.asarray(candidates, dtype=float)
+
+    best_t, best_total = float(grid[0]), -np.inf
+    for t in grid:
+        total = float(ret[prob >= t].sum())
+        if total > best_total:
+            best_total, best_t = total, float(t)
+    return best_t
+
+
+def fit_inner(events: pd.DataFrame, fold, make_model, *,
+              window_sessions: Optional[int] = None,
+              feature_cols: Optional[list] = None,
+              inner_splits: int = 3) -> tuple:
+    """内側foldの予測から校正と閾値を決める。
+
+    **外側foldの値は一切使わない。** 外側の学習側をさらに分割し、その
+    内側検証で得た予測だけを材料にする（spec §7）。
+    戻り値: (Calibrator, 採用閾値)
+    """
+    outer = validation.training_inputs(
+        events, fold, window_sessions=window_sessions, feature_cols=feature_cols)
+    outer_train = outer.events
+    if len(outer_train) == 0:
+        return Calibrator(kind="identity", model=None), 0.5
+
+    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    raw_parts, y_parts, ret_parts = [], [], []
+    for inner in validation.inner_folds(outer_train, n_splits=inner_splits):
+        inner_inputs = validation.training_inputs(
+            outer_train, inner, window_sessions=window_sessions, feature_cols=feature_cols)
+        _, inner_val = validation.split_events(outer_train, inner)
+        if len(inner_inputs.events) == 0 or len(inner_val) == 0:
+            continue
+        model = make_model()
+        model.fit(inner_inputs.events[cols].astype("float64"),
+                  inner_inputs.events["label"].astype(int),
+                  inner_inputs.weights)
+        raw_parts.append(model.predict_proba(inner_val[cols].astype("float64")))
+        y_parts.append(inner_val["label"].astype(int))
+        ret_parts.append(inner_val["net_return"].astype(float).values)
+
+    if not raw_parts:
+        return Calibrator(kind="identity", model=None), 0.5
+
+    raw = np.concatenate(raw_parts)
+    y = pd.concat(y_parts, ignore_index=True)
+    ret = np.concatenate(ret_parts)
+
+    cal = fit_calibrator(raw, y)
+    threshold = select_threshold(apply_calibrator(cal, raw), ret)
+    return cal, threshold
