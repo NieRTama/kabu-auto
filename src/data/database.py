@@ -109,6 +109,11 @@ class Prediction(Base):
     calibrated_probability = Column(Float)
     fold_index = Column(Integer)      # 出所fold。shadow等は -1
     purpose = Column(String(16))      # "validation" / "shadow"
+    # 学習側正例率と採用閾値。無いと保存済み明細だけからは
+    # brier_vs_constant/log_loss_vs_constant やそのrun自身の売買判断を
+    # 復元できない（外部レビューI-3）。新規列なので nullable のまま
+    train_positive_rate = Column(Float)
+    threshold = Column(Float)
 
     __table_args__ = (
         Index("ix_predictions_run_model", "evaluation_run_id", "model_id"),

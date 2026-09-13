@@ -46,10 +46,21 @@ def save_predictions(predictions: pd.DataFrame, evaluation_run_id: str,
     calibrated_probability / fold_index の列を持つこと。
     実績ラベルはここでは書かない。
 
+    `train_positive_rate` / `threshold` 列は任意（外部レビューI-3）。
+    無い呼び出し元との後方互換のため、無ければ既定値で埋めずに
+    NULLのまま保存する。
+
     `label_contract_id` を必須にするのは、後で実績と結合するときの
     キーがこの組だからである（外部レビューR07）。欠けたまま保存すると
     結合先が定まらないので、既定値で埋めずに例外にする。
+
+    同じ `(evaluation_run_id, model_id)` の既存明細を保存前に削除してから
+    挿入する（run単位の置換）。`EvaluationRun` / `PredictionOutcome` は
+    同じIDでの再実行を上書きとして扱うのに、ここだけ素の追記だと
+    同一runを2回実行しただけで明細が静かに二重化する（外部レビューI-2）。
     """
+    from sqlalchemy import delete as sa_delete
+
     from src.data.database import Prediction, get_session
 
     if len(predictions) == 0:
@@ -59,7 +70,12 @@ def save_predictions(predictions: pd.DataFrame, evaluation_run_id: str,
             "predictions に label_contract_id 列がありません。"
             "実績との結合キーなので省略できません")
     now = clock.now()
+    has_train_rate = "train_positive_rate" in predictions.columns
+    has_threshold = "threshold" in predictions.columns
     with get_session() as session:
+        session.execute(sa_delete(Prediction).where(
+            Prediction.evaluation_run_id == evaluation_run_id,
+            Prediction.model_id == model_id))
         for _, r in predictions.iterrows():
             session.add(Prediction(
                 event_id=str(r["event_id"]),
@@ -71,6 +87,12 @@ def save_predictions(predictions: pd.DataFrame, evaluation_run_id: str,
                 calibrated_probability=float(r["calibrated_probability"]),
                 fold_index=int(r["fold_index"]),
                 purpose=purpose,
+                train_positive_rate=(
+                    float(r["train_positive_rate"])
+                    if has_train_rate and pd.notna(r["train_positive_rate"]) else None),
+                threshold=(
+                    float(r["threshold"])
+                    if has_threshold and pd.notna(r["threshold"]) else None),
             ))
         session.commit()
     return len(predictions)
@@ -124,6 +146,12 @@ def load_prediction_details(evaluation_run_id: str,
     """予測明細に実績を突き合わせて返す（実績が無い行は actual_label が NaN）。
 
     この明細から指標も売買判断も再計算できる（spec §14 段階C完了条件）。
+    `train_positive_rate`（学習側正例率）と `threshold`（採用閾値）を列に
+    含めるため、`brier_vs_constant` / `log_loss_vs_constant` だけでなく
+    **その run 自身が採用した売買判断**も、保存済みの明細だけから
+    復元できる（外部レビューI-3。以前はこの2値がどこにも永続化されておらず、
+    任意の閾値で引き直すことはできても「その run 自身の判断」は
+    再現できなかった）。
     """
     from src.data.database import Prediction, PredictionOutcome, get_session
     from sqlalchemy import select as sa_select
@@ -154,6 +182,8 @@ def load_prediction_details(evaluation_run_id: str,
             "calibrated_probability": p.calibrated_probability,
             "fold_index": p.fold_index,
             "purpose": p.purpose,
+            "train_positive_rate": p.train_positive_rate,
+            "threshold": p.threshold,
             "actual_label": o.actual_label if o else np.nan,
             "net_return": o.net_return if o else np.nan,
         })
@@ -232,6 +262,21 @@ class LogisticRegressionModel:
             return np.full(len(X), self._constant, dtype=float)
         Z = apply_preprocessor(self._pre, X, feature_cols=self._feature_cols)
         return self._model.predict_proba(Z)[:, 1]
+
+    # ─── 保存のための契約（段階Eの model_store が使う）─────────────────
+    # _LightGbmBase と全く同じ `self._constant` という状態を持つため、
+    # 単一クラス縮退の検知手段も同じ形で公開する（外部レビューI-5）。
+    # `booster` はLightGBM固有の概念なのでこちらには無い。
+
+    @property
+    def is_constant(self) -> bool:
+        """単一クラスしか見なかったため定数を返すモデルか。"""
+        return self._constant is not None
+
+    @property
+    def constant_probability(self) -> Optional[float]:
+        """定数モデルのときの確率。二値モデルなら None。"""
+        return self._constant
 
 
 class _LightGbmBase:
@@ -460,8 +505,17 @@ def fit_inner(events: pd.DataFrame, fold, make_model, *,
         return Calibrator(kind="identity", model=None), 0.5
 
     cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
+    try:
+        inner_fold_list = validation.inner_folds(outer_train, n_splits=inner_splits)
+    except ValueError:
+        # 内側に分割するだけのセッション数が無い。evaluate_fold が退化foldに
+        # 対して return None（skip）する規約を既に持っているのと同じ扱いで、
+        # ここでは例外を外へ漏らさず「校正なし・閾値0.5」の既存の退化パスへ
+        # 合流する（外側fold自体は続行させる。外部レビューI-1）。
+        return Calibrator(kind="identity", model=None), 0.5
+
     raw_parts, y_parts, ret_parts = [], [], []
-    for inner in validation.inner_folds(outer_train, n_splits=inner_splits):
+    for inner in inner_fold_list:
         inner_inputs = validation.training_inputs(
             outer_train, inner, window_sessions=window_sessions, feature_cols=feature_cols)
         _, inner_val = validation.split_events(outer_train, inner)
@@ -498,6 +552,8 @@ class FoldResult:
     threshold: float
     metrics: dict
     predictions: pd.DataFrame
+    calibrator_kind: str
+    model_is_constant: bool
 
 
 def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
@@ -539,6 +595,10 @@ def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
         "raw_probability": raw,
         "calibrated_probability": calibrated,
         "fold_index": fold.index,
+        # 保存済み明細だけからbrier_vs_constant等・その run自身の売買判断を
+        # 復元できるようにする（外部レビューI-3）
+        "train_positive_rate": train_rate,
+        "threshold": threshold,
     })
     metrics = compute_metrics(
         val["label"].astype(int), calibrated, baseline_rate=train_rate)
@@ -548,6 +608,10 @@ def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
         n_train=len(inputs.events), n_val=len(val),
         train_positive_rate=train_rate, threshold=threshold,
         metrics=metrics, predictions=predictions,
+        calibrator_kind=calibrator.kind,
+        # ConstantProbability/MajorityClass は元々定数を返す設計なので対象外。
+        # is_constant を公開しないモデルは getattr の既定値で False 扱いにする
+        model_is_constant=bool(getattr(model, "is_constant", False)),
     )
 
 
@@ -703,15 +767,47 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
     folds = validation.calendar_folds(events, n_splits=n_splits)
     results = []
     for model_id, make_model in factories.items():
+        model_predictions = []
         for fold in folds:
             res = evaluate_fold(
                 events, fold, model_id, make_model,
                 window_sessions=window_sessions, feature_cols=feature_cols)
             if res is None:
+                # (a) 退化fold（学習/検証データが空）はskipする。evaluate_fold
+                # 自身の規約（return None）に合わせ、理由をここで記録する
+                # （外部レビューI-4）。
+                degraded_reasons.append(
+                    f"fold {fold.index} model={model_id}: "
+                    "学習/検証データが空のためskip")
                 continue
+            if res.calibrator_kind == "identity":
+                # (b) 内側foldの校正がidentity（未校正）に落ちた。データ不足や
+                # 片側クラスなど、fit_calibrator / fit_inner の退化パスに
+                # 合流した結果である（外部レビューI-4）。
+                degraded_reasons.append(
+                    f"fold {res.fold_index} model={model_id}: "
+                    "内側foldの校正がidentity(未校正)に縮退")
+            if res.model_is_constant:
+                # (c) 学習側が単一クラスでモデルが定数に縮退した
+                # （外部レビューI-4・I-5）。
+                degraded_reasons.append(
+                    f"fold {res.fold_index} model={model_id}: モデルが定数に縮退")
+            if res.metrics.get("roc_auc") is None:
+                # (d) 検証側が片側クラスで roc_auc が未定義になった
+                # （外部レビューI-4）。
+                degraded_reasons.append(
+                    f"fold {res.fold_index} model={model_id}: "
+                    "roc_aucが未定義(検証側が片側クラス)")
             results.append(res)
             if persist:
-                save_predictions(res.predictions, evaluation_run_id, model_id)
+                model_predictions.append(res.predictions)
+        if persist and model_predictions:
+            # モデル単位で一括保存する。fold単位で都度 save_predictions() を
+            # 呼ぶと、その関数の「同一 (run_id, model_id) は置換する」という
+            # 冪等化（外部レビューI-2）が直前foldの分まで消してしまう。
+            save_predictions(
+                pd.concat(model_predictions, ignore_index=True),
+                evaluation_run_id, model_id)
 
     if persist:
         save_outcomes(events)
@@ -743,19 +839,46 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
         "evaluation_run_id": evaluation_run_id,
         "fold_results": results,
         "summary": summary,
+        "degraded_reasons": degraded_reasons,
     }
 
 
-def recompute_metrics(details: pd.DataFrame, *, baseline_rate: float,
+def _single_column_value(df: pd.DataFrame, col: str) -> float:
+    """列の値がこの範囲内で単一値であることを確認してから返す。
+
+    `capture_run_config._one()` と同じ考え方（外部レビューI-3）。単一で
+    なければ、その範囲を跨いだ baseline を暗黙に選ぶことになり誤りうる
+    ため ValueError にする。
+    """
+    if col not in df.columns or len(df) == 0:
+        raise ValueError(
+            f"baseline_rate を省略するには、明細に{col}列が必要です")
+    values = set(df[col].dropna().tolist())
+    if len(values) != 1:
+        raise ValueError(
+            f"baseline_rate を省略するには{col}がこの範囲内で単一値である"
+            f"必要があります（fold等で絞り込んでください）: {sorted(values)}")
+    return float(values.pop())
+
+
+def recompute_metrics(details: pd.DataFrame, *, baseline_rate: Optional[float] = None,
                       model_id: Optional[str] = None) -> dict:
     """保存した予測明細だけから指標を計算し直す。
 
     実績が未確定の行（shadow等）は除外する。集計済みの数値しか無い状態では
     「その数字が何を意味するか」を後から検証できないため、明細から同じ指標を
     再現できることを保証する（spec §14 段階C完了条件）。
+
+    `baseline_rate` を省略すると、`details` の `train_positive_rate` 列
+    （外部レビューI-3で永続化）から導出する。その列がこの呼び出しの対象
+    範囲内（`model_id` で絞り込んだ後）で単一値であることを要求し、
+    単一でなければ ValueError にする（複数foldをまたいだ明細をそのまま
+    渡すと、どのfoldのbaselineを使うべきか一意に決まらないため）。
     """
     sub = details if model_id is None else details[details["model_id"] == model_id]
     sub = sub[sub["actual_label"].notna()]
+    if baseline_rate is None:
+        baseline_rate = _single_column_value(sub, "train_positive_rate")
     return compute_metrics(
         sub["actual_label"].astype(int),
         sub["calibrated_probability"].astype(float).values,

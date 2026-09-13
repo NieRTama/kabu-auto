@@ -143,6 +143,39 @@ class TestPredictionTables:
         assert len(evaluation.load_prediction_details("run1")) == 2
         assert len(evaluation.load_prediction_details("run1", model_id="lgbm")) == 1
 
+    def test_train_positive_rate_and_threshold_are_persisted(self, isolated_db):
+        """baseline_rate/threshold の永続化（外部レビューI-3）。保存済み明細
+        だけから brier_vs_constant やその run自身の売買判断を復元できるように、
+        列として保存・読み出しできること。"""
+        preds = pd.DataFrame({
+            "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
+            "raw_probability": [0.6],
+            "calibrated_probability": [0.55],
+            "fold_index": [0],
+            "train_positive_rate": [0.42],
+            "threshold": [0.51],
+        })
+        evaluation.save_predictions(preds, "run1", "const")
+        details = evaluation.load_prediction_details("run1")
+        assert details["train_positive_rate"].iloc[0] == pytest.approx(0.42)
+        assert details["threshold"].iloc[0] == pytest.approx(0.51)
+
+    def test_missing_baseline_columns_save_as_none(self, isolated_db):
+        """train_positive_rate/threshold列が無い呼び出し元との後方互換。
+        既定値で埋めず None のまま保存する。"""
+        preds = pd.DataFrame({
+            "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
+            "raw_probability": [0.6],
+            "calibrated_probability": [0.55],
+            "fold_index": [0],
+        })
+        evaluation.save_predictions(preds, "run1", "const")
+        details = evaluation.load_prediction_details("run1")
+        assert pd.isna(details["train_positive_rate"].iloc[0])
+        assert pd.isna(details["threshold"].iloc[0])
+
     def test_save_predictions_rejects_missing_label_contract_id(self, isolated_db):
         """結合キーが欠けた予測は保存できない"""
         preds = pd.DataFrame({
@@ -153,6 +186,51 @@ class TestPredictionTables:
         })
         with pytest.raises(ValueError, match="label_contract_id"):
             evaluation.save_predictions(preds, "run1", "const")
+
+    def test_save_predictions_is_idempotent_for_the_same_run_and_model(
+            self, isolated_db):
+        """同じ evaluation_run_id・model_id で2回呼んでも明細が二重化しない
+        （外部レビューI-2。EvaluationRun/PredictionOutcomeはupsertなのに
+        Predictionだけ素のinsertだったため再実行のたびに明細が倍化していた）
+        """
+        preds = pd.DataFrame({
+            "event_id": ["7203:20260105", "9984:20260105"],
+            "label_contract_id": [_LC, _LC],
+            "raw_probability": [0.6, 0.3],
+            "calibrated_probability": [0.55, 0.35],
+            "fold_index": [0, 0],
+        })
+        n1 = evaluation.save_predictions(preds, "run1", "const")
+        n2 = evaluation.save_predictions(preds, "run1", "const")
+        assert n1 == 2
+        assert n2 == 2
+
+        with get_session() as session:
+            rows = list(session.scalars(select(db.Prediction)).all())
+        assert len(rows) == 2
+
+    def test_save_predictions_idempotency_is_scoped_to_run_and_model(
+            self, isolated_db):
+        """置換はrun×model単位。他のrunや他のmodelの明細は消えない"""
+        preds = pd.DataFrame({
+            "event_id": ["7203:20260105"],
+            "label_contract_id": [_LC],
+            "raw_probability": [0.6],
+            "calibrated_probability": [0.55],
+            "fold_index": [0],
+        })
+        evaluation.save_predictions(preds, "run1", "const")
+        evaluation.save_predictions(preds, "run1", "lgbm")
+        evaluation.save_predictions(preds, "run2", "const")
+
+        evaluation.save_predictions(preds, "run1", "const")
+
+        with get_session() as session:
+            rows = list(session.scalars(select(db.Prediction)).all())
+        assert len(rows) == 3
+        assert {(r.evaluation_run_id, r.model_id) for r in rows} == {
+            ("run1", "const"), ("run1", "lgbm"), ("run2", "const"),
+        }
 
 
 class TestOutcomeIsolationBetweenLabelContracts:
@@ -329,6 +407,32 @@ class TestLogisticRegressionModel:
 
     def test_has_a_name(self):
         assert evaluation.LogisticRegressionModel().name == "logistic_regression"
+
+    def test_is_constant_properties_on_single_class(self):
+        """LightGBM系と同じ契約: 単一クラス学習後は is_constant/constant_probability
+        で縮退を検知できること（レビュー指摘I-5）"""
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([1, 1, 1])
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, np.ones(3))
+        assert m.is_constant is True
+        assert m.constant_probability == 1.0
+
+    def test_is_constant_properties_on_single_class_all_negative(self):
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([0, 0, 0])
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, np.ones(3))
+        assert m.is_constant is True
+        assert m.constant_probability == 0.0
+
+    def test_is_constant_properties_on_normal_binary_training(self):
+        events = _events(n_sessions=60)
+        X, y, w = _xy(events)
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, w)
+        assert m.is_constant is False
+        assert m.constant_probability is None
 
 
 class TestLightGbmModels:
@@ -674,6 +778,27 @@ class TestFitInner:
         assert len(captured_train_event_ids) > 0
         assert captured_train_event_ids.isdisjoint(outer_val_ids)
 
+    def test_falls_back_to_identity_when_inner_split_is_impossible(self):
+        """内側分割に足りるセッション数が無いとき、ValueErrorを外へ漏らさず
+        既存の退化パス（identity, 0.5）へ合流すること（レビュー指摘I-1）。
+
+        n_sessions=30, n_splits=5 は最終ブランチレビューで実際にクラッシュを
+        再現した規模（外側fold 0 の学習側が inner_folds に足りない）。
+        """
+        events = _events(n_sessions=30)
+        fold = validation.calendar_folds(events, n_splits=5)[0]
+
+        # 修正前は validation.inner_folds() が ValueError を送出していたことの確認
+        outer = validation.training_inputs(events, fold, feature_cols=FEATURES)
+        with pytest.raises(ValueError):
+            list(validation.inner_folds(outer.events, n_splits=3))
+
+        cal, thr = evaluation.fit_inner(
+            events, fold, evaluation.ConstantProbability, feature_cols=FEATURES)
+        assert cal.kind == "identity"
+        assert cal.model is None
+        assert thr == 0.5
+
 
 class TestEvaluateFold:
     def test_returns_predictions_for_every_validation_event(self):
@@ -694,9 +819,21 @@ class TestEvaluateFold:
         res = evaluation.evaluate_fold(
             events, fold, "const", evaluation.ConstantProbability,
             feature_cols=FEATURES)
-        for col in ("event_id", "raw_probability", "calibrated_probability", "fold_index"):
+        for col in ("event_id", "raw_probability", "calibrated_probability", "fold_index",
+                    "train_positive_rate", "threshold"):
             assert col in res.predictions.columns
         assert (res.predictions["fold_index"] == fold.index).all()
+
+    def test_prediction_columns_carry_baseline_rate_and_threshold(self):
+        """外部レビューI-3: predictionsのtrain_positive_rate/threshold列は
+        FoldResult自身の同名フィールドと一致し、明細から復元できること"""
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+        res = evaluation.evaluate_fold(
+            events, fold, "const", evaluation.ConstantProbability,
+            feature_cols=FEATURES)
+        assert (res.predictions["train_positive_rate"] == res.train_positive_rate).all()
+        assert (res.predictions["threshold"] == res.threshold).all()
 
     def test_baseline_rate_comes_from_training_side(self):
         """train_positive_rate は学習側（検証側ではない）の正例率であり、
@@ -970,10 +1107,120 @@ class TestRunEvaluation:
         assert {r.model_id for r in out["fold_results"]} == set(
             evaluation.default_model_factories())
 
+    def test_rerunning_the_same_run_id_does_not_duplicate_predictions(
+            self, isolated_db):
+        """同じ evaluation_run_id で run_evaluation() を2回呼んでも、複数fold
+        が同じモデルへ保存される経路全体で明細が二重化しないこと
+        （外部レビューI-2。fold単位でsave_predictions()を都度呼ぶと、
+        その冪等化が直前foldぶんまで消してしまう退行を防ぐ）。"""
+        events = _events(n_sessions=150)
+        run_id = "run-idempotent-full"
+        out1 = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, evaluation_run_id=run_id, persist=True)
+        first_count = len(evaluation.load_prediction_details(run_id))
+        assert first_count == sum(len(r.predictions) for r in out1["fold_results"])
+
+        evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, evaluation_run_id=run_id, persist=True)
+        second_count = len(evaluation.load_prediction_details(run_id))
+        assert second_count == first_count
+
+    def test_does_not_crash_on_small_data_that_cannot_split_inner_folds(
+            self, isolated_db):
+        """n_sessions=30, n_splits=5 は内側分割を作れない規模（最終ブランチ
+        レビューで実際にクラッシュを再現した規模）。例外を送出せず結果が
+        返ること（レビュー指摘I-1、回帰固定M-6）。"""
+        events = _events(n_sessions=30)
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=5, feature_cols=FEATURES, persist=True)
+        assert len(out["fold_results"]) > 0
+
+    def test_small_data_run_is_marked_degraded_with_reasons(self, isolated_db):
+        events = _events(n_sessions=30)
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=5, feature_cols=FEATURES, persist=True)
+        loaded = evaluation.load_evaluation_run(out["evaluation_run_id"])
+        assert loaded.degraded == 1
+        reasons = json.loads(loaded.degraded_reasons)
+        assert len(reasons) > 0
+
+
+class TestDegradedReasons:
+    """run_evaluation() が実際に degraded_reasons へ理由を積むことの検証
+    （レビュー指摘I-4）。宣言だけで結線されていない「死んだ経路」を
+    それぞれの発生源ごとに固定する。
+    """
+
+    def test_records_reason_when_a_fold_is_skipped(self, isolated_db, monkeypatch):
+        """(a) evaluate_fold が None を返した fold は理由付きで記録される"""
+        events = _events(n_sessions=150)
+        real_evaluate_fold = evaluation.evaluate_fold
+        calls = {"n": 0}
+
+        def flaky_evaluate_fold(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real_evaluate_fold(*args, **kwargs)
+
+        monkeypatch.setattr(evaluation, "evaluate_fold", flaky_evaluate_fold)
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        assert any("skip" in r for r in out["degraded_reasons"])
+
+    def test_records_reason_when_calibrator_falls_back_to_identity(
+            self, isolated_db, monkeypatch):
+        """(b) fit_inner が identity キャリブレータへ落ちたfoldは理由付きで記録される"""
+        events = _events(n_sessions=150)
+        monkeypatch.setattr(
+            evaluation, "fit_inner",
+            lambda *a, **kw: (evaluation.Calibrator(kind="identity", model=None), 0.5))
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        assert any("identity" in r or "校正" in r for r in out["degraded_reasons"])
+
+    def test_records_reason_when_model_degenerates_to_constant(self, isolated_db):
+        """(c) モデルが定数に縮退したfoldは理由付きで記録される"""
+        events = _events(n_sessions=60)
+        events["label"] = 1  # 全件同一クラスにして LogisticRegressionModel を縮退させる
+        events["net_return"] = 0.02
+        out = evaluation.run_evaluation(
+            events, model_factories={"logistic_regression": evaluation.LogisticRegressionModel},
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        assert any("定数" in r for r in out["degraded_reasons"])
+
+    def test_records_reason_when_roc_auc_is_undefined(self, isolated_db, monkeypatch):
+        """(d) 検証側が片側クラスで roc_auc=None になった fold は理由付きで記録される"""
+        events = _events(n_sessions=150)
+        real_compute_metrics = evaluation.compute_metrics
+
+        def one_sided_metrics(y_true, p, **kwargs):
+            import numpy as _np
+            forced = _np.zeros(len(y_true))
+            return real_compute_metrics(forced, p, **kwargs)
+
+        monkeypatch.setattr(evaluation, "compute_metrics", one_sided_metrics)
+        out = evaluation.run_evaluation(
+            events, model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=False)
+        assert any("roc_auc" in r for r in out["degraded_reasons"])
+
 
 class TestRecomputeFromDetails:
     def test_metrics_match_the_original_run(self, isolated_db):
-        """保存した明細だけから、実行時と同じ指標が出る（spec §14 完了条件）"""
+        """保存した明細**だけ**から、実行時と同じ指標が出る（spec §14 完了条件）。
+
+        baseline_rate は明示的に渡さず、保存済みの train_positive_rate 列
+        （外部レビューI-3で永続化）から導出する。以前はメモリ上の
+        FoldResult から `res.train_positive_rate` を借りていたため、
+        「保存データだけからは指標を再現できない」欠陥を隠していた。
+        """
         events = _events(n_sessions=150)
         out = evaluation.run_evaluation(
             events,
@@ -985,12 +1232,44 @@ class TestRecomputeFromDetails:
 
         for res in out["fold_results"]:
             sub = details[details["fold_index"] == res.fold_index]
-            again = evaluation.recompute_metrics(
-                sub, baseline_rate=res.train_positive_rate)
+            again = evaluation.recompute_metrics(sub)
             assert again["n"] == res.metrics["n"]
             assert again["brier"] == pytest.approx(res.metrics["brier"])
+            assert again["brier_vs_constant"] == pytest.approx(
+                res.metrics["brier_vs_constant"])
+            assert again["log_loss_vs_constant"] == pytest.approx(
+                res.metrics["log_loss_vs_constant"])
             if res.metrics["roc_auc"] is not None:
                 assert again["roc_auc"] == pytest.approx(res.metrics["roc_auc"])
+
+    def test_baseline_rate_can_still_be_overridden_explicitly(self, isolated_db):
+        """任意のbaselineで引き直したい場合のため、明示指定は従来どおり効く"""
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events,
+            model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+        details = evaluation.load_prediction_details(out["evaluation_run_id"])
+        sub = details[details["fold_index"] == out["fold_results"][0].fold_index]
+        explicit = evaluation.recompute_metrics(sub, baseline_rate=0.5)
+        auto = evaluation.recompute_metrics(sub)
+        # 明示指定した baseline=0.5 が実際に効いていること（自動導出値と違う前提）
+        assert sub["train_positive_rate"].iloc[0] != pytest.approx(0.5)
+        assert explicit["brier_vs_constant"] != pytest.approx(auto["brier_vs_constant"])
+
+    def test_raises_when_baseline_rate_is_ambiguous_without_explicit_value(
+            self, isolated_db):
+        """複数foldにまたがる明細でbaseline_rateを省略すると、train_positive_rate
+        が単一値ではないため ValueError（外部レビューI-3）"""
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events,
+            model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+        details = evaluation.load_prediction_details(out["evaluation_run_id"])
+        assert details["train_positive_rate"].nunique() > 1
+        with pytest.raises(ValueError, match="train_positive_rate"):
+            evaluation.recompute_metrics(details)
 
     def test_trading_decisions_can_be_recomputed(self, isolated_db):
         """明細から採用群も引き直せる（閾値を変えた検討ができる）"""
@@ -1002,6 +1281,23 @@ class TestRecomputeFromDetails:
         details = evaluation.load_prediction_details(out["evaluation_run_id"])
         taken = details[details["calibrated_probability"] >= 0.0]
         assert taken["net_return"].notna().all()
+
+    def test_the_runs_own_trading_decision_can_be_recovered(self, isolated_db):
+        """外部レビューI-3: 保存済みの threshold 列を使えば、その run自身が
+        採用した閾値（任意の閾値ではなく）で売買判断を再現できる"""
+        events = _events(n_sessions=150)
+        out = evaluation.run_evaluation(
+            events,
+            model_factories={"constant_probability": evaluation.ConstantProbability},
+            n_splits=3, feature_cols=FEATURES, persist=True)
+        details = evaluation.load_prediction_details(out["evaluation_run_id"])
+        for res in out["fold_results"]:
+            sub = details[details["fold_index"] == res.fold_index]
+            assert sub["threshold"].iloc[0] == pytest.approx(res.threshold)
+            taken = sub[sub["calibrated_probability"] >= sub["threshold"]]
+            expected_taken = res.predictions[
+                res.predictions["calibrated_probability"] >= res.threshold]
+            assert len(taken) == len(expected_taken)
 
     def test_skips_rows_without_outcomes(self, isolated_db):
         preds = pd.DataFrame({
