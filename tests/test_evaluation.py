@@ -314,5 +314,13 @@ class TestLogisticRegressionModel:
         m.fit(X, y, np.ones(3))
         assert np.allclose(m.predict_proba(X), 1.0)
 
+    def test_falls_back_to_constant_on_single_class_all_negative(self):
+        """学習側が負例だけなら定数0.0を返す（例外にしない）"""
+        X = pd.DataFrame({"x1": [0.0, 1.0, 2.0], "x2": [1.0, 0.0, 1.0]})
+        y = pd.Series([0, 0, 0])
+        m = evaluation.LogisticRegressionModel()
+        m.fit(X, y, np.ones(3))
+        assert np.allclose(m.predict_proba(X), 0.0)
+
     def test_has_a_name(self):
         assert evaluation.LogisticRegressionModel().name == "logistic_regression"
