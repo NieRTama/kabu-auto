@@ -3,6 +3,9 @@
 同じ入力・同じ分割で5つのモデルを比較し、予測明細を残して後から
 指標も売買判断も再計算できるようにする（spec §7・§14）。
 """
+import json
+import subprocess
+import unittest.mock as mock
 from datetime import date, timedelta
 
 import lightgbm as lgb
@@ -696,14 +699,22 @@ class TestEvaluateFold:
         assert (res.predictions["fold_index"] == fold.index).all()
 
     def test_baseline_rate_comes_from_training_side(self):
+        """train_positive_rate は学習側（検証側ではない）の正例率であり、
+        ConstantProbability.fit() と同じ**一意性重み付き**平均のはず
+        （単純平均ではない。レビュー指摘: train_positive_rateが重み無視の
+        単純平均になっていた）。
+        """
         events = _events(n_sessions=120)
         fold = validation.calendar_folds(events, n_splits=5)[3]
         inputs = validation.training_inputs(events, fold, feature_cols=FEATURES)
         res = evaluation.evaluate_fold(
             events, fold, "const", evaluation.ConstantProbability,
             feature_cols=FEATURES)
-        assert res.train_positive_rate == pytest.approx(
-            inputs.events["label"].astype(int).mean())
+        y = inputs.events["label"].astype(int).astype(float)
+        expected = float(np.average(y, weights=inputs.weights))
+        assert res.train_positive_rate == pytest.approx(expected)
+        # 単純平均とは異なることも確認する（一意性重みが非自明なため）
+        assert res.train_positive_rate != pytest.approx(float(y.mean()))
 
     def test_outer_validation_values_do_not_change_training(self):
         """外側の検証側を書き換えても学習件数と学習側正例率は変わらない"""
@@ -729,6 +740,167 @@ class TestEvaluateFold:
         assert evaluation.evaluate_fold(
             events, empty_fold, "const", evaluation.ConstantProbability,
             feature_cols=FEATURES) is None
+
+    def test_train_positive_rate_is_weighted_like_constant_probability(self):
+        """ConstantProbability を自己評価すると vs定数指標は厳密に0になるはず。
+
+        `baseline_rate`（学習側正例率＝train_positive_rate）と、
+        ConstantProbability.fit() がモデル自身の確率として学習する値は、
+        同じ学習データ・同じ重みに対して同じ計算式で作られているべきである。
+        単純平均のままだと ConstantProbability.fit() の一意性重み付き平均と
+        ずれ、vs定数指標が0からずれる（レビュー実測 -0.00126）。
+
+        内側foldの等調回帰キャリブレータは（複数の内側foldそれぞれで
+        学習側正例率が異なりうるため）ConstantProbabilityであっても
+        outer側の生確率を動かしうる。それ自体は別の効果なので、ここでは
+        fit_inner() をidentityキャリブレータに固定して、train_positive_rate
+        の重み計算だけを切り出して検証する。
+        """
+        events = _events(n_sessions=120)
+        fold = validation.calendar_folds(events, n_splits=5)[3]
+
+        # 一意性重みが非自明（全て1.0ではない）ことを事前確認する
+        inputs = validation.training_inputs(events, fold, feature_cols=FEATURES)
+        assert len(set(np.round(inputs.weights, 6).tolist())) > 1
+
+        with mock.patch("src.strategy.evaluation.fit_inner",
+                        return_value=(evaluation.Calibrator(kind="identity", model=None), 0.5)):
+            res = evaluation.evaluate_fold(
+                events, fold, "const", evaluation.ConstantProbability,
+                feature_cols=FEATURES)
+
+        assert res is not None
+        assert abs(res.metrics["brier_vs_constant"]) < 1e-9
+        assert abs(res.metrics["log_loss_vs_constant"]) < 1e-9
+
+        # train_positive_rate 自体も ConstantProbability.fit() と同じ値のはず
+        model = evaluation.ConstantProbability()
+        model.fit(inputs.events[FEATURES].astype("float64"),
+                  inputs.events["label"].astype(int), inputs.weights)
+        assert res.train_positive_rate == pytest.approx(model._p)
+
+
+class TestCaptureRunConfig:
+    """RunConfig / capture_run_config() のテスト（レビュー指摘2）。
+
+    段階Eの check_promotable() が昇格可否の根拠にする値なので、内容の
+    捕捉・決定性・変化検知を検証する。
+    """
+
+    def test_captures_config_sections_and_code_version(self):
+        events = _events(n_sessions=10)
+        run_config = evaluation.capture_run_config(
+            events, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+
+        payload = json.loads(run_config.config_json)
+        assert payload["strategy"] == cfg.get_section("strategy")
+        assert payload["trading"] == cfg.get_section("trading")
+        assert payload["backtest"] == cfg.get_section("backtest")
+        # このworktreeはgit管理下にあるので短縮SHAが取れるはず
+        assert run_config.code_version is not None
+        assert len(run_config.code_version) > 0
+
+    def test_same_events_and_params_produce_a_deterministic_hash(self):
+        events = _events(n_sessions=10)
+        a = evaluation.capture_run_config(
+            events, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+        b = evaluation.capture_run_config(
+            events.copy(), n_splits=3, window_sessions=None, feature_cols=FEATURES)
+        assert a.config_hash == b.config_hash
+
+    def test_changing_events_changes_the_hash(self):
+        """events の行数（n_events）が変われば config_hash も変わる"""
+        fewer = _events(n_sessions=10)
+        more = _events(n_sessions=20)
+        a = evaluation.capture_run_config(
+            fewer, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+        b = evaluation.capture_run_config(
+            more, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+        assert a.config_hash != b.config_hash
+
+    def test_code_version_returns_none_when_git_is_unavailable(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise FileNotFoundError("git not found")
+        monkeypatch.setattr(subprocess, "run", boom)
+        assert evaluation._code_version() is None
+
+
+class TestSaveAndLoadEvaluationRun:
+    """save_evaluation_run() / load_evaluation_run() のテスト（レビュー指摘2）。"""
+
+    def test_round_trip_preserves_key_fields(self, isolated_db):
+        events = _events(n_sessions=10)
+        run_config = evaluation.capture_run_config(
+            events, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+
+        evaluation.save_evaluation_run(
+            "run-roundtrip-1", run_config,
+            purpose=evaluation.PURPOSE_VALIDATION, model_id="constant_probability",
+            n_folds=3, n_predictions=42, degraded_reasons=[])
+
+        loaded = evaluation.load_evaluation_run("run-roundtrip-1")
+        assert loaded is not None
+        assert loaded.purpose == evaluation.PURPOSE_VALIDATION
+        assert loaded.model_id == "constant_probability"
+        assert loaded.dataset_id == run_config.dataset_id
+        assert loaded.config_hash == run_config.config_hash
+        assert loaded.n_folds == 3
+        assert loaded.n_predictions == 42
+        assert loaded.degraded == 0
+
+    def test_degraded_reasons_set_the_degraded_flag(self, isolated_db):
+        events = _events(n_sessions=10)
+        run_config = evaluation.capture_run_config(
+            events, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+        evaluation.save_evaluation_run(
+            "run-degraded-1", run_config,
+            purpose=evaluation.PURPOSE_VALIDATION, model_id="const",
+            n_folds=3, n_predictions=1, degraded_reasons=["insufficient_data"])
+        loaded = evaluation.load_evaluation_run("run-degraded-1")
+        assert loaded.degraded == 1
+
+    def test_same_id_overwrites_instead_of_inserting_a_new_row(self, isolated_db):
+        """同じ evaluation_run_id で2回保存すると、新規行が増えず上書きされる"""
+        events = _events(n_sessions=10)
+        run_config = evaluation.capture_run_config(
+            events, n_splits=3, window_sessions=None, feature_cols=FEATURES)
+
+        evaluation.save_evaluation_run(
+            "run-dup-1", run_config,
+            purpose=evaluation.PURPOSE_VALIDATION, model_id="a",
+            n_folds=3, n_predictions=10, degraded_reasons=[])
+        evaluation.save_evaluation_run(
+            "run-dup-1", run_config,
+            purpose=evaluation.PURPOSE_SHADOW, model_id="b",
+            n_folds=5, n_predictions=99, degraded_reasons=["x"])
+
+        with get_session() as session:
+            rows = list(session.scalars(
+                select(db.EvaluationRun).where(
+                    db.EvaluationRun.evaluation_run_id == "run-dup-1")).all())
+        assert len(rows) == 1
+
+        loaded = evaluation.load_evaluation_run("run-dup-1")
+        assert loaded.purpose == evaluation.PURPOSE_SHADOW
+        assert loaded.model_id == "b"
+        assert loaded.n_folds == 5
+        assert loaded.n_predictions == 99
+        assert loaded.degraded == 1
+
+    def test_load_returns_none_when_not_found(self, isolated_db):
+        assert evaluation.load_evaluation_run("does-not-exist") is None
+
+
+class TestEvaluationRunIdGeneration:
+    """evaluation_run_id の既定生成のテスト（レビュー指摘3）。
+
+    段階B2の Dataset.collection_id と同じ「秒精度タイムスタンプだけ」の
+    バグを踏まないことを、タイトループで（sleepでごまかさずに）確認する。
+    """
+
+    def test_tight_loop_generates_all_unique_ids(self):
+        ids = [evaluation._new_evaluation_run_id() for _ in range(500)]
+        assert len(set(ids)) == len(ids)
 
 
 class TestRunEvaluation:

@@ -14,6 +14,7 @@
 """
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -525,7 +526,11 @@ def evaluate_fold(events: pd.DataFrame, fold, model_id: str, make_model, *,
 
     raw = model.predict_proba(val[cols].astype("float64"))
     calibrated = apply_calibrator(calibrator, raw)
-    train_rate = float(y_train.mean())
+    # ConstantProbability.fit() と同じ重み付き平均に揃える。単純平均のままだと
+    # 一意性重み（inputs.weights）を無視した値になり、ConstantProbability
+    # 自身を評価しても vs定数指標が厳密に0にならない（レビュー指摘）。
+    train_rate = float(np.average(y_train.astype(float), weights=inputs.weights)) \
+        if len(y_train) and np.sum(inputs.weights) > 0 else 0.5
 
     predictions = pd.DataFrame({
         "event_id": val["event_id"].values,
@@ -663,6 +668,17 @@ def load_evaluation_run(evaluation_run_id: str):
         return row
 
 
+def _new_evaluation_run_id() -> str:
+    """既定の evaluation_run_id を生成する。
+
+    秒精度のタイムスタンプだけでは、同一秒内の連続呼び出しで衝突しうる
+    （Windowsの時計分解能は約15.6ms）。段階B2の Dataset.collection_id と
+    全く同じ種類のバグで、そのときは100%再現した実績がある。
+    uuid4 の先頭8桁を付与して構造的に一意性を確保する。
+    """
+    return f"{clock.now():%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
+
+
 def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = None,
                    n_splits: int = 5, window_sessions: Optional[int] = None,
                    feature_cols: Optional[list] = None,
@@ -675,7 +691,7 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
     """
     factories = model_factories or default_model_factories()
     if evaluation_run_id is None:
-        evaluation_run_id = f"{clock.now():%Y%m%dT%H%M%S}"
+        evaluation_run_id = _new_evaluation_run_id()
 
     # 実行条件は**開始時に固定する**。終了後に読み直すと、実行中に設定が
     # 変わっていた場合に「実際に使った設定」とずれる。
