@@ -197,6 +197,16 @@ def advance_session(pf: Portfolio, prices: dict) -> Portfolio:
     規約を持つため、ピークの反映はその日の判定が終わった後に行う
     （src/strategy/policy.py の step() と同じ順序）。
     価格が取れない銘柄のピークは動かさない。
+
+    **`policy.step()` とは別の状態を進めている点に注意（最終ブランチレビュー、
+    段階D前半）。** `policy.HoldingState`（退出判定専用）と `Holding`（本関数、
+    会計記録用）は同じ`peak_price`/`sessions_held`という名前を持つが別オブジェクト
+    であり、どちらも「その日1回だけ」進める責務を持つ。日次ループ（段階D後半）は
+    **両方を、同じ営業日の同じ価格根拠（`policy.step()`はObservation.high、
+    本関数は`prices`辞書＝通常は終値）で、それぞれちょうど1回ずつ**呼ぶこと。
+    一方だけを「もう一方の代わり」として省略したり、逆に同じ日に本関数を
+    2回呼んだりすると、`sessions_held`が実際の保有日数とずれ、満了退出
+    （`max_holding_sessions`）が意図より早く／遅く発火する。
     """
     holdings = {}
     for symbol, h in pf.holdings.items():
@@ -333,6 +343,21 @@ def allocate(pf: Portfolio, candidates: list, conf: SizingConfig,
 
     引数のポートフォリオは変更しない（割り当ての試算用に複製して進める）。
     採用されなかった候補には必ず理由を付けて返す。
+
+    **本関数のスコープ外（最終ブランチレビュー、段階D前半）:**
+    - **出来高制約を見ない。** ここで決めた`PlannedOrder.quantity`は
+      「資金・上限だけを根拠にした希望数量」であり、実際の約定数量ではない。
+      日次ループ（段階D後半）は、この`quantity`を`entry_fill_limited()`へ
+      渡した後の`FillResult.filled_quantity`（出来高制約で縮むことがある）を
+      `Portfolio`へ反映すること。`PlannedOrder.quantity`をそのまま
+      `apply_buy()`に渡してはいけない。
+    - **`Portfolio.reserved`を更新しない。** 発注はしたがまだ約定していない
+      買いの引当（`reserved`）を積む・戻すAPIは本計画には無い。日次ループが
+      発注〜約定〜反映のタイミングをまたいで`reserved`を扱う場合は、
+      別途その責務を実装すること。
+    - **売り（退出）による現金の増加を考慮しない。** 同じ営業日に退出も
+      起きる場合、退出で得られる現金は本関数の呼び出し前に`Portfolio`へ
+      反映済みである必要がある（呼び出し側の責務）。
     """
     working = pf
     orders: list = []
