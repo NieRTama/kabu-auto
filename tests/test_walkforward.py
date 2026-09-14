@@ -380,13 +380,23 @@ class TestSectorConcentrationRefillAtFillTime:
     と、約定日の時価では上限を超えることがある。この経路は候補自身の価格が
     動かないため calc_quantity() 側の自己縮小が働かず、最終ブランチレビューが
     「実際に突破するのは難しい」と評した自己相殺（数量↓×価格↑≒一定）が起きない。
+
+    新規Important A: 買い約定は寄りで起きるため、この引き直しは**約定日の寄り値**
+    を使わねばならない。約定日の引け値（＝9:00には分からない未来の情報）を使うと
+    look-aheadになる。以下のテストは寄りと引けを意図的に別の値にして、判定が
+    寄り値ベースで行われていること（引け値ベースなら別の結果になるはずのケースで、
+    実際に寄り値ベースの結果になること）を検証する。
     """
 
-    def _market(self):
-        # A: 既存保有。1/7（3営業日目）に100→200へジャンプ（同一セクターの評価額を膨らませる）
+    def _market(self, jump_open: float, jump_close: float):
+        # A: 既存保有。1/7（3営業日目）に寄り・引けを独立にジャンプさせる
+        # （同一セクターの評価額を膨らませる）。
         bars_a = _bars(6, price=100.0)
         idx = bars_a.index[2]
-        bars_a.loc[idx, ["open", "high", "low", "close"]] = [200.0, 200.0, 200.0, 200.0]
+        day_high = max(jump_open, jump_close)
+        day_low = min(jump_open, jump_close)
+        bars_a.loc[idx, ["open", "high", "low", "close"]] = [
+            jump_open, day_high, day_low, jump_close]
         # B: 新規候補。価格は終始横ばい（B自身の数量はcalc_quantity側で自己縮小しない）
         bars_b = _bars(6, price=100.0)
         return wf.MarketData(bars={"A": bars_a, "B": bars_b}, sectors={"A": "S", "B": "S"})
@@ -406,8 +416,13 @@ class TestSectorConcentrationRefillAtFillTime:
             return []
         return decide
 
-    def test_shrinks_the_order_when_existing_holding_reprices_into_breach(self):
-        md = self._market()
+    def test_shrinks_the_order_when_the_open_gaps_into_breach_even_if_the_close_fades_back(self):
+        """寄りでジャンプ・引けは元通り（＝9:00時点で本来ブロックすべきケース）。
+
+        引け値を見る実装だと、このケースは超過を見逃してBを全量約定させて
+        しまう（元レビュー再検証のL1相当）。
+        """
+        md = self._market(jump_open=200.0, jump_close=100.0)
         res = wf.run_walkforward(
             md, date(2026, 1, 5), date(2026, 1, 10),
             initial_capital=1_000_000.0, decide=self._decide_a_then_b(),
@@ -415,7 +430,7 @@ class TestSectorConcentrationRefillAtFillTime:
             sizing=_sizing(ratio=0.3, sector_ratio=0.55),
             liquidity=execution.LiquidityConfig())
 
-        fill_day = date(2026, 1, 7)   # Aがジャンプし、Bが約定する日
+        fill_day = date(2026, 1, 7)   # Aの寄りがジャンプし、Bが約定する日
         reasons = " ".join(
             res.rejected[res.rejected["session"] == fill_day]["reason"].astype(str))
         assert "セクター集中率上限" in reasons
@@ -427,10 +442,41 @@ class TestSectorConcentrationRefillAtFillTime:
         assert row["cash"] == pytest.approx(590_000.0)
         assert row["n_holdings"] == 2
 
+    def test_does_not_shrink_when_only_the_close_jumps_after_the_open_is_flat(self):
+        """寄りは横ばい・引けだけジャンプ（＝9:00時点では超過していないケース）。
+
+        引け値を見る実装だと、まだ起きていない値動きを理由にBを誤って
+        縮小してしまう（元レビュー再検証のL2相当）。寄り値ベースなら
+        超過しないため、Bは全量（2,100株）約定するはずである。
+        """
+        md = self._market(jump_open=100.0, jump_close=200.0)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=self._decide_a_then_b(),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(),
+            sizing=_sizing(ratio=0.3, sector_ratio=0.55),
+            liquidity=execution.LiquidityConfig())
+
+        fill_day = date(2026, 1, 7)   # Aの引けがジャンプするが、Bの約定は寄りで起きる日
+        reasons = " ".join(
+            res.rejected[res.rejected["session"] == fill_day]["reason"].astype(str))
+        assert "セクター集中率上限" not in reasons
+
+        # B は縮小されず全量（2,100株）約定している
+        # （現金700,000 − 2,100株×100円 = 490,000）
+        row = res.daily[res.daily["session"] == fill_day].iloc[0]
+        assert row["cash"] == pytest.approx(490_000.0)
+        assert row["n_holdings"] == 2
+
     def test_without_the_refill_check_the_breach_would_go_uncaught(self):
         """回帰確認: allocate()時点（前日終値）のセクター比率チェックだけでは
-        このシナリオの超過を検出できない（=約定時点の引き直しが必須である証拠）"""
-        md = self._market()
+        このシナリオの超過を検出できない（=約定時点の引き直しが必須である証拠）。
+
+        ここで渡す価格辞書は、本番コードでは opens_at()（約定日の寄り値）に
+        あたる。closes_at()（約定日の引け値）を渡してはならない
+        （新規Important A）。
+        """
+        md = self._market(jump_open=200.0, jump_close=100.0)
         state = pf.apply_buy(pf.empty_portfolio(1_000_000.0), "A", 3000, 100.0,
                              "S", date(2026, 1, 5), commission_pct=0.0)
         # allocate()時点の終値（Aジャンプ前）では通過してしまう
@@ -438,7 +484,7 @@ class TestSectorConcentrationRefillAtFillTime:
             state, "S", 100.0 * 2100, {"A": 100.0, "B": 100.0},
             _sizing(ratio=0.3, sector_ratio=0.55))
         assert ok is True
-        # 約定日の時価（Aジャンプ後）で引き直すと超過する
+        # 約定日の寄り値（Aジャンプ後）で引き直すと超過する
         ok2, _ = pf.check_sector_concentration(
             state, "S", 100.0 * 2100, {"A": 200.0, "B": 100.0},
             _sizing(ratio=0.3, sector_ratio=0.55))

@@ -262,6 +262,20 @@ def closes_at(md: MarketData, session: date) -> dict:
     return out
 
 
+def opens_at(md: MarketData, session: date) -> dict:
+    """その日の寄り値。足が無い銘柄は含めない（呼び出し側が取得単価へ落とす）。
+
+    買い約定はこの日の寄りで起きるため、約定判定の時点で分かっている情報は
+    終値ではなく寄り値まで（Tの終値の情報はT+1以降の注文にしか使えない）。
+    """
+    out = {}
+    for symbol in md.bars:
+        row = _bar_of(md, symbol, session)
+        if row is not None:
+            out[symbol] = float(row["open"])
+    return out
+
+
 def _row_for(md: MarketData, symbol: str, session: date):
     """判断（decide）へ渡す1行。生OHLCVに特徴量とrule_scoreを重ねたもの。
 
@@ -402,6 +416,10 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
 
         realized = 0.0
         closes = closes_at(md, session)
+        # 買い約定（この日の寄り）の判定に使う。closesと違い、9:00時点で
+        # 実際に分かっている価格のみを含む（新規Important A: 終値を混ぜると
+        # T+1以降にしか使えないはずの情報が同日の約定判定に混入するlook-ahead）。
+        opens = opens_at(md, session)
         # 出来高の枠はこの営業日ぶん。買いと売りで共有する（外部レビューR09）
         budget = execution.VolumeBudget(liquidity)
 
@@ -460,15 +478,31 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
             # セクター集中の上限を約定価格・約定数量で引き直す。allocate()時点
             # （前日終値ベース）は通過していても、ギャップアップで分子（約定金額）・
             # 分母（総資金）が動いた後は超過することがある（Minor 2）。
+            # 既存保有の評価には必ず寄り値（opens）を使う。closesを渡すと
+            # 9:00の約定判定が同日の終値（T+1以降にしか使えないはずの情報）に
+            # 依存するlook-aheadになる（新規Important A）。
             notional = fill_price * capped
             sector_ok, sector_reason = pf.check_sector_concentration(
-                state, order.sector, notional, closes, sizing)
+                state, order.sector, notional, opens, sizing)
             if not sector_ok:
+                original_sector_reason = sector_reason
                 shrunk = capped
                 while shrunk >= pf.LOT_SIZE and not sector_ok:
                     shrunk -= pf.LOT_SIZE
                     sector_ok, sector_reason = pf.check_sector_concentration(
-                        state, order.sector, fill_price * shrunk, closes, sizing)
+                        state, order.sector, fill_price * shrunk, opens, sizing)
+                if shrunk < pf.LOT_SIZE:
+                    # 0株まで縮めた時点で集中率自体は解消し得るため、その場合
+                    # sector_reasonは空になる。空の却下理由を残さないよう、
+                    # 縮小前に超過していた事実を1件の見送り理由にまとめる
+                    # （新規Minor B）。
+                    rejected.append({
+                        "session": session, "symbol": order.symbol,
+                        "reason": (
+                            f"約定価格{fill_price:,.1f}で{original_sector_reason}"
+                            f"のため単元未満まで縮小し見送り（{capped:,}株→0株）"
+                        )})
+                    continue
                 if shrunk < capped:
                     rejected.append({
                         "session": session, "symbol": order.symbol,
@@ -477,10 +511,6 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                             f"数量を再縮小（{capped:,}株→{shrunk:,}株）"
                         )})
                 capped = shrunk
-                if capped < pf.LOT_SIZE:
-                    rejected.append({"session": session, "symbol": order.symbol,
-                                     "reason": sector_reason})
-                    continue
 
             result = execution.entry_fill_limited(
                 obs, capped, costs, budget,

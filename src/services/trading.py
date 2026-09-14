@@ -34,14 +34,28 @@ from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 
 
 def _select_latest_signals(session, max_age_days: int = 5) -> list:
-    """直近のシグナル生成日（最新の signal_scan バッチの日付）のBUY/SELLシグナルを、
-    銘柄ごと1件にdedupして返す。
+    """直近のBUYバッチ（signal_scanの日付）のBUYシグナルと、max_age_days以内の
+    SELLシグナルをあわせて、銘柄ごと1件にdedupして返す。
 
     「now - 20時間」のような固定時間窓では、土日・祝日を挟むと前営業日（例: 金曜16:20）の
-    シグナルを月曜9:05の発注時に取りこぼす（20時間を超えるため）。そのため「最新のシグナル
+    シグナルを月曜9:05の発注時に取りこぼす（20時間を超えるため）。そのため「最新のBUY
     生成日そのもの」を基準にすることで、休場日数に関わらず前営業日分を正しく拾う。
-    生成日が max_age_days を超えて古い場合は陳腐化したシグナルとみなし空リストを返す
+    全体が max_age_days を超えて古い場合は陳腐化したシグナルとみなし空リストを返す
     （長期間ジョブが止まっていた場合の誤発注を防ぐ）。
+
+    BUYの対象日とSELLの対象範囲は別々に決める（新規Important C）。v2 paperの
+    stop_loss_checkは当日付でSELLを保存するため、BUYと同じ「最新シグナル日」を
+    基準にすると、当日9:00にSELLが1件でも保存された途端、前営業日16:20の
+    signal_scanバッチ（本来9:05のmorning_executionが拾うべきBUY群）が丸ごと
+    対象外になってしまう。これを避けるため、
+    - BUYは「最新のBUY生成日（＝直近のsignal_scanバッチ日）」の分だけを対象にし、
+    - SELLは生成日に関わらずmax_age_days以内であれば常に対象にする
+    （既に約定済み・保有が無くなった銘柄のSELLは呼び出し側の
+    `_get_position_qty() <= 0` チェックで自然に無視されるため、古いSELLを
+    拾っても実害は無い）。
+    - ただしBUY自体もmax_age_daysより古ければ対象外にする（他銘柄の新しい
+    SELLがあるからといって、signal_scanが止まって何日も経った古いBUY
+    バッチを蘇らせて発注してしまわないようにするため）。
 
     dedupは**生成時刻ではなくSELLを優先**する。日中の stop_loss_check が保存した
     SELL（保有保護の退出）を、同日16:20の signal_scan が生成したより新しいBUYで
@@ -56,17 +70,39 @@ def _select_latest_signals(session, max_age_days: int = 5) -> list:
         return []
     if (clock.now() - latest_at).days > max_age_days:
         return []
-    day_start = datetime.combine(latest_at.date(), datetime.min.time())
-    day_end = day_start + timedelta(days=1)
-    signals = session.scalars(
+
+    signals = []
+    buy_latest_at = session.scalar(
+        select(func.max(Signal.generated_at)).where(Signal.action == "BUY")
+    )
+    # SELLがmax_age_days以内なら上のガードは常に通ってしまうため、BUY自体の
+    # 陳腐化は独立に見る（他銘柄の新しいSELLがあるからといって、何日も前の
+    # 止まったsignal_scanバッチを蘇らせて発注してはいけない）。
+    if buy_latest_at is not None and (clock.now() - buy_latest_at).days > max_age_days:
+        buy_latest_at = None
+    if buy_latest_at is not None:
+        buy_day_start = datetime.combine(buy_latest_at.date(), datetime.min.time())
+        buy_day_end = buy_day_start + timedelta(days=1)
+        signals.extend(session.scalars(
+            select(Signal)
+            .where(
+                Signal.action == "BUY",
+                Signal.generated_at >= buy_day_start,
+                Signal.generated_at < buy_day_end,
+            )
+            .order_by(Signal.generated_at.desc())
+        ).all())
+
+    age_cutoff = clock.now() - timedelta(days=max_age_days)
+    signals.extend(session.scalars(
         select(Signal)
         .where(
-            Signal.action.in_(["BUY", "SELL"]),
-            Signal.generated_at >= day_start,
-            Signal.generated_at < day_end,
+            Signal.action == "SELL",
+            Signal.generated_at >= age_cutoff,
         )
         .order_by(Signal.generated_at.desc())
-    ).all()
+    ).all())
+
     by_symbol: dict = {}
     for s in signals:
         current = by_symbol.get(s.symbol)

@@ -86,16 +86,55 @@ class TestSelectLatestSignals:
         assert len(result) == 1
         assert result[0].action == "SELL"  # より新しい方が残る
 
-    def test_only_latest_batch_date_included(self, isolated_db):
-        """最新シグナル生成日より前の日のシグナルは対象外（古いバッチを混在させない）"""
+    def test_old_buy_batch_excluded_when_a_newer_buy_batch_exists(self, isolated_db):
+        """古いBUYバッチより新しいBUYバッチが存在すれば、古い方は対象外
+        （同じ銘柄群への重複発注を防ぐ）。"""
         now = clock.now()
         _add_signal("7203", "BUY", _batch_time(now - timedelta(days=5)))   # 古いバッチ
-        _add_signal("6758", "SELL", _batch_time(now - timedelta(days=3)))  # 最新バッチ
+        _add_signal("6758", "BUY", _batch_time(now - timedelta(days=3)))   # 最新バッチ
 
         with get_session() as session:
             result = main_module._select_latest_signals(session)
         symbols = {s.symbol for s in result}
         assert symbols == {"6758"}
+
+    def test_todays_stop_loss_sell_does_not_hide_yesterdays_buy_batch(self, isolated_db):
+        """新規Important C: 前営業日のBUYバッチ（signal_scan）が、当日保存された
+        損切りSELL（stop_loss_check、別銘柄）によって丸ごと隠れてはいけない。
+
+        修正前は「最新シグナル生成日」をBUY/SELL共通の基準にしていたため、
+        当日付のSELLが1件保存されただけで基準日が「今日」にすり替わり、
+        前営業日のBUYバッチ（本来9:05のmorning_executionが拾うべきもの）が
+        全滅していた（レビュー実測: BUY 3件が消える）。
+        """
+        yesterday_batch = _batch_time(clock.now() - timedelta(days=1))
+        _add_signal("7203", "BUY", yesterday_batch)
+        _add_signal("6758", "BUY", yesterday_batch)
+        _add_signal("9984", "BUY", yesterday_batch)
+
+        # 当日09:30にstop_loss_checkが7203をSELL
+        _add_signal("7203", "SELL", clock.now())
+
+        with get_session() as session:
+            result = main_module._select_latest_signals(session)
+        by_symbol = {s.symbol: s for s in result}
+        assert by_symbol.keys() == {"7203", "6758", "9984"}
+        assert by_symbol["7203"].action == "SELL"   # dedupでSELLが優先（Important 4）
+        assert by_symbol["6758"].action == "BUY"
+        assert by_symbol["9984"].action == "BUY"
+
+    def test_old_buy_batch_not_revived_by_an_unrelated_fresh_sell(self, isolated_db):
+        """BUY自体がmax_age_daysより古ければ、他銘柄の新しいSELLがあっても
+        対象外のままであること（signal_scanが止まったまま何日も経った
+        BUYバッチを誤って蘇らせないための安全策）。"""
+        _add_signal("7203", "BUY", _batch_time(clock.now() - timedelta(days=10)))
+        _add_signal("6758", "SELL", clock.now())  # 他銘柄の新しいSELL
+
+        with get_session() as session:
+            result = main_module._select_latest_signals(session, max_age_days=5)
+        by_symbol = {s.symbol: s for s in result}
+        assert "7203" not in by_symbol
+        assert by_symbol["6758"].action == "SELL"
 
     def test_hold_signals_excluded(self, isolated_db):
         """HOLDシグナルは対象外（BUY/SELLのみ）"""
