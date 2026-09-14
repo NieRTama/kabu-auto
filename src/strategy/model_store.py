@@ -326,3 +326,34 @@ def rollback(*, base_dir: str = "models") -> Optional[CurrentRef]:
         return None
     return set_current(ref.previous_model_id, base_dir=base_dir,
                        previous_model_id=ref.model_id)
+
+
+def train_as_candidate(train_fn, meta_fn, *,
+                       base_dir: str = "models") -> Optional[str]:
+    """学習を**候補の生成として**実行する。成功したら model_id を返す。
+
+    **失敗しても現行には一切触れない。** 現行の ml_model は週次再学習の
+    戻り値を運用モデルへ直接代入するため、学習の途中経過が運用へ漏れる
+    （レビューF09）。ここでは学習・メタ生成・保存のいずれで落ちても、
+    現行の参照も過去の候補も変わらない。
+
+    書きかけの候補ディレクトリは残さない（次回の読み込みで壊れたモデルを
+    掴まないため）。
+    """
+    try:
+        model = train_fn()
+        meta = meta_fn()
+    except Exception as e:
+        logger.error(f"候補モデルの学習に失敗しました（現行は変更していません）: {e}")
+        return None
+
+    path = candidate_dir(meta.model_id, base_dir)
+    existed = path.exists()
+    try:
+        save_candidate(model, meta, base_dir=base_dir)
+    except Exception as e:
+        logger.error(f"候補モデルの保存に失敗しました（現行は変更していません）: {e}")
+        if not existed and path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+        return None
+    return meta.model_id

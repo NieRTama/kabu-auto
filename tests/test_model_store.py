@@ -349,3 +349,68 @@ class TestRollback:
 
     def test_returns_none_when_unpromoted(self, tmp_path):
         assert ms.rollback(base_dir=str(tmp_path)) is None
+
+
+class TestTrainAsCandidate:
+    def _promoted(self, tmp_path):
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+
+    def test_successful_training_creates_a_candidate_not_a_switch(self, tmp_path):
+        """学習成功はモデル更新ではなく候補の生成（spec §9）"""
+        self._promoted(tmp_path)
+        model, _ = _trained_model()
+
+        model_id = ms.train_as_candidate(
+            lambda: model, lambda: _meta("m0002"), base_dir=str(tmp_path))
+
+        assert model_id == "m0002"
+        assert ms.candidate_dir("m0002", str(tmp_path)).exists()
+        # 現行は変わらない
+        assert ms.read_current(base_dir=str(tmp_path)).model_id == "m0001"
+
+    def test_training_failure_leaves_the_current_intact(self, tmp_path):
+        """学習失敗で現行モデルが失われない（spec §14 段階E完了条件）"""
+        self._promoted(tmp_path)
+
+        def broken():
+            raise RuntimeError("学習に失敗しました")
+
+        assert ms.train_as_candidate(
+            broken, lambda: _meta("m0002"), base_dir=str(tmp_path)) is None
+        assert ms.read_current(base_dir=str(tmp_path)).model_id == "m0001"
+        assert ms.load_current(base_dir=str(tmp_path))[1].model_id == "m0001"
+
+    def test_metadata_failure_leaves_no_half_written_candidate(self, tmp_path):
+        """メタの生成で落ちたら候補ディレクトリを残さない"""
+        self._promoted(tmp_path)
+        model, _ = _trained_model()
+
+        def broken_meta():
+            raise RuntimeError("メタの生成に失敗しました")
+
+        assert ms.train_as_candidate(
+            lambda: model, broken_meta, base_dir=str(tmp_path)) is None
+        assert not ms.candidate_dir("m0002", str(tmp_path)).exists()
+
+    def test_failure_when_unpromoted_stays_unpromoted(self, tmp_path):
+        def broken():
+            raise RuntimeError("boom")
+
+        assert ms.train_as_candidate(
+            broken, lambda: _meta("m0002"), base_dir=str(tmp_path)) is None
+        assert ms.read_current(base_dir=str(tmp_path)) is None
+
+    def test_previous_candidate_survives_a_new_failure(self, tmp_path):
+        """過去の候補も壊さない"""
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        before = (ms.candidate_dir("m0001", str(tmp_path)) / "model.txt").read_bytes()
+
+        def broken():
+            raise RuntimeError("boom")
+
+        ms.train_as_candidate(broken, lambda: _meta("m0002"), base_dir=str(tmp_path))
+        after = (ms.candidate_dir("m0001", str(tmp_path)) / "model.txt").read_bytes()
+        assert after == before
