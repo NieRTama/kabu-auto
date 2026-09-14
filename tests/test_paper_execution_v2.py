@@ -118,17 +118,30 @@ class TestExecutePendingSignalsGateV2Paper:
                                rule_score=0.0, ml_score=0.0, combined_score=0.0))
             session.commit()
 
+    @staticmethod
+    def _ohlcv_df(price=900.0):
+        """load_ohlcv()の戻り値を模したモック。df["close"].iloc[-1] が price を返す。"""
+        df_mock = MagicMock()
+        df_mock.__len__.return_value = 1
+        df_mock.__getitem__.return_value.iloc.__getitem__.return_value = price
+        return df_mock
+
     def test_v2_paper_reaches_order_flow_via_morning_execution(self, isolated_db):
         """v2 + paper: ゲートで return されず、保存済みSELLシグナルに基づき
-        実際に order_mgr.sell() まで到達する"""
+        実際に order_mgr.sell() まで到達する。paper は板API（client.get_board）
+        ではなくローカル日足（load_ohlcv）で価格を決める（Important 3是正）"""
         svc, client, risk, order_mgr = self._make_services("paper", "v2")
         self._seed_sell_signal("7203")
         with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
              patch("src.services.trading._get_position_qty", return_value=100), \
+             patch("src.services.trading.load_ohlcv", return_value=self._ohlcv_df(900.0)), \
              patch("src.services.trading.alert"):
             svc.morning_execution()
         order_mgr.sell.assert_called_once()
         assert order_mgr.sell.call_args[0][0] == "7203"
+        assert order_mgr.sell.call_args[0][1] == pytest.approx(900.0)
+        # 板APIは呼ばない（paperはローカル日足だけで完結する）
+        client.get_board.assert_not_called()
 
     def test_legacy_paper_still_returns_at_gate(self, isolated_db):
         """回帰防止: legacy + paper は従来通りゲートで即returnし、
@@ -217,7 +230,8 @@ class TestStopLossCheckDefersInV2:
 
     def test_v2_signal_is_picked_up_by_next_morning_execution(self, isolated_db):
         """v2で保存されたSELLシグナルが、翌営業日のmorning_executionで
-        実際に売り注文（order_mgr.sell）まで進むこと"""
+        実際に売り注文（order_mgr.sell）まで進むこと。paperはローカル日足で
+        価格を決めるため板APIは呼ばない（Important 3是正）"""
         svc, risk, order_mgr = self._services("v2")
         self._run(svc)  # stop_loss_check がSignalをDBに保存する
 
@@ -229,9 +243,109 @@ class TestStopLossCheckDefersInV2:
         order_mgr2.sell.return_value = "SELL-ORD"
         svc2 = trading.TradingServices(client2, risk, order_mgr2)
         svc2.trading_conf = {"mode": "paper"}
+        df_mock = MagicMock()
+        df_mock.__len__.return_value = 1
+        df_mock.__getitem__.return_value.iloc.__getitem__.return_value = 950.0
         with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
              patch("src.services.trading._get_position_qty", return_value=100), \
+             patch("src.services.trading.load_ohlcv", return_value=df_mock), \
              patch("src.services.trading.alert"):
             svc2.morning_execution()
         order_mgr2.sell.assert_called_once()
         assert order_mgr2.sell.call_args[0][0] == "7203"
+        client2.get_board.assert_not_called()
+
+
+# ─── Important 3: paper v2 は板API・余力APIへの接続を必須にしない ──────────
+
+
+class TestPaperV2NoClientDependency:
+    """paper + v2 は client（板API get_board・余力API get_wallet）が無くても
+    ローカル日足（load_ohlcv）と仮想ウォレット（_paper_available_cash）だけで
+    発注処理まで進むこと（最終ブランチレビュー Important 3）。
+
+    接続の無い環境で paper v2 を有効にすると、修正前は BUY が
+    client.get_wallet() の失敗で全滅し、SELL は個別 except でログのみ残る
+    「沈黙した失敗」になっていた。
+    """
+
+    @staticmethod
+    def _ohlcv_df(price):
+        df_mock = MagicMock()
+        df_mock.__len__.return_value = 1
+        df_mock.__getitem__.return_value.iloc.__getitem__.return_value = price
+        return df_mock
+
+    def _services(self, client=None):
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        risk = MagicMock()
+        risk.validate_buy.return_value = (True, "")
+        risk.calc_position_size.return_value = 100
+        order_mgr = MagicMock()
+        order_mgr.sell.return_value = "SELL-ORD"
+        order_mgr.buy.return_value = "BUY-ORD"
+        svc = trading.TradingServices(client, risk, order_mgr)
+        svc.trading_conf = {"mode": "paper"}
+        return svc, risk, order_mgr
+
+    def test_sell_reaches_order_flow_with_client_none(self, isolated_db):
+        """SELL: clientがNoneでも、load_ohlcvの終値だけを使って
+        order_mgr.sell()まで進む（client.get_boardは一切呼ばれない）"""
+        svc, risk, order_mgr = self._services(client=None)
+        with get_session() as session:
+            session.add(Signal(symbol="7203", action="SELL",
+                               rule_score=0.0, ml_score=0.0, combined_score=0.0))
+            session.commit()
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
+             patch("src.services.trading._get_position_qty", return_value=100), \
+             patch("src.services.trading.load_ohlcv", return_value=self._ohlcv_df(880.0)), \
+             patch("src.services.trading.alert"):
+            svc.morning_execution()  # client=None: get_board を呼べば AttributeError で落ちる
+        order_mgr.sell.assert_called_once()
+        assert order_mgr.sell.call_args[0][0] == "7203"
+        assert order_mgr.sell.call_args[0][1] == pytest.approx(880.0)
+
+    def test_buy_reaches_order_flow_with_client_none(self, isolated_db):
+        """BUY: clientがNoneでも、_paper_available_cash()で余力を求め、
+        load_ohlcvの終値だけを使って order_mgr.buy()まで進む
+        （client.get_wallet/get_boardは一切呼ばれない）"""
+        svc, risk, order_mgr = self._services(client=None)
+        with get_session() as session:
+            session.add(Signal(symbol="9984", action="BUY",
+                               rule_score=0.5, ml_score=0.5, combined_score=0.5))
+            session.commit()
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
+             patch("src.services.trading.load_ohlcv", return_value=self._ohlcv_df(500.0)), \
+             patch("src.services.trading.watchlist_store") as watchlist_mock, \
+             patch("src.services.trading.alert"):
+            watchlist_mock.get_sectors.return_value = {"9984": "小売"}
+            svc.morning_execution()  # client=None: get_wallet/get_board を呼べば落ちる
+        order_mgr.buy.assert_called_once()
+        assert order_mgr.buy.call_args[0][0] == "9984"
+        assert order_mgr.buy.call_args[0][1] == pytest.approx(500.0)
+
+    def test_live_mode_still_requires_client_board(self, isolated_db):
+        """回帰防止: live/dry_run/semi_liveはこの分岐に入らず、
+        従来通りclient.get_boardを使う（is_paperのみのフォールバックであること）"""
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        risk = MagicMock()
+        risk.validate_buy.return_value = (True, "")
+        risk.calc_position_size.return_value = 100
+        order_mgr = MagicMock()
+        order_mgr.sell.return_value = "SELL-ORD"
+        client = MagicMock()
+        client.get_board.return_value = {"CurrentPrice": 700.0}
+        svc = trading.TradingServices(client, risk, order_mgr)
+        svc.trading_conf = {"mode": "dry_run"}
+        with get_session() as session:
+            session.add(Signal(symbol="7203", action="SELL",
+                               rule_score=0.0, ml_score=0.0, combined_score=0.0))
+            session.commit()
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
+             patch("src.services.trading._get_position_qty", return_value=100), \
+             patch("src.services.trading.load_ohlcv") as load_ohlcv_mock, \
+             patch("src.services.trading.alert"):
+            svc.morning_execution()
+        client.get_board.assert_called_once_with("7203")
+        load_ohlcv_mock.assert_not_called()
+        order_mgr.sell.assert_called_once()

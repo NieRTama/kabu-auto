@@ -28,8 +28,8 @@ from src.core import clock
 from src.strategy import policy
 
 _DAILY_COLUMNS = ["session", "nav", "cash", "n_holdings", "realized_pnl"]
-_TRADE_COLUMNS = ["symbol", "entry_at", "entry_price", "exit_at", "exit_price",
-                  "quantity", "pnl", "reason"]
+_TRADE_COLUMNS = ["symbol", "entry_at", "entry_price", "entry_cost_basis",
+                  "exit_at", "exit_price", "quantity", "pnl", "reason"]
 _REJECTED_COLUMNS = ["session", "symbol", "reason"]
 _MODEL_USAGE_COLUMNS = ["model_id", "from_session", "to_session", "n_train_events"]
 
@@ -431,7 +431,10 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
             fill_price = execution.buy_fill_price(obs.open, costs)
             affordable = pf.max_affordable_quantity(
                 state.cash, fill_price, costs.commission_pct)
-            # 1銘柄あたりの上限・セクター集中の上限も約定価格で引き直す
+            # 1銘柄あたりの上限（calc_quantity）も約定価格で引き直す。
+            # セクター集中の上限は calc_quantity() が見ないため、下の
+            # check_sector_concentration() で別途約定価格・約定数量で引き直す
+            # （Minor 2。以前はここのコメントだけがセクターも引き直すと主張していた）。
             capped = min(
                 order.quantity,
                 affordable,
@@ -453,6 +456,31 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                         f"約定価格{fill_price:,.1f}で数量を縮小"
                         f"（{order.quantity:,}株→{capped:,}株）"
                     )})
+
+            # セクター集中の上限を約定価格・約定数量で引き直す。allocate()時点
+            # （前日終値ベース）は通過していても、ギャップアップで分子（約定金額）・
+            # 分母（総資金）が動いた後は超過することがある（Minor 2）。
+            notional = fill_price * capped
+            sector_ok, sector_reason = pf.check_sector_concentration(
+                state, order.sector, notional, closes, sizing)
+            if not sector_ok:
+                shrunk = capped
+                while shrunk >= pf.LOT_SIZE and not sector_ok:
+                    shrunk -= pf.LOT_SIZE
+                    sector_ok, sector_reason = pf.check_sector_concentration(
+                        state, order.sector, fill_price * shrunk, closes, sizing)
+                if shrunk < capped:
+                    rejected.append({
+                        "session": session, "symbol": order.symbol,
+                        "reason": (
+                            f"約定価格{fill_price:,.1f}でセクター集中率上限のため"
+                            f"数量を再縮小（{capped:,}株→{shrunk:,}株）"
+                        )})
+                capped = shrunk
+                if capped < pf.LOT_SIZE:
+                    rejected.append({"session": session, "symbol": order.symbol,
+                                     "reason": sector_reason})
+                    continue
 
             result = execution.entry_fill_limited(
                 obs, capped, costs, budget,
@@ -539,9 +567,10 @@ def _drive_exits(portfolio_state: pf.Portfolio, md: MarketData, session: date,
     戻り値: (次のポートフォリオ, 当日約定した取引のリスト, 翌営業日へ繰り越す退出意図)
 
     保有の peak_price / sessions_held は **policy.step() が返す次の状態で更新する**。
-    portfolio.advance_session() は「その日の足が無くポリシーを回せない保有」にだけ
-    使う。同じ規則（未来のピークを遡ってストップに使わない）の実装を2つ
-    持たないため。
+    その日の足が無くポリシーを回せない保有は、`sessions_held` のみをインラインで
+    +1 して持ち越す（`peak_price` は据え置き。値の付かない日にピークを進めない
+    ため）。`portfolio.advance_session()` はここでは呼ばない。同関数は価格辞書から
+    `peak_price` も更新してしまうため、足が無い日に使うと不適切（外部レビューI-1）。
 
     STOP の意図はその日のうちに約定する（execution.exit_fill が
     min(open, trigger) で処理する）。MARKET の意図（売りシグナル・満了）は

@@ -182,6 +182,38 @@ class TestExitDriving:
         assert t["entry_at"] == date(2026, 1, 6)
         assert t["exit_at"] == date(2026, 1, 9)
 
+    def test_time_limit_exit_reports_entry_cost_basis(self):
+        """最終ブランチレビュー Important 1: entry_cost_basis 列が
+        pd.DataFrame(..., columns=_TRADE_COLUMNS) で無言で落ちず、
+        holding.avg_cost_with_fees 相当の実値を持って出力されること。
+
+        値動きゼロ・手数料0.1%で満了退出させると、entry_price と exit_price は
+        一致するため (exit_price - entry_price) * quantity = 0 になる一方、
+        pnl は往復手数料ぶんマイナスになる。entry_cost_basis が出力されていれば
+        pnl = (exit_price - entry_cost_basis) * quantity - 売却手数料 が
+        再現でき、出力だけから損益の根拠が辿れる。
+        """
+        md = wf.MarketData(bars={"A": _bars(12, price=1000.0)}, sectors={"A": "S"})
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 16),
+            initial_capital=1_000_000.0, decide=_buy_once("A", at_index=0),
+            policy_conf=_policy_conf(max_holding=3), costs=_costs(comm=0.001),
+            sizing=_sizing(), liquidity=execution.LiquidityConfig())
+
+        assert "entry_cost_basis" in res.trades.columns
+        assert len(res.trades) == 1
+        t = res.trades.iloc[0]
+        assert t["reason"] == policy.TIME_LIMIT
+        assert t["entry_price"] == pytest.approx(1000.0)
+        assert t["exit_price"] == pytest.approx(1000.0)
+        # avg_cost_with_fees = price * (1 + commission_pct)（手数料込み取得単価）
+        assert t["entry_cost_basis"] == pytest.approx(1001.0)
+        assert t["entry_cost_basis"] != pytest.approx(t["entry_price"])
+        # (exit_price - entry_price) * quantity = 0 なのに pnl は非ゼロ
+        # → entry_cost_basis が無いと出力だけから再現できない
+        assert (t["exit_price"] - t["entry_price"]) * t["quantity"] == pytest.approx(0.0)
+        assert t["pnl"] != pytest.approx(0.0)
+
     def test_holding_is_released_after_exit(self):
         md = wf.MarketData(bars={"A": _bars(12, price=1000.0)}, sectors={"A": "S"})
         res = wf.run_walkforward(
@@ -337,6 +369,80 @@ class TestFillTimeAffordability:
             costs=_costs(comm=0.001), sizing=_sizing(ratio=1.0),
             liquidity=execution.LiquidityConfig())
         assert (res.daily["cash"] >= 0).all()
+
+
+class TestSectorConcentrationRefillAtFillTime:
+    """Minor 2: セクター集中の上限も約定価格で引き直すこと。
+
+    calc_quantity()（1銘柄あたりの上限）は約定価格の上昇に応じて数量を縮めるが
+    セクターを見ない。allocate()時点（前日終値）でセクター比率を通過していても、
+    **候補自身の価格ではなく既存保有（同一セクター）の価格が約定日にジャンプする**
+    と、約定日の時価では上限を超えることがある。この経路は候補自身の価格が
+    動かないため calc_quantity() 側の自己縮小が働かず、最終ブランチレビューが
+    「実際に突破するのは難しい」と評した自己相殺（数量↓×価格↑≒一定）が起きない。
+    """
+
+    def _market(self):
+        # A: 既存保有。1/7（3営業日目）に100→200へジャンプ（同一セクターの評価額を膨らませる）
+        bars_a = _bars(6, price=100.0)
+        idx = bars_a.index[2]
+        bars_a.loc[idx, ["open", "high", "low", "close"]] = [200.0, 200.0, 200.0, 200.0]
+        # B: 新規候補。価格は終始横ばい（B自身の数量はcalc_quantity側で自己縮小しない）
+        bars_b = _bars(6, price=100.0)
+        return wf.MarketData(bars={"A": bars_a, "B": bars_b}, sectors={"A": "S", "B": "S"})
+
+    def _decide_a_then_b(self):
+        state = {"count": 0}
+
+        def decide(session, rows, model, ctx):
+            idx = state["count"]
+            state["count"] += 1
+            if idx == 0 and "A" in rows:
+                return [pf.Candidate(symbol="A", sector=ctx["sectors"]["A"],
+                                     price=float(rows["A"]["close"]), score=0.9)]
+            if idx == 1 and "B" in rows:
+                return [pf.Candidate(symbol="B", sector=ctx["sectors"]["B"],
+                                     price=float(rows["B"]["close"]), score=0.9)]
+            return []
+        return decide
+
+    def test_shrinks_the_order_when_existing_holding_reprices_into_breach(self):
+        md = self._market()
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=self._decide_a_then_b(),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(),
+            sizing=_sizing(ratio=0.3, sector_ratio=0.55),
+            liquidity=execution.LiquidityConfig())
+
+        fill_day = date(2026, 1, 7)   # Aがジャンプし、Bが約定する日
+        reasons = " ".join(
+            res.rejected[res.rejected["session"] == fill_day]["reason"].astype(str))
+        assert "セクター集中率上限" in reasons
+        assert "縮小" in reasons
+
+        # B は全量却下ではなく1,100株まで縮小されて約定している
+        # （現金700,000 − 1,100株×100円 = 590,000）
+        row = res.daily[res.daily["session"] == fill_day].iloc[0]
+        assert row["cash"] == pytest.approx(590_000.0)
+        assert row["n_holdings"] == 2
+
+    def test_without_the_refill_check_the_breach_would_go_uncaught(self):
+        """回帰確認: allocate()時点（前日終値）のセクター比率チェックだけでは
+        このシナリオの超過を検出できない（=約定時点の引き直しが必須である証拠）"""
+        md = self._market()
+        state = pf.apply_buy(pf.empty_portfolio(1_000_000.0), "A", 3000, 100.0,
+                             "S", date(2026, 1, 5), commission_pct=0.0)
+        # allocate()時点の終値（Aジャンプ前）では通過してしまう
+        ok, _ = pf.check_sector_concentration(
+            state, "S", 100.0 * 2100, {"A": 100.0, "B": 100.0},
+            _sizing(ratio=0.3, sector_ratio=0.55))
+        assert ok is True
+        # 約定日の時価（Aジャンプ後）で引き直すと超過する
+        ok2, _ = pf.check_sector_concentration(
+            state, "S", 100.0 * 2100, {"A": 200.0, "B": 100.0},
+            _sizing(ratio=0.3, sector_ratio=0.55))
+        assert ok2 is False
 
 
 class TestExitLiquidity:

@@ -35,13 +35,19 @@ from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 
 def _select_latest_signals(session, max_age_days: int = 5) -> list:
     """直近のシグナル生成日（最新の signal_scan バッチの日付）のBUY/SELLシグナルを、
-    銘柄ごと最新1件にdedupして返す。
+    銘柄ごと1件にdedupして返す。
 
     「now - 20時間」のような固定時間窓では、土日・祝日を挟むと前営業日（例: 金曜16:20）の
     シグナルを月曜9:05の発注時に取りこぼす（20時間を超えるため）。そのため「最新のシグナル
     生成日そのもの」を基準にすることで、休場日数に関わらず前営業日分を正しく拾う。
     生成日が max_age_days を超えて古い場合は陳腐化したシグナルとみなし空リストを返す
     （長期間ジョブが止まっていた場合の誤発注を防ぐ）。
+
+    dedupは**生成時刻ではなくSELLを優先**する。日中の stop_loss_check が保存した
+    SELL（保有保護の退出）を、同日16:20の signal_scan が生成したより新しいBUYで
+    上書きして消してしまうと、損切り・トレーリングストップの退出が最低1営業日
+    遅れる（最終ブランチレビュー Important 4）。同一銘柄にSELLが1件でもあれば、
+    生成時刻に関わらずSELLを採用する。
     """
     latest_at = session.scalar(
         select(func.max(Signal.generated_at)).where(Signal.action.in_(["BUY", "SELL"]))
@@ -61,13 +67,15 @@ def _select_latest_signals(session, max_age_days: int = 5) -> list:
         )
         .order_by(Signal.generated_at.desc())
     ).all()
-    seen: set = set()
-    pending: list = []
+    by_symbol: dict = {}
     for s in signals:
-        if s.symbol not in seen:
-            seen.add(s.symbol)
-            pending.append(s)
-    return pending
+        current = by_symbol.get(s.symbol)
+        if current is None:
+            by_symbol[s.symbol] = s
+        elif current.action != "SELL" and s.action == "SELL":
+            # 保有保護の退出（SELL）は生成時刻に関わらずBUYより優先する
+            by_symbol[s.symbol] = s
+    return list(by_symbol.values())
 
 
 def _signal_rationale(sig) -> str:
@@ -581,6 +589,14 @@ class TradingServices:
         source はジョブ名（OrderIntent.source・ログ表記に使う）。
         skip_existing=True のときは、BUY候補のうち本日既にBUYが成立/進行中の銘柄を
         対象から除外する（同日の二度打ち防止。前日までの保有は対象外＝買い増しを許す）。
+
+        paper（v2）はここへ合流するが、legacy paper 経路と異なり板API・余力APIへの
+        接続を前提にできない。paper のときは板・余力の取得をローカル日足
+        （load_ohlcv）と仮想ウォレット（_paper_available_cash）へフォールバックする
+        （signal_scan のlegacy分岐と同じパターン）。接続の無い環境で paper v2 を
+        有効にすると client.get_board/get_wallet が必ず失敗し、BUYは全滅・SELLは
+        個別exceptで沈黙する事故になっていた（最終ブランチレビュー Important 3）。
+        live/dry_run/semi_live はこの分岐に入らず、従来通り client を使う。
         """
         mode = self.trading_conf.get("mode", "paper")
         if not tm.uses_morning_execution(mode) and not (
@@ -595,6 +611,7 @@ class TradingServices:
         if not pending:
             return
 
+        is_paper = mode == "paper"
         buy_signals = [s for s in pending if s.action == "BUY"]
         sell_signals = [s for s in pending if s.action == "SELL"]
         label = "後場" if skip_existing else "朝"
@@ -605,8 +622,15 @@ class TradingServices:
                 qty = _get_position_qty(sig.symbol)
                 if qty <= 0:
                     continue
-                board = self.client.get_board(sig.symbol)
-                price = board.get("CurrentPrice") or board.get("Buy1", {}).get("Price", 0)
+                if is_paper:
+                    # ペーパーモードはリアルタイム板が無いため直近日足の終値を使う
+                    # （stop_loss_check のpaper経路と同じ近似。kabuステーション
+                    # 接続の無い環境でも発注処理まで進める）
+                    df = load_ohlcv(sig.symbol)
+                    price = float(df["close"].iloc[-1]) if len(df) else 0
+                else:
+                    board = self.client.get_board(sig.symbol)
+                    price = board.get("CurrentPrice") or board.get("Buy1", {}).get("Price", 0)
                 if not price:
                     continue
                 self.order_mgr.sell(sig.symbol, float(price), qty,
@@ -633,17 +657,28 @@ class TradingServices:
         if TradingScheduler.is_near_close(near_close_min):
             logger.info(f"{label}買い見送り: 大引け{near_close_min}分前以降のため新規BUYを抑止")
             return
-        try:
-            wallet = self.client.get_wallet()
-            cash = float(wallet.get("StockAccountWallet", 0))
-        except Exception as e:
-            logger.error(f"余力取得失敗: {e}")
-            return
+        if is_paper:
+            # 固定額ではなく仮想ウォレット残高で発注サイズを決める
+            # （signal_scanのlegacy分岐と同じ関数。client.get_wallet()は呼ばない）
+            paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
+            cash = _paper_available_cash(paper_base)
+        else:
+            try:
+                wallet = self.client.get_wallet()
+                cash = float(wallet.get("StockAccountWallet", 0))
+            except Exception as e:
+                logger.error(f"余力取得失敗: {e}")
+                return
         sectors = watchlist_store.get_sectors()
         for sig in buy_signals:
             try:
-                board = self.client.get_board(sig.symbol)
-                price = board.get("CurrentPrice") or board.get("Sell1", {}).get("Price", 0)
+                if is_paper:
+                    df = load_ohlcv(sig.symbol)
+                    price = float(df["close"].iloc[-1]) if len(df) else 0
+                    board = None
+                else:
+                    board = self.client.get_board(sig.symbol)
+                    price = board.get("CurrentPrice") or board.get("Sell1", {}).get("Price", 0)
                 if not price:
                     continue
                 sector = sectors.get(sig.symbol, "")
@@ -652,11 +687,18 @@ class TradingServices:
                     logger.info(f"{label}買い見送り: {sig.symbol} - {reason}")
                     continue
                 ok_liq, liq_reason = liquidity.check_liquidity(
-                    sig.symbol, load_ohlcv(sig.symbol), self.liquidity_conf)
+                    sig.symbol, df if is_paper else load_ohlcv(sig.symbol),
+                    self.liquidity_conf)
                 if not ok_liq:
                     logger.info(f"{label}買い見送り: {liq_reason}")
                     continue
-                ok_sp, sp_reason = liquidity.check_spread(board, self.liquidity_conf)
+                if is_paper:
+                    # 板が無いのでスプレッド判定は行わない
+                    # （liquidity.check_spread のdocstring: ペーパー/バックテスト
+                    # では板が無いため使わない）
+                    ok_sp, sp_reason = True, ""
+                else:
+                    ok_sp, sp_reason = liquidity.check_spread(board, self.liquidity_conf)
                 if not ok_sp:
                     logger.info(f"{label}買い見送り: {sig.symbol} - {sp_reason}")
                     continue

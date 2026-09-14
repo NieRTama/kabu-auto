@@ -116,3 +116,35 @@ class TestSelectLatestSignals:
         with get_session() as session:
             result = main_module._select_latest_signals(session, max_age_days=5)
         assert len(result) == 1
+
+    def test_sell_wins_over_more_recent_buy(self, isolated_db):
+        """最終ブランチレビュー Important 4: 同日の損切りSELLが、より新しい
+        signal_scan由来のBUYで上書きされて消えてはいけない。
+
+        v2+paperでは、日中の stop_loss_check が保存したSELLの後に、同日16:20の
+        signal_scan が同一銘柄へBUYを生成することがある。dedupが単純に「生成時刻が
+        新しい方」を残すと、保有保護の退出（SELL）が消えて最低1営業日遅れる。
+        """
+        base = _batch_time(clock.now() - timedelta(days=3))
+        _add_signal("7203", "SELL", base)                       # 日中の損切り判定
+        _add_signal("7203", "BUY", base + timedelta(minutes=5))  # その後のsignal_scan
+
+        with get_session() as session:
+            result = main_module._select_latest_signals(session)
+        assert len(result) == 1
+        assert result[0].action == "SELL"
+
+    def test_sell_wins_over_more_recent_buy_among_other_symbols(self, isolated_db):
+        """他銘柄のdedup（最新1件を残す通常ルール）と共存すること"""
+        base = _batch_time(clock.now() - timedelta(days=3))
+        _add_signal("7203", "SELL", base)
+        _add_signal("7203", "BUY", base + timedelta(minutes=5))
+        _add_signal("6758", "BUY", base)
+        _add_signal("6758", "BUY", base + timedelta(minutes=5))  # 同銘柄同アクションは最新が残る
+
+        with get_session() as session:
+            result = main_module._select_latest_signals(session)
+        by_symbol = {s.symbol: s for s in result}
+        assert by_symbol["7203"].action == "SELL"
+        assert by_symbol["6758"].action == "BUY"
+        assert by_symbol["6758"].generated_at == base + timedelta(minutes=5)
