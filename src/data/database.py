@@ -138,6 +138,32 @@ class RunModelUsage(Base):
     __table_args__ = (Index("ix_run_model_usage_run_id", "run_id"),)
 
 
+class ModelPromotion(Base):
+    """モデルを現行へ昇格した記録。
+
+    自動昇格は行わない。**誰が・何を根拠に・なぜ切り替えたか**を残す
+    （spec §9）。学習が成功しただけで運用モデルが入れ替わる経路を無くす。
+    """
+    __tablename__ = "model_promotions"
+    id = Column(Integer, primary_key=True)
+    model_id = Column(String(64), nullable=False)
+    evaluation_run_id = Column(String(64))
+    decided_by = Column(String(64))
+    reason = Column(Text)
+    previous_model_id = Column(String(64))
+    # 参照の切替が完了したか。pending / committed / failed。
+    # 参照ファイルとDBは別の永続化先なので、片方だけが進んだ状態が
+    # 起こりうる。それを検出して決着できるように持つ（外部レビューR11）。
+    state = Column(String(16), default="committed")
+    # 実際に切り替わった時刻。pending / failed では None
+    switched_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_model_promotions_model_id", "model_id"),
+        Index("ix_model_promotions_state", "state"),
+    )
+
+
 class PredictionOutcome(Base):
     """イベントの実績。予測より後に確定するため別テーブルに持つ。
 
