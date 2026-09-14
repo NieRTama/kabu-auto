@@ -1,0 +1,231 @@
+"""モデルの保存と現行の管理。
+
+学習成功は**モデル更新ではなく候補の生成**である（spec §9）。現行の
+ml_model.py は週次再学習が成功するとその戻り値をそのまま self.model へ
+代入しており、成績に応じた合格判断がその経路に無かった（レビューF09）。
+
+実体はバージョン別の**不変ディレクトリ**へ保存し、現行を指す**小さな参照
+だけを原子的に更新する**。途中書き込みや学習失敗で現行版が失われず、
+前のモデルへ戻せる。
+
+保存形式は pickle を廃し **LightGBMネイティブ形式 + JSONメタ** にする。
+pickle は信頼できないデータのロードで任意コードを実行しうる経路であり、
+ハッシュ照合を足しても「モデルとメタを同時に置換できる相手」には効かない。
+
+**旧 pickle 経路（ml_model.MODEL_PATH）は触らない。** engine_version: legacy
+の受け皿として無改造で残す（spec §10）。
+"""
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import lightgbm as lgb
+import numpy as np
+from loguru import logger
+
+CURRENT_REF = "current.json"
+CANDIDATES_DIR = "candidates"
+MODEL_FILE = "model.txt"
+META_FILE = "meta.json"
+CONSTANT_FILE = "constant.json"
+
+# 保存形式。二値がそろったモデルと、単一クラス時の定数モデルを区別する
+# （定数モデルには Booster が存在しない・外部レビューR02）。
+KIND_BOOSTER = "lightgbm_booster"
+KIND_CONSTANT = "constant"
+
+
+@dataclass(frozen=True)
+class ModelMeta:
+    """モデルを再現・検証するための来歴。
+
+    特徴量定義（feature_cols）を持つのは、昇格時に現行と食い違っていないかを
+    検査するため。ラベル定義が変わったモデルを黙って現行にすると、
+    同じ数字が別の意味になる。
+    """
+    model_id: str
+    trained_at: datetime
+    training_window_sessions: Optional[int] = None
+    symbols: list = field(default_factory=list)
+    label_definition: str = ""
+    feature_cols: list = field(default_factory=list)
+    positive_rate: Optional[float] = None
+    fold_results: list = field(default_factory=list)
+    code_version: Optional[str] = None
+    lightgbm_version: Optional[str] = None
+    dataset_id: Optional[str] = None
+    # 保存形式。save_candidate() が書き込み時に確定させる
+    model_kind: str = KIND_BOOSTER
+    # ラベル契約ID（段階B後半 dataset.make_label_contract_id）。
+    # このモデルがどう作られたラベルで学習されたかを固定する
+    label_contract_id: Optional[str] = None
+
+
+def candidate_dir(model_id: str, base_dir: str = "models") -> Path:
+    return Path(base_dir) / CANDIDATES_DIR / model_id
+
+
+def current_ref_path(base_dir: str = "models") -> Path:
+    return Path(base_dir) / CURRENT_REF
+
+
+def _meta_to_json(meta: ModelMeta) -> str:
+    payload = asdict(meta)
+    payload["trained_at"] = meta.trained_at.isoformat()
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _meta_from_json(text: str) -> ModelMeta:
+    payload = json.loads(text)
+    payload["trained_at"] = datetime.fromisoformat(payload["trained_at"])
+    return ModelMeta(**payload)
+
+
+class CandidateExists(FileExistsError):
+    """同じ model_id の候補が既に存在する。"""
+
+
+def _extract_artifact(model) -> tuple:
+    """モデルから保存形式を取り出す。`(kind, payload)` を返す。
+
+    段階Cの `_LightGbmBase` 系ラッパーは `_model` と `predict_proba()` しか
+    持たず、`booster_` も `save_model()` も無い。`getattr(model, "booster_",
+    model).save_model(...)` のような書き方は AttributeError になり、
+    それを握り潰すと**保存できていないのに学習成功として扱われる**
+    （外部レビューR02）。保存できる形は次の3つだけと決め、
+    それ以外は**その場で例外にする**。
+
+      1. 段階Cのラッパー … `is_constant` / `constant_probability` / `booster`
+      2. scikit-learn API の LGBMClassifier … `booster_`
+      3. `lgb.Booster` そのもの
+
+    単一クラスしか見なかった定数モデルには Booster が存在しない。
+    「二値がそろったモデル」と「定数モデル」で保存方式を分ける。
+    """
+    if hasattr(model, "is_constant"):
+        if model.is_constant:
+            return KIND_CONSTANT, float(model.constant_probability)
+        booster = model.booster
+        if booster is None:
+            raise TypeError(
+                "is_constant=False なのに booster が None です: "
+                f"{type(model).__name__}")
+        return KIND_BOOSTER, booster
+    if hasattr(model, "booster_"):
+        return KIND_BOOSTER, model.booster_
+    if isinstance(model, lgb.Booster):
+        return KIND_BOOSTER, model
+    raise TypeError(
+        f"保存できないモデル型です: {type(model).__name__}。"
+        "is_constant/constant_probability/booster を公開するか、"
+        "booster_ を持つか、lgb.Booster であること")
+
+
+def save_candidate(model, meta: ModelMeta, *, base_dir: str = "models") -> Path:
+    """学習結果を**候補として**保存する。現行は一切触らない。
+
+    **既存の model_id へは書かない。** 候補ディレクトリは不変である。
+    `exist_ok=True` で受け入れて中身を上書きすると、その ID を current や
+    rollback 先が指していた場合に**昇格操作なしで実体が入れ替わる**
+    （外部レビューR12）。同じIDでの再保存は `CandidateExists` にする。
+
+    **全成果物を一時ディレクトリへ書き、読み直して検証してから公開する。**
+    モデルを書いた後にメタの保存が失敗すると、中途半端なディレクトリが
+    残って「保存済みだが読めない候補」になる。公開は `os.replace()` に
+    よるディレクトリの原子的な差し替えで行う。
+    """
+    final = candidate_dir(meta.model_id, base_dir)
+    if final.exists():
+        raise CandidateExists(
+            f"この model_id の候補は既に存在します: {meta.model_id}。"
+            "候補は不変です。学習し直したなら新しいIDを付けてください")
+
+    final.parent.mkdir(parents=True, exist_ok=True)
+    kind, payload = _extract_artifact(model)
+
+    staging = Path(tempfile.mkdtemp(prefix=f".{meta.model_id}.", dir=str(final.parent)))
+    try:
+        if kind == KIND_BOOSTER:
+            payload.save_model(str(staging / MODEL_FILE))
+        else:
+            (staging / CONSTANT_FILE).write_text(
+                json.dumps({"probability": payload}), encoding="utf-8")
+        stored = replace(meta, model_kind=kind)
+        (staging / META_FILE).write_text(_meta_to_json(stored), encoding="utf-8")
+
+        # 公開前に読み直して、実際に復元できることを確かめる
+        _load_from_dir(staging)
+
+        os.replace(str(staging), str(final))
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    logger.info(f"候補モデルを保存: {meta.model_id} → {final}（{kind}）")
+    return final
+
+
+def read_meta(model_id: str, *, base_dir: str = "models") -> ModelMeta:
+    path = candidate_dir(model_id, base_dir) / META_FILE
+    if not path.exists():
+        raise FileNotFoundError(f"メタが見つかりません: {path}")
+    return _meta_from_json(path.read_text(encoding="utf-8"))
+
+
+class ConstantModel:
+    """単一クラスしか見なかった学習の結果。常に同じ確率を返す。
+
+    Booster が存在しないので、読み出し側が `predict()` を一様に呼べるよう
+    最小の互換型を置く。`lgb.Booster.predict()` と同じく、正例確率の
+    1次元配列を返す（外部レビューR02）。
+    """
+
+    def __init__(self, probability: float):
+        self.probability = float(probability)
+
+    def predict(self, X, **kwargs):
+        return np.full(len(X), self.probability, dtype=float)
+
+
+def _load_from_dir(path: Path) -> tuple:
+    """ディレクトリから (モデル, ModelMeta) を復元する。
+
+    保存直後の検証にも使うので、`candidate_dir()` ではなく実パスを取る。
+    """
+    meta = _meta_from_json((path / META_FILE).read_text(encoding="utf-8"))
+    if meta.model_kind == KIND_CONSTANT:
+        payload = json.loads((path / CONSTANT_FILE).read_text(encoding="utf-8"))
+        return ConstantModel(payload["probability"]), meta
+    model_path = path / MODEL_FILE
+    if not model_path.exists():
+        raise FileNotFoundError(f"モデルが見つかりません: {model_path}")
+    return lgb.Booster(model_file=str(model_path)), meta
+
+
+def load_model(model_id: str, *, base_dir: str = "models") -> tuple:
+    """候補モデルを読み込む。(モデル, ModelMeta) を返す。
+
+    モデルは `lgb.Booster` か `ConstantModel`。どちらも
+    `predict(X) -> 正例確率の1次元配列` を持つ（scikit-learn APIの
+    `predict_proba()[:, 1]` と同じ値）。読み出し側は型で分岐しない。
+    """
+    path = candidate_dir(model_id, base_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"候補が見つかりません: {path}")
+    return _load_from_dir(path)
+
+
+def set_current(model_id: str, *, base_dir: str = "models") -> None:
+    """指定モデルIDを現行として参照を更新する。
+
+    current.json に model_id を記録し、次回のロード時に参照できるようにする。
+    複数モデルの昇格・ロールバック対応が次フェーズ（Task 3）。
+    """
+    ref = current_ref_path(base_dir)
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text(json.dumps({"model_id": model_id}), encoding="utf-8")
