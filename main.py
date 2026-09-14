@@ -209,6 +209,7 @@ def main() -> None:
             dash_port=dash_conf.get("port", 8080),
             # 休場日は未ログインが通常なので疎通は見ない（設定ミスの検査は続ける）
             skip_api=is_closed_today,
+            runtime=cfg.get_section("runtime"),
         )
         preflight.log_results(result)
         if not result["ok"] and tm.places_real_orders(mode):
@@ -267,7 +268,7 @@ def main() -> None:
         )
 
     def broker_full_login_job():
-        """スケジューラから呼ばれる完全自動ログインジョブ（平日06:45）。
+        """スケジューラから呼ばれる完全自動ログインジョブ（平日08:30）。
 
         broker_full_login_enabled が false の間は何もしない（段階導入のフラグ）。
         休場日は認証が切れていても異常ではないため実行しない

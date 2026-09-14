@@ -184,13 +184,24 @@ runtime:
   # WSL2/Docker側 ~/projects/kabusapi-auto-login-template に導入済み）を使って
   # Kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化できるように
   # した。false の間は broker_full_login は一切動かず、従来通り人がログインする。
-  # 段階導入のため既定は false。実運用で安全性を確認してから true にする。
-  broker_full_login_enabled: false
+  #
+  # ログイン処理を自動化する方針はユーザーの明示指示により確定（2026-09-13）。
+  # 導入計画（docs/superpowers/plans/2026-09-11-broker-full-login-integration.md
+  # 末尾「実装後、ユーザー立ち会いで行うこと」）が定める前提3点のうち、
+  # 「kabu-auto本体を起動するタスクスケジューラのタスクが『ログオン時のみ実行
+  # （対話セッションあり）』になっていること」は、2026-09-13時点で
+  # `schtasks /query /tn "\kabu\kabu-auto" /xml` で確認した実測値では
+  # `LogonType: S4U`（ログオン有無に関わらず実行）であり、まだ満たしていない
+  # ——WSL側 `run_login_only.sh` の2段階認証入力は対話デスクトップを必要とするため、
+  # このままだと自動ログイン自体が失敗する可能性がある。方針決定を覆すものでは
+  # ないため有効化はそのまま維持するが、実運用でログイン失敗が続く場合は
+  # まずこのタスクスケジューラ設定（LogonTypeをInteractiveへ）を疑うこと。
+  broker_full_login_enabled: true
   # WSL側スクリプトのタイムアウト秒数。ハングしても親プロセス(kabu-auto本体)を
   # 巻き込まない。
   broker_full_login_timeout_seconds: 180
   # 1日の完全自動ログイン試行上限。broker起動と同じ考え方で、無意味な
-  # リトライの暴走を防ぐ。**自動実行(平日06:45)にだけ効く**。Discordの
+  # リトライの暴走を防ぐ。**自動実行(平日08:30)にだけ効く**。Discordの
   # full_login（人の明示操作）は上限で止めない。
   broker_full_login_max_attempts_per_day: 3
 

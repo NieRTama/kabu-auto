@@ -1,8 +1,8 @@
 """
 APSchedulerによるジョブスケジューラ
-- 毎朝6:45: kabuステーション完全自動ログイン（broker_full_login_enabled=trueのときのみ実働）
 - 毎朝8:25: 日次リスクカウンタリセット
-- 毎朝8:30: APIトークン更新
+- 毎朝8:30: kabuステーション完全自動ログイン（broker_full_login_enabled=trueのときのみ実働）
+- 毎朝8:35: APIトークン更新（完全自動ログインの完了を待つため8:30より後ろに設定）
 - 毎日16:00: データ更新
 - 毎日16:20: シグナルスキャン（data_updateの完了を待つため16:00より後ろに設定）
 - 毎日17:00: DBバックアップ
@@ -34,34 +34,43 @@ class TradingScheduler:
     def start(self) -> None:
         cb = self._registered_callbacks
 
-        if "broker_full_login" in cb:
-            # Kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化する
-            # （2026-09-11、broker_full_login.py参照。従来「認証は自動化しない」
-            # 方針だったが、Gmail API経由のワンタイムパスワード自動入力へ転換した）。
-            # 平日06:45（risk_reset(8:25)より前）に実行する。完了後の接続確認は
-            # 通常08:30のtoken_refreshの成否がそのまま担う（06:45時点ではauth_recovery.
-            # attempt_recovery()が前提とするis_expired()がまだtrueでないことが多い）。
-            # auth_recovery_check（5分間隔）は、既にexpired扱いだった場合の安全網。
-            # wait_for_broker_minutesは起動時の一度きりの待機にしか効かず、
-            # この時点では対象外。
-            self._scheduler.add_job(
-                cb["broker_full_login"], "cron",
-                day_of_week="mon-fri", hour=6, minute=45, id="broker_full_login",
-            )
         if "risk_reset" in cb:
             # 取引開始前に日次カウンタ（注文数・損失額）をリセットする
             self._scheduler.add_job(
                 cb["risk_reset"], "cron",
                 day_of_week="mon-fri", hour=8, minute=25, id="risk_reset",
             )
+        if "broker_full_login" in cb:
+            # Kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化する
+            # （2026-09-11、broker_full_login.py参照。従来「認証は自動化しない」
+            # 方針だったが、Gmail API経由のワンタイムパスワード自動入力へ転換した）。
+            # 平日08:30に実行する（2026-09-13、6:45から変更）。
+            # **token_refresh（下記）はこれより後ろの時刻にすること**——本ジョブは
+            # WSL側スクリプトの完了まで最大 broker_full_login_timeout_seconds 秒
+            # （既定180秒）ブロックする同期呼び出しのため、token_refreshを同時刻や
+            # 直後に置くと、KabuS.exeがまだkillされて再起動している最中にAPIを
+            # 叩いてしまい、実際にはログイン処理が進行中であるにもかかわらず
+            # 「🔴再ログインが必要です」を誤発報する。
+            # auth_recovery_check（5分間隔）は、既にexpired扱いだった場合の安全網。
+            # wait_for_broker_minutesは起動時の一度きりの待機にしか効かず、
+            # この時点では対象外。
+            self._scheduler.add_job(
+                cb["broker_full_login"], "cron",
+                day_of_week="mon-fri", hour=8, minute=30, id="broker_full_login",
+            )
         if "token_refresh" in cb:
             # 休場日はトークンを取る必要が無く、取れなくても異常ではない。
             # 曜日指定が無いと土日祝にも走り、🔴「再ログインが必要です」を誤発報する
             # （2026-09-05 土曜に実際に発生）。祝日は cron では表せないため
             # 実装側の is_holiday でも弾く（二重の守り。heartbeat と同じ形）。
+            #
+            # 08:35（完全自動ログイン08:30より後ろ）に実行する。broker_full_login
+            # は最大180秒（既定）ブロックする同期呼び出しのため、5分の余裕を
+            # 置いて完了を待ってから叩く（2026-09-13、8:30から変更。broker_full_login
+            # が無効（既定）のときはこの余裕分の意味は無いが、害も無い）。
             self._scheduler.add_job(
                 cb["token_refresh"], "cron",
-                day_of_week="mon-fri", hour=8, minute=30, id="token_refresh",
+                day_of_week="mon-fri", hour=8, minute=35, id="token_refresh",
             )
         if "data_update" in cb:
             self._scheduler.add_job(
@@ -104,7 +113,7 @@ class TradingScheduler:
                 hour=9, minute=5, id="morning_execution",
             )
         if "heartbeat" in cb:
-            # 平日8:45（場前・トークン更新8:30の後）に「稼働中です」を通知する。
+            # 平日8:45（場前・トークン更新8:35の後）に「稼働中です」を通知する。
             # 異常検知はプロセスが生きている前提なので、落ちていれば通知も来ない。
             # 能動的な生存信号があると「通知が来ないこと自体」を異常として扱える
             # （2026-08-26/27 は通知なしを正常と誤認し2営業日気づけなかった）。

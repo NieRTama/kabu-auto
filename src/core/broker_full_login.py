@@ -26,12 +26,13 @@ kabu-auto は従来、Kabuステーションの起動のみを自動化し、2�
 日次試行回数上限を持つ。
 """
 import subprocess
-import threading
 import time
 from datetime import date
 from typing import Optional
 
 from loguru import logger
+
+from src.core import broker_process_lock
 
 DEFAULT_WSL_DISTRO = "Ubuntu"
 DEFAULT_PROJECT_DIR = "~/projects/kabusapi-auto-login-template"
@@ -44,15 +45,18 @@ DEFAULT_MAX_ATTEMPTS_PER_DAY = 3
 # 走ると起動直後のプロセスをまた落とすことになる）。
 RERUN_COOLDOWN_SECONDS = 60
 
-_lock = threading.Lock()
+# KabuS.exe の起動・再起動を行う全モジュールで共有するロック（broker_process_lock.py 参照）。
+# 別々のロックを持つと、broker_launcher.py の生存監視自動起動と同時に有効化した際
+# 互いを知らずに二重起動しうる（2026-09-13 に発見）。
+#
+# クールダウン起点（直近の操作完了時刻）と実行中フラグも broker_process_lock.py の
+# ものを使う。ロックだけ共有してもこれらがモジュールごとに別々のままだと、
+# broker_full_login.run() が subprocess.run() 実行中にロックを手放す間隙で
+# broker_launcher.launch() が「自分は実行中でない」と誤判定して二重起動できて
+# しまうことが再現テストで判明したため（2026-09-13）。
+_lock = broker_process_lock.lock
 _attempts: int = 0
 _attempts_date: Optional[date] = None
-_last_run_at: float = -float('inf')
-# 実行中フラグ。クールダウン（経過時間ベース）とは別に、subprocess.run() の
-# 実行中は無条件で二重実行を拒否する（タイムアウト上限が180秒＝クールダウンの
-# 60秒を大きく上回るため、経過時間だけのガードでは実行中の60〜180秒の間に
-# 到着した呼び出しをすり抜けさせてしまう）。
-_running: bool = False
 
 
 def _today() -> date:
@@ -67,12 +71,11 @@ def _now() -> float:
 
 def reset() -> None:
     """テスト用に試行回数とクールダウンを初期化する。"""
-    global _attempts, _attempts_date, _last_run_at, _running
+    global _attempts, _attempts_date
     with _lock:
         _attempts = 0
         _attempts_date = None
-        _last_run_at = -float('inf')
-        _running = False
+    broker_process_lock.reset()
 
 
 def attempts_today() -> int:
@@ -112,33 +115,39 @@ def run(*, manual: bool = False,
     経路が数分止まるのは取引システムとして安全上望ましくない）。
 
     二重実行の防止は「経過時間ベースのクールダウン（60秒）」と
-    「実行中フラグ（`_running`）」の2段構え。クールダウンだけでは、
-    タイムアウト上限（既定180秒）がクールダウン秒数を超えるため、実行中の
-    60〜180秒の間に到着した呼び出しが素通りしてしまう（`elapsed` が
-    `RERUN_COOLDOWN_SECONDS` を超えるため）。`_running` は経過時間に関係なく
+    「実行中フラグ（`broker_process_lock.in_progress`）」の2段構え。クールダウン
+    だけでは、タイムアウト上限（既定180秒）がクールダウン秒数を超えるため、
+    実行中の60〜180秒の間に到着した呼び出しが素通りしてしまう（`elapsed` が
+    `RERUN_COOLDOWN_SECONDS` を超えるため）。実行中フラグは経過時間に関係なく
     「今まさに1本実行中かどうか」だけを見るので、この隙間を塞ぐ。
+
+    クールダウン起点・実行中フラグは broker_launcher.py と共有する
+    （broker_process_lock.py 参照）。モジュールごとに別々の状態を持つと、
+    このモジュールが subprocess.run() 実行中にロックを手放す間隙で
+    broker_launcher.launch() が「自分は実行中でない」と誤判定し、同じ
+    KabuS.exe を二重に起動/再起動できてしまう（2026-09-13、再現テストで確認）。
 
     注意: WSLコマンドは wsl_distro/project_dir/script_path を f-string で
     シェルエスケープ無しに埋め込んでいる。現状 main.py は既定値以外を渡さない
     ため安全だが、将来これらを設定ファイル等の外部入力で差し替え可能にする場合は
     埋め込み前に shlex.quote() を通すこと。
     """
-    global _attempts, _last_run_at, _running
+    global _attempts
 
     with _lock:
         now = _now()
-        elapsed = now - _last_run_at
+        elapsed = now - broker_process_lock.last_operation_at
         if elapsed < RERUN_COOLDOWN_SECONDS:
             return False, (
                 f"直前に実行しています（{int(elapsed)}秒前）。"
                 f"{RERUN_COOLDOWN_SECONDS}秒は再実行しません"
             )
-        if _running:
+        if broker_process_lock.in_progress:
             # クールダウン（経過時間）だけでは、タイムアウト上限（既定180秒）が
             # クールダウン秒数（60秒）を超えるため、実行中の60〜180秒の間に
             # 到着した呼び出しがこの上のチェックを素通りしてしまう。経過時間に
             # 関係なく「実行中は無条件で拒否する」ことでその隙間を塞ぐ。
-            return False, "既に実行中です。完了までお待ちください"
+            return False, "既に起動/再起動の操作が進行中です。完了までお待ちください"
 
         _roll_over_if_new_day()
         if manual:
@@ -156,8 +165,8 @@ def run(*, manual: bool = False,
         # ガードを兼ねる（ロック解放直後に別呼び出しが来ても、この時刻で
         # クールダウンに掛かり subprocess を二重に走らせない）。完了後に
         # 実際の完了時刻で上書きする（cooldownは完了時刻basisにするため）。
-        _last_run_at = now
-        _running = True
+        broker_process_lock.last_operation_at = now
+        broker_process_lock.in_progress = True
 
     command = [
         "wsl", "-d", wsl_distro, "--", "bash", "-lc",
@@ -169,8 +178,8 @@ def run(*, manual: bool = False,
         )
     except subprocess.TimeoutExpired:
         with _lock:
-            _last_run_at = _now()
-            _running = False
+            broker_process_lock.last_operation_at = _now()
+            broker_process_lock.in_progress = False
         logger.error(f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）")
         return False, (
             f"完全自動ログインがタイムアウトしました（{timeout_seconds}秒）。"
@@ -179,14 +188,14 @@ def run(*, manual: bool = False,
         )
     except Exception as e:
         with _lock:
-            _last_run_at = _now()
-            _running = False
+            broker_process_lock.last_operation_at = _now()
+            broker_process_lock.in_progress = False
         logger.error(f"完全自動ログインの実行に失敗しました: {e}")
         return False, f"実行に失敗しました: {e}"
 
     with _lock:
-        _last_run_at = _now()
-        _running = False
+        broker_process_lock.last_operation_at = _now()
+        broker_process_lock.in_progress = False
 
     if result.returncode != 0:
         # WSL側スクリプトは set -e のため、docker compose up --build 等の

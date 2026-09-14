@@ -334,7 +334,7 @@ class TestRunningFlagBlocksOverlapPastCooldownWindow:
             th.join(timeout=5)
 
         assert ok2 is False
-        assert "実行中" in detail2
+        assert "進行中" in detail2
         assert mock_run.call_count == 1, (
             f"subprocess.run が{mock_run.call_count}回実行された"
             "（実行中フラグが二重実行を防げていない）"
@@ -354,8 +354,8 @@ class TestSchedulerWiring:
         call = calls["broker_full_login"]
         assert call.args[1] == "cron"
         assert call.kwargs.get("day_of_week") == "mon-fri"
-        assert call.kwargs.get("hour") == 6
-        assert call.kwargs.get("minute") == 45
+        assert call.kwargs.get("hour") == 8
+        assert call.kwargs.get("minute") == 30
 
     def test_omitted_when_not_registered(self):
         sched = scheduler_mod.TradingScheduler()
