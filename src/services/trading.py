@@ -34,8 +34,9 @@ from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 
 
 def _select_latest_signals(session, max_age_days: int = 5) -> list:
-    """直近のBUYバッチ（signal_scanの日付）のBUYシグナルと、max_age_days以内の
-    SELLシグナルをあわせて、銘柄ごと1件にdedupして返す。
+    """直近のBUYバッチ（signal_scanの日付）のBUYシグナルと、そのバッチ日以降
+    （BUYバッチが無ければmax_age_days以内）のSELLシグナルをあわせて、銘柄ごと
+    1件にdedupして返す。
 
     「now - 20時間」のような固定時間窓では、土日・祝日を挟むと前営業日（例: 金曜16:20）の
     シグナルを月曜9:05の発注時に取りこぼす（20時間を超えるため）。そのため「最新のBUY
@@ -49,13 +50,22 @@ def _select_latest_signals(session, max_age_days: int = 5) -> list:
     signal_scanバッチ（本来9:05のmorning_executionが拾うべきBUY群）が丸ごと
     対象外になってしまう。これを避けるため、
     - BUYは「最新のBUY生成日（＝直近のsignal_scanバッチ日）」の分だけを対象にし、
-    - SELLは生成日に関わらずmax_age_days以内であれば常に対象にする
-    （既に約定済み・保有が無くなった銘柄のSELLは呼び出し側の
-    `_get_position_qty() <= 0` チェックで自然に無視されるため、古いSELLを
-    拾っても実害は無い）。
+    - SELLは「有効なBUYバッチがあればそのバッチ日の00:00以降」、
+      「BUYバッチが無い・陳腐化している場合はmax_age_days以内」を対象にする
+      （最終ブランチレビュー 新規Important D）。
+      SELLの対象範囲をBUYと無関係にmax_age_days全体まで広げると、`Signal`表に
+      消費済みを表す列が無いため、数日前に約定済みで役目を終えた古いSELL行が
+      dedupで「SELLは生成時刻に関わらずBUYより優先」（Important 4）のルールに
+      乗ってしまい、その後に生成された新しいBUYを毎回上書きして消してしまう
+      （＝ある銘柄で損切りが1度発火すると、以降max_age_days日ぶんその銘柄への
+      新規BUYが無音で潰れる）。下限をBUYバッチ日に揃えることで、BUYバッチより
+      前の古いSELLを拾わないようにする。まだ退出が必要な状況（何日も約定できずに
+      残っている等）は、stop_loss_checkが5分毎に新しいSELLを保存し直すため、
+      直近のBUYバッチ日以降に収まり取りこぼさない。
     - ただしBUY自体もmax_age_daysより古ければ対象外にする（他銘柄の新しい
     SELLがあるからといって、signal_scanが止まって何日も経った古いBUY
-    バッチを蘇らせて発注してしまわないようにするため）。
+    バッチを蘇らせて発注してしまわないようにするため）。この場合SELLの
+    下限もmax_age_days窓へフォールバックする。
 
     dedupは**生成時刻ではなくSELLを優先**する。日中の stop_loss_check が保存した
     SELL（保有保護の退出）を、同日16:20の signal_scan が生成したより新しいBUYで
@@ -93,12 +103,19 @@ def _select_latest_signals(session, max_age_days: int = 5) -> list:
             .order_by(Signal.generated_at.desc())
         ).all())
 
-    age_cutoff = clock.now() - timedelta(days=max_age_days)
+    sell_floor = clock.now() - timedelta(days=max_age_days)
+    if buy_latest_at is not None:
+        # 有効なBUYバッチがある場合、SELLの下限をmax_age_days全体ではなく
+        # そのバッチ日の00:00に引き上げる（新規Important D）。BUYバッチより
+        # 古いSELLは既に約定済みで役目を終えている可能性が高く、それを拾うと
+        # dedupで新しいBUYを消してしまう退行になる。
+        buy_day_start = datetime.combine(buy_latest_at.date(), datetime.min.time())
+        sell_floor = buy_day_start
     signals.extend(session.scalars(
         select(Signal)
         .where(
             Signal.action == "SELL",
-            Signal.generated_at >= age_cutoff,
+            Signal.generated_at >= sell_floor,
         )
         .order_by(Signal.generated_at.desc())
     ).all())

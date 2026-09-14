@@ -173,6 +173,30 @@ class TestSelectLatestSignals:
         assert len(result) == 1
         assert result[0].action == "SELL"
 
+    def test_old_sell_before_buy_batch_does_not_hide_newer_buy(self, isolated_db):
+        """新規Important D: 数日前に約定済みで役目を終えたSELLが、その後生成された
+        新しいBUYバッチをdedupで上書きして消してはいけない（X1）。
+
+        修正前（新規Important C是正直後）はSELLの対象範囲がmax_age_days全体
+        だったため、4日前に保存されたSELL(7203)（当時実際に約定し保有0になった
+        想定）が、前営業日16:20のBUYバッチに含まれる7203のBUYを毎回上書きして
+        消していた。SELLの下限をBUYバッチ日の00:00に引き上げることで、
+        BUYバッチより前の古いSELLは対象外になり、両銘柄ともBUYのまま残ること
+        を確認する。
+        """
+        _add_signal("7203", "SELL", clock.now() - timedelta(days=4))
+
+        yesterday_batch = _batch_time(clock.now() - timedelta(days=1))
+        _add_signal("7203", "BUY", yesterday_batch)
+        _add_signal("6758", "BUY", yesterday_batch)
+
+        with get_session() as session:
+            result = main_module._select_latest_signals(session)
+        by_symbol = {s.symbol: s for s in result}
+        assert by_symbol.keys() == {"7203", "6758"}
+        assert by_symbol["7203"].action == "BUY"
+        assert by_symbol["6758"].action == "BUY"
+
     def test_sell_wins_over_more_recent_buy_among_other_symbols(self, isolated_db):
         """他銘柄のdedup（最新1件を残す通常ルール）と共存すること"""
         base = _batch_time(clock.now() - timedelta(days=3))

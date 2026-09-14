@@ -468,6 +468,39 @@ class TestSectorConcentrationRefillAtFillTime:
         assert row["cash"] == pytest.approx(490_000.0)
         assert row["n_holdings"] == 2
 
+    def test_shrinks_to_zero_shares_leaves_exactly_one_non_empty_rejection(self):
+        """新規Minor E: 0株まで縮むケースでも却下理由が1件・非空になること。
+
+        再レビュー §2.3 のグリッド探索（12通り）で確認された効果を固定する。
+        L1（jump_open=200, sector_ratio=0.55）は1,100株までの部分縮小で
+        止まるため、ここでは寄りの急騰をさらに大きくし（4倍）、
+        max_sector_ratio=0.6 と組み合わせて単元未満（0株）まで縮む
+        ケースを作る。縮小ループ直後の分岐が「0株→0株」という空理由の
+        行を出さず、縮小前の超過理由をまとめた1行だけを残すことを検証する。
+        """
+        md = self._market(jump_open=400.0, jump_close=100.0)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 10),
+            initial_capital=1_000_000.0, decide=self._decide_a_then_b(),
+            policy_conf=_policy_conf(max_holding=20), costs=_costs(),
+            sizing=_sizing(ratio=0.3, sector_ratio=0.6),
+            liquidity=execution.LiquidityConfig())
+
+        fill_day = date(2026, 1, 7)
+        rejected_today = res.rejected[res.rejected["session"] == fill_day]
+
+        # 却下行は1件だけ（Bの分。0株→0株という空理由の行が別途出ない）
+        assert len(rejected_today) == 1
+        reason = rejected_today.iloc[0]["reason"]
+        assert reason != ""
+        assert "セクター集中率" in reason
+        assert "0株" in reason
+
+        # Bは1株も約定せず、現金・保有数はAのみの状態のまま
+        row = res.daily[res.daily["session"] == fill_day].iloc[0]
+        assert row["cash"] == pytest.approx(700_000.0)
+        assert row["n_holdings"] == 1
+
     def test_without_the_refill_check_the_breach_would_go_uncaught(self):
         """回帰確認: allocate()時点（前日終値）のセクター比率チェックだけでは
         このシナリオの超過を検出できない（=約定時点の引き直しが必須である証拠）。
