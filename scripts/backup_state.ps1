@@ -1,19 +1,26 @@
 ﻿# === kabu-auto 状態バックアップ ===
-# 目的: GitHub に存在しない「ローカル生成物・運用状態・機密」をまとめて ZIP 化し、OneDrive へ退避する。
+# 目的: GitHub に存在しない「ローカル生成物・運用状態・機密」をまとめて ZIP 化し、OneDrive・Google Drive の
+#       2箇所へ退避する（二重化。2026-09-09追加。片方のクラウドが障害・容量超過・アカウント問題で
+#       復元できなくても、もう一方から復旧できるようにするため）。
 #       端末が故障しても、GitHub のコード + この ZIP の2つで復元できる状態を保つ。
 # 原則: 稼働中の本体プロセス(python main.py / 8080)には一切触れない。DB は読み取り専用で開き、
 #       SQLite オンラインバックアップAPI で整合スナップショットを取る（WAL 未反映分も含まれる）。
 # 注意: 既定では .env と data/auth.json（＝証券APIパスワード等の機密）を含む。
-#       機密を除いた ZIP が欲しい場合は -NoSecrets を付ける。
+#       機密を除いた ZIP が欲しい場合は -NoSecrets を付ける（両方の退避先に適用される）。
 
 [CmdletBinding()]
 param(
-    # 退避先。既定は OneDrive の kabu-auto フォルダ。
+    # 退避先①（本線）。既定は OneDrive の kabu-auto フォルダ。
     [string]$Dest = (Join-Path $env:USERPROFILE 'OneDrive\kabu-auto'),
-    # 退避先に残す世代数（古いものから削除）。
+    # 退避先②（二重化）。既定は Google Drive の kabu-auto フォルダ。
+    # Google Drive アプリ未インストール・Gドライブ未マウントの環境では自動でスキップする（警告のみ）。
+    [string]$Dest2 = 'G:\マイドライブ\kabu-auto',
+    # 退避先に残す世代数（古いものから削除）。Dest・Dest2 の両方に同じ世代数を適用する。
     [int]$Keep = 7,
-    # 指定すると .env / data/auth.json を含めない。
-    [switch]$NoSecrets
+    # 指定すると .env / data/auth.json を含めない（Dest・Dest2 の両方に適用される）。
+    [switch]$NoSecrets,
+    # 指定すると Dest2（二重化先）への複製をスキップする。
+    [switch]$SkipDest2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,9 +39,14 @@ function Write-Utf8File([string]$Path, [string]$Text) {
 if ($NoSecrets) { $secretLabel = '除外 (-NoSecrets)' } else { $secretLabel = '含める (.env / data/auth.json)' }
 
 Write-Host '=== kabu-auto 状態バックアップ ===' -ForegroundColor Cyan
-Write-Host "リポジトリ : $repo"
-Write-Host "退避先     : $Dest"
-Write-Host "機密の扱い : $secretLabel"
+Write-Host "リポジトリ   : $repo"
+Write-Host "退避先①    : $Dest"
+if ($SkipDest2) {
+    Write-Host "退避先②    : (スキップ -SkipDest2)"
+} else {
+    Write-Host "退避先②    : $Dest2"
+}
+Write-Host "機密の扱い   : $secretLabel"
 
 if (-not (Test-Path $Dest)) { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
 
@@ -269,37 +281,83 @@ if ($dbEntry.Length -ne (Get-Item $dbDst).Length) {
     throw "ZIP 内の DB サイズがスナップショットと一致しません: $($dbEntry.Length) != $((Get-Item $dbDst).Length)"
 }
 
-# 退避先へコピー（直前に存在確認。同期クライアントが消していたら作り直す）
+# 退避先①（本線）へコピー（直前に存在確認。同期クライアントが消していたら作り直す）
 if (-not (Test-Path $Dest)) { New-Item -ItemType Directory -Path $Dest -Force | Out-Null }
 Copy-Item $zipTmp $zipPath -Force
-if (-not (Test-Path $zipPath)) { throw "退避先へのコピーに失敗しました: $zipPath" }
+if (-not (Test-Path $zipPath)) { throw "退避先①へのコピーに失敗しました: $zipPath" }
 if ((Get-Item $zipPath).Length -ne (Get-Item $zipTmp).Length) {
-    throw "退避先のファイルサイズが一致しません: $zipPath"
+    throw "退避先①のファイルサイズが一致しません: $zipPath"
 }
 
 $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
-Write-Host "      $zipPath"
-Write-Host "      エントリ $entryCount 件 / $zipSize MB / DB同梱 OK"
+Write-Host "      [1] $zipPath"
+Write-Host "          エントリ $entryCount 件 / $zipSize MB / DB同梱 OK"
+
+# 退避先②（二重化）へコピー。片方のクラウドの障害・容量超過・アカウント問題だけで
+# 復元不能にならないための保険。Gドライブが無い環境（Google Driveアプリ未導入・
+# 他端末等）では二重化そのものが成立しないため、警告のみで処理を継続する
+# （本線のOneDrive側は既に成功しているため、ここで止める理由が無い）。
+$zipPath2 = $null
+if ($SkipDest2) {
+    Write-Host '      [2] スキップ (-SkipDest2)' -ForegroundColor DarkGray
+} else {
+    $driveRoot2 = [System.IO.Path]::GetPathRoot($Dest2)
+    if (-not (Test-Path $driveRoot2)) {
+        Write-Host "      [2] スキップ: 退避先②のドライブが見つかりません ($driveRoot2 未マウント)" -ForegroundColor Yellow
+    } else {
+        try {
+            if (-not (Test-Path $Dest2)) { New-Item -ItemType Directory -Path $Dest2 -Force | Out-Null }
+            $zipPath2 = Join-Path $Dest2 "kabu-auto-state_$stamp.zip"
+            Copy-Item $zipTmp $zipPath2 -Force
+            if (-not (Test-Path $zipPath2)) { throw "退避先②へのコピーに失敗しました: $zipPath2" }
+            if ((Get-Item $zipPath2).Length -ne (Get-Item $zipTmp).Length) {
+                throw "退避先②のファイルサイズが一致しません: $zipPath2"
+            }
+            Write-Host "      [2] $zipPath2"
+            Write-Host "          エントリ $entryCount 件 / $zipSize MB / DB同梱 OK"
+        } catch {
+            # 二重化先の失敗で本線のバックアップ自体を失敗扱いにしない（fail-open）。
+            Write-Host "      [2] 失敗（本線のバックアップは成功済みのため継続）: $($_.Exception.Message)" -ForegroundColor Yellow
+            $zipPath2 = $null
+        }
+    }
+}
 
 Remove-Item $zipTmp -Force
 Remove-Item $staging -Recurse -Force
 
 # ------------------------------------------------------------------
-# 6. 世代管理（このスクリプトが作った ZIP のみを対象に削除）
+# 6. 世代管理（このスクリプトが作った ZIP のみを対象に削除。退避先①②の両方に適用）
 # ------------------------------------------------------------------
 Write-Host ''
 Write-Host "[6/6] 古い世代を整理中（$Keep 世代を保持）..." -ForegroundColor Yellow
 $olds = Get-ChildItem $Dest -Filter 'kabu-auto-state_*.zip' | Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep
 foreach ($o in $olds) {
     Remove-Item $o.FullName -Force
-    Write-Host "      削除: $($o.Name)" -ForegroundColor DarkGray
+    Write-Host "      削除[1]: $($o.Name)" -ForegroundColor DarkGray
+}
+if ((-not $SkipDest2) -and (Test-Path $Dest2)) {
+    $olds2 = Get-ChildItem $Dest2 -Filter 'kabu-auto-state_*.zip' | Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep
+    foreach ($o in $olds2) {
+        Remove-Item $o.FullName -Force
+        Write-Host "      削除[2]: $($o.Name)" -ForegroundColor DarkGray
+    }
 }
 $remain = (Get-ChildItem $Dest -Filter 'kabu-auto-state_*.zip').Count
-Write-Host "      保持中の世代: $remain"
+Write-Host "      保持中の世代[1]: $remain"
+if ((-not $SkipDest2) -and (Test-Path $Dest2)) {
+    $remain2 = (Get-ChildItem $Dest2 -Filter 'kabu-auto-state_*.zip').Count
+    Write-Host "      保持中の世代[2]: $remain2"
+}
 
 Write-Host ''
 Write-Host '完了。' -ForegroundColor Green
-Write-Host "  $zipPath"
+Write-Host "  [1] $zipPath"
+if ($zipPath2) {
+    Write-Host "  [2] $zipPath2"
+} elseif (-not $SkipDest2) {
+    Write-Host '  [2] 二重化先への複製は行われませんでした（上記の警告を参照）' -ForegroundColor Yellow
+}
 if (-not $NoSecrets) {
     Write-Host '  ※ このZIPには .env / auth.json が平文で含まれる。共有リンクを作らないこと。' -ForegroundColor Yellow
 }

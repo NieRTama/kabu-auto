@@ -10,6 +10,7 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/*.log
+data/*.log.old
 data/*.lock
 # バックアップは丸ごと除外する。`data/backups/*.db` は1階層しか効かず、
 # 実際に data/backups/pre_paper_reset_.../kabu_auto.db（実取引履歴を含む）が
