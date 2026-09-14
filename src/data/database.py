@@ -164,6 +164,41 @@ class ModelPromotion(Base):
     )
 
 
+class ShadowComparisonRow(Base):
+    """shadow運用での「現行 vs 候補」の比較1件。
+
+    `Prediction` には候補の確率しか入らない。それだけでは再起動後に
+    「その時どちらを採り、なぜ見送ったか」を復元できない（外部レビューR21）。
+    **両モデルID・両確率・判断閾値・採否・一致区分**を同じ行に置く。
+
+    現行が未昇格のときも行は作る。`current_model_id` と
+    `current_probability` を NULL にして「現行が無かった」という状態を残す。
+    行ごと作らないと「比較しなかった」のか「現行が無かった」のかを
+    後から区別できない。
+    """
+    __tablename__ = "shadow_comparisons"
+    id = Column(Integer, primary_key=True)
+    evaluation_run_id = Column(String(64), nullable=False)
+    event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
+    current_model_id = Column(String(64))          # 未昇格なら NULL
+    candidate_model_id = Column(String(64), nullable=False)
+    current_probability = Column(Float)            # 未昇格なら NULL
+    candidate_probability = Column(Float, nullable=False)
+    threshold = Column(Float, nullable=False)
+    current_takes = Column(Integer, default=0)
+    candidate_takes = Column(Integer, default=0)
+    agreement = Column(String(24))
+    recorded_at = Column(DateTime, default=clock.now)
+
+    __table_args__ = (
+        Index("ix_shadow_comparisons_run", "evaluation_run_id"),
+        Index("ix_shadow_comparisons_event",
+              "evaluation_run_id", "label_contract_id", "event_id",
+              unique=True),
+    )
+
+
 class PredictionOutcome(Base):
     """イベントの実績。予測より後に確定するため別テーブルに持つ。
 
