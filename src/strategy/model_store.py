@@ -28,6 +28,8 @@ import lightgbm as lgb
 import numpy as np
 from loguru import logger
 
+from src.core import clock
+
 CURRENT_REF = "current.json"
 CANDIDATES_DIR = "candidates"
 MODEL_FILE = "model.txt"
@@ -220,12 +222,107 @@ def load_model(model_id: str, *, base_dir: str = "models") -> tuple:
     return _load_from_dir(path)
 
 
-def set_current(model_id: str, *, base_dir: str = "models") -> None:
-    """指定モデルIDを現行として参照を更新する。
+@dataclass(frozen=True)
+class CurrentRef:
+    """現行モデルを指す参照。**実体ではなくIDだけを持つ小さなファイル。**
 
-    current.json に model_id を記録し、次回のロード時に参照できるようにする。
-    複数モデルの昇格・ロールバック対応が次フェーズ（Task 3）。
+    切替でモデルの実体をコピー・移動しないため、途中で落ちても実体は壊れない。
+    previous_model_id はロールバック先。
     """
-    ref = current_ref_path(base_dir)
-    ref.parent.mkdir(parents=True, exist_ok=True)
-    ref.write_text(json.dumps({"model_id": model_id}), encoding="utf-8")
+    model_id: str
+    switched_at: datetime
+    previous_model_id: Optional[str] = None
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """一時ファイルへ書いてから置換する。
+
+    書き込み途中で落ちても、参照は常に「前の完全な内容」か
+    「新しい完全な内容」のどちらかになる（spec §9）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def read_current(*, base_dir: str = "models") -> Optional[CurrentRef]:
+    """現行の参照を読む。**未昇格（参照が無い）を正常として None を返す。**
+
+    v2はモデル未昇格の状態から開始する（spec §9）。
+    """
+    path = current_ref_path(base_dir)
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return CurrentRef(
+        model_id=payload["model_id"],
+        switched_at=datetime.fromisoformat(payload["switched_at"]),
+        previous_model_id=payload.get("previous_model_id"),
+    )
+
+
+def set_current(model_id: str, *, base_dir: str = "models",
+                previous_model_id: Optional[str] = None) -> CurrentRef:
+    """現行の参照を差し替える。
+
+    **実体が存在することを先に確かめる。** 存在しないモデルを指す参照を
+    書くと、次回の起動でモデルを読めなくなる。検査で落ちた場合、
+    現行の参照は前のまま残る。
+    """
+    cand_dir = candidate_dir(model_id, base_dir)
+    meta_path = cand_dir / META_FILE
+    if not meta_path.exists():
+        raise FileNotFoundError(f"保存されていないモデルは現行にできません: {model_id}")
+
+    # メタを読んでモデル種別を確認
+    meta = read_meta(model_id, base_dir=base_dir)
+    if meta.model_kind == KIND_BOOSTER:
+        model_path = cand_dir / MODEL_FILE
+        if not model_path.exists():
+            raise FileNotFoundError(f"保存されていないモデルは現行にできません: {model_id}")
+    elif meta.model_kind == KIND_CONSTANT:
+        const_path = cand_dir / CONSTANT_FILE
+        if not const_path.exists():
+            raise FileNotFoundError(f"保存されていないモデルは現行にできません: {model_id}")
+    else:
+        raise FileNotFoundError(f"不明なモデル種別: {meta.model_kind}")
+
+    if previous_model_id is None:
+        existing = read_current(base_dir=base_dir)
+        previous_model_id = existing.model_id if existing else None
+
+    ref = CurrentRef(model_id=model_id, switched_at=clock.now(),
+                     previous_model_id=previous_model_id)
+    _write_atomically(current_ref_path(base_dir), json.dumps({
+        "model_id": ref.model_id,
+        "switched_at": ref.switched_at.isoformat(),
+        "previous_model_id": ref.previous_model_id,
+    }, ensure_ascii=False, indent=2))
+    logger.warning(f"現行モデルを切替: {previous_model_id} → {model_id}")
+    return ref
+
+
+def load_current(*, base_dir: str = "models") -> Optional[tuple]:
+    """現行モデルを読み込む。未昇格なら None。"""
+    ref = read_current(base_dir=base_dir)
+    if ref is None:
+        return None
+    return load_model(ref.model_id, base_dir=base_dir)
+
+
+def rollback(*, base_dir: str = "models") -> Optional[CurrentRef]:
+    """1つ前のモデルへ戻す。戻り先が無ければ None（現行は変えない）。"""
+    ref = read_current(base_dir=base_dir)
+    if ref is None or ref.previous_model_id is None:
+        return None
+    return set_current(ref.previous_model_id, base_dir=base_dir,
+                       previous_model_id=ref.model_id)

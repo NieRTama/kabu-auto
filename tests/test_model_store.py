@@ -242,3 +242,110 @@ class TestCandidateDirectoriesAreImmutable:
         loaded, meta = ms.load_model("m0010", base_dir=str(tmp_path))
         assert meta.model_id == "m0010"
         assert loaded is not None
+
+
+class TestCurrentRef:
+    def test_starts_unpromoted(self, tmp_path):
+        """v2はモデル未昇格の状態から開始する（spec §9）"""
+        assert ms.read_current(base_dir=str(tmp_path)) is None
+        assert ms.load_current(base_dir=str(tmp_path)) is None
+
+    def test_set_current_points_at_the_model(self, tmp_path):
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ref = ms.set_current("m0001", base_dir=str(tmp_path))
+        assert ref.model_id == "m0001"
+        assert ref.previous_model_id is None
+        assert ms.read_current(base_dir=str(tmp_path)).model_id == "m0001"
+
+    def test_load_current_returns_the_model_and_meta(self, tmp_path):
+        model, X = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        booster, meta = ms.load_current(base_dir=str(tmp_path))
+        assert meta.model_id == "m0001"
+        assert len(booster.predict(X)) == len(X)
+
+    def test_switching_records_the_previous(self, tmp_path):
+        model, _ = _trained_model()
+        for mid in ("m0001", "m0002"):
+            ms.save_candidate(model, _meta(mid), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        ref = ms.set_current("m0002", base_dir=str(tmp_path))
+        assert ref.model_id == "m0002"
+        assert ref.previous_model_id == "m0001"
+
+    def test_rejects_a_model_that_was_never_saved(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            ms.set_current("ghost", base_dir=str(tmp_path))
+
+    def test_the_reference_is_small_and_the_model_stays_put(self, tmp_path):
+        """切替は参照だけを書き換える。モデルの実体はコピーも移動もしない"""
+        model, _ = _trained_model()
+        path = ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        before = (path / "model.txt").read_bytes()
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        assert (path / "model.txt").read_bytes() == before
+        assert ms.current_ref_path(str(tmp_path)).stat().st_size < 1000
+
+
+class TestAtomicSwitch:
+    def test_no_partial_reference_is_left_behind(self, tmp_path):
+        """一時ファイルが残らない（原子的な置換の副作用が無い）"""
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        leftovers = [p for p in Path(tmp_path).iterdir()
+                     if p.name != ms.CURRENT_REF and p.is_file()]
+        assert leftovers == []
+
+    def test_previous_reference_survives_a_failed_switch(self, tmp_path):
+        """存在しないモデルへの切替が失敗しても、現行は前のまま残る"""
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            ms.set_current("ghost", base_dir=str(tmp_path))
+        assert ms.read_current(base_dir=str(tmp_path)).model_id == "m0001"
+
+    def test_reference_survives_a_reread(self, tmp_path):
+        """再起動後に同じモデルへ復帰する（参照を読み直しても同じ）"""
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        first = ms.read_current(base_dir=str(tmp_path))
+        second = ms.read_current(base_dir=str(tmp_path))
+        assert first.model_id == second.model_id
+        assert first.switched_at == second.switched_at
+
+
+class TestRollback:
+    def test_returns_to_the_previous_model(self, tmp_path):
+        model, _ = _trained_model()
+        for mid in ("m0001", "m0002"):
+            ms.save_candidate(model, _meta(mid), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        ms.set_current("m0002", base_dir=str(tmp_path))
+
+        ref = ms.rollback(base_dir=str(tmp_path))
+        assert ref.model_id == "m0001"
+        assert ms.load_current(base_dir=str(tmp_path))[1].model_id == "m0001"
+
+    def test_records_the_rolled_back_model_as_previous(self, tmp_path):
+        model, _ = _trained_model()
+        for mid in ("m0001", "m0002"):
+            ms.save_candidate(model, _meta(mid), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        ms.set_current("m0002", base_dir=str(tmp_path))
+        ref = ms.rollback(base_dir=str(tmp_path))
+        assert ref.previous_model_id == "m0002"
+
+    def test_returns_none_when_there_is_nothing_to_roll_back_to(self, tmp_path):
+        model, _ = _trained_model()
+        ms.save_candidate(model, _meta("m0001"), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        assert ms.rollback(base_dir=str(tmp_path)) is None
+        assert ms.read_current(base_dir=str(tmp_path)).model_id == "m0001"
+
+    def test_returns_none_when_unpromoted(self, tmp_path):
+        assert ms.rollback(base_dir=str(tmp_path)) is None
