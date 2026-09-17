@@ -216,6 +216,81 @@
         "code": "8850",
         "name": "Starts Corporation Inc.",
         "sector": "Real Estate"
+      },
+      {
+        "code": "8001",
+        "name": "",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8002",
+        "name": "Marubeni Corporation",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8031",
+        "name": "",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8053",
+        "name": "",
+        "sector": "Industrials"
+      },
+      {
+        "code": "6592",
+        "name": "",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "5821",
+        "name": "Hirakawa Hewtech Corp.",
+        "sector": "Industrials"
+      },
+      {
+        "code": "3449",
+        "name": "Technoflex Corporation",
+        "sector": "Industrials"
+      },
+      {
+        "code": "593a",
+        "name": "",
+        "sector": "Technology"
+      },
+      {
+        "code": "6902",
+        "name": "DENSO Corporation",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "4425",
+        "name": "",
+        "sector": "Technology"
+      },
+      {
+        "code": "336A",
+        "name": "Dynamic Map Platform Co., Ltd.",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "6237",
+        "name": "",
+        "sector": "Industrials"
+      },
+      {
+        "code": "4202",
+        "name": "Daicel Corporation",
+        "sector": "Basic Materials"
+      },
+      {
+        "code": "6504",
+        "name": "",
+        "sector": "Industrials"
+      },
+      {
+        "code": "6584",
+        "name": "",
+        "sector": "Consumer Cyclical"
       }
     ],
     "小額リスト": [

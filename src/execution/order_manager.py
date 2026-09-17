@@ -195,18 +195,23 @@ class OrderManager:
             logger.warning(f"建玉照合失敗（次回再試行）: {e}")
             return {"ok": False, "drift": [], "error": str(e)}
 
+        # 銘柄コードは大文字小文字を正規化してから照合する。東証の英字混在証券コード
+        # （例: '336A'）で、ウォッチリスト登録時の表記とブローカーAPIの表記（常に大文字）が
+        # 食い違うと、同一建玉が別銘柄として誤認識されドリフト誤検知・kill switch誤作動を
+        # 起こす（2026-09-17実例）。
         broker_qty: dict[str, int] = {}
         for p in broker_positions:
             symbol = p.get("Symbol")
             if not symbol:
                 continue
+            symbol = symbol.upper()
             broker_qty[symbol] = broker_qty.get(symbol, 0) + int(p.get("LeavesQty") or 0)
 
         with get_session() as session:
-            db_qty = {
-                p.symbol: p.quantity
-                for p in session.scalars(select(Position).where(Position.quantity > 0)).all()
-            }
+            db_qty: dict[str, int] = {}
+            for p in session.scalars(select(Position).where(Position.quantity > 0)).all():
+                symbol = p.symbol.upper()
+                db_qty[symbol] = db_qty.get(symbol, 0) + p.quantity
 
         drift = [
             {"symbol": sym, "db_qty": db_qty.get(sym, 0), "broker_qty": broker_qty.get(sym, 0)}

@@ -13,11 +13,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.core import broker_auth
+from src.core import halt
 
 
 @pytest.fixture(autouse=True)
-def _reset_state():
+def _reset_state(tmp_path):
+    """broker_auth に加え halt も隔離する。
+
+    halt.is_halted() は既定で data/trading_halt.json（本番の実行ディレクトリの
+    ファイル）を読む遅延初期化のため、これを呼ばずに放置すると本番の停止状態
+    （建玉ドリフト検知時のkill switch ON等）がテストへそのまま漏れ込む
+    （2026-09-17実例: 本物のドリフト事故でtrading_halt.jsonがON状態のまま保存され、
+    それを読み込んだ TestOrderGate が誤って失敗した）。
+    """
     broker_auth.reset()
+    halt.load(str(tmp_path / "trading_halt.json"))
     yield
     broker_auth.reset()
 

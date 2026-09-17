@@ -66,9 +66,13 @@ def normalize_code(code: str) -> str:
     - yfinance形式の市場サフィックス '.T'（東証）を除去する（例: '7203.T' → '7203'）。
       コードは内部的にサフィックス無しで保存し、yfinance呼び出し時にのみ '.T' を付ける
       ため、入力揺れ（'7203' と '7203.T'）を同一銘柄として重複判定できるようにする。
+    - 英字を含む証券コード（東証の英字混在コード。例: '336A'）は大文字に統一する。
+      2026-09-17実例: ウォッチリストに小文字'336a'で登録されていたため、常に大文字で
+      返すブローカーAPIとの照合で同一建玉が別銘柄と誤認識され、建玉ドリフト誤検知で
+      kill switchが作動した。
     """
-    normalized = unicodedata.normalize("NFKC", code.strip())
-    if normalized.upper().endswith(".T"):
+    normalized = unicodedata.normalize("NFKC", code.strip()).upper()
+    if normalized.endswith(".T"):
         normalized = normalized[:-2]
     return normalized
 

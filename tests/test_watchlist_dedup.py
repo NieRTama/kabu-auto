@@ -29,6 +29,15 @@ class TestNormalizeSuffix:
     def test_plain_code_unchanged(self, isolated):
         assert wl.normalize_code("7203") == "7203"
 
+    def test_lowercase_alpha_code_is_uppercased(self, isolated):
+        """東証の英字混在証券コード（'336A'等）は表記揺れを避けるため大文字に統一する。
+
+        2026-09-17実例: ウォッチリストに小文字'336a'で登録されていたため、
+        常に大文字で返すブローカーAPIとの照合で同一建玉が別銘柄と誤認識され、
+        建玉ドリフト誤検知でkill switchが作動した。
+        """
+        assert wl.normalize_code("336a") == "336A"
+
 
 class TestAddDedup:
     def test_duplicate_same_code_raises(self, isolated):
@@ -45,6 +54,11 @@ class TestAddDedup:
         wl.add("7203", "トヨタ")
         with pytest.raises(wl.DuplicateError):
             wl.add("７２０３", "トヨタ")
+
+    def test_duplicate_via_lowercase_raises(self, isolated):
+        wl.add("336A", "サンプル")
+        with pytest.raises(wl.DuplicateError):
+            wl.add("336a", "サンプル再")
 
     def test_different_code_ok(self, isolated):
         wl.add("7203", "トヨタ")

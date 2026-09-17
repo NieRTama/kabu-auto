@@ -85,6 +85,21 @@ class TestReconcilePositionsWithBroker:
         assert result["ok"] is False
         assert halt.is_halted() is True
 
+    def test_case_insensitive_symbol_match_no_drift(self, isolated_db):
+        """銘柄コードの大文字小文字の違いだけで別銘柄と誤認識しない（2026-09-17実例）。
+
+        東証の英字混在証券コード（'336A'等）で、ウォッチリスト登録時の表記（小文字）と
+        ブローカーAPIが返す表記（常に大文字）が食い違い、同一建玉が「DB専有」
+        「ブローカー専有」の両方として検知されドリフト誤検知・kill switch作動した。
+        """
+        _add_position("336a", 100)
+        with _make_om("live") as (om, client):
+            client.get_positions.return_value = [{"Symbol": "336A", "LeavesQty": 100}]
+            result = om.reconcile_positions_with_broker()
+        assert result["ok"] is True
+        assert result["drift"] == []
+        assert halt.is_halted() is False
+
     def test_quantity_mismatch_triggers_halt(self, isolated_db):
         _add_position("7203", 100)
         with _make_om("live") as (om, client):
