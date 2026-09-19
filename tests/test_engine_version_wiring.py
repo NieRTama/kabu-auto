@@ -94,3 +94,35 @@ class TestV2Retrain:
                    side_effect=RuntimeError("boom")):
             load.return_value = MagicMock(__len__=lambda s: 300)
             svc.ml_retrain()   # 例外が外へ出ない
+
+
+class TestBacktestEngineSelection:
+    def test_legacy_uses_the_old_engine(self):
+        from src.dashboard import app as dash
+
+        assert dash._select_backtest_engine() == "legacy"
+
+    def test_v2_uses_walkforward(self):
+        from src.dashboard import app as dash
+
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        assert dash._select_backtest_engine() == "v2"
+
+    def test_unknown_value_falls_back_to_legacy(self):
+        from src.dashboard import app as dash
+
+        cfg.get_section("strategy")["engine_version"] = "experimental"
+        assert dash._select_backtest_engine() == "legacy"
+
+    def test_legacy_path_still_imports_the_old_engine(self):
+        """legacy の経路が残っている（挙動不変の裏付け）"""
+        from src.dashboard import app as dash
+
+        src = inspect.getsource(dash)
+        assert "from src.backtest.engine import run_backtest" in src
+
+    def test_v2_path_references_walkforward(self):
+        from src.dashboard import app as dash
+
+        src = inspect.getsource(dash)
+        assert "walkforward" in src

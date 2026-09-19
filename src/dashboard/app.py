@@ -7,13 +7,14 @@ Webダッシュボード（FastAPI）
 - バックテスト実行・結果表示
 """
 import asyncio
+import hashlib
 import json
 import os
 import secrets
 import socket
 import threading
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -1356,6 +1357,19 @@ class BacktestRequest(BaseModel):
     use_ml: bool = False
     buy_threshold: Optional[float] = None   # 省略時はアクティブなリスクプロファイルの値を使用
     sell_threshold: Optional[float] = None  # ライブ/ペーパー取引の設定には影響しない（この実行のみ）
+    # 現在の昇格モデルを固定して過去へ当てる診断用。
+    # walk-forward成績（採否用）とは別物として扱う（外部レビューR04）。
+    use_current_model_fixed: bool = False
+
+
+def _select_backtest_engine() -> str:
+    """バックテストの実行主体を選ぶ。未知の値は安全側（legacy）に倒す。
+
+    legacy = src/backtest/engine.py（単一銘柄・同じ終値で判断と約定）
+    v2     = src/backtest/walkforward.py（ポートフォリオ・T+1執行）
+    """
+    value = cfg.get_section("strategy").get("engine_version", "legacy")
+    return "v2" if value == "v2" else "legacy"
 
 
 @app.get("/api/backtest/default_thresholds")
@@ -1368,7 +1382,6 @@ async def get_backtest_default_thresholds():
 @app.post("/api/backtest/run")
 async def start_backtest(req: BacktestRequest):
     """バックテストを実行してrun_idを返す（数秒〜十数秒かかる）"""
-    from src.backtest.engine import run_backtest
     try:
         start_d = date.fromisoformat(req.start)
         end_d = date.fromisoformat(req.end)
@@ -1376,6 +1389,15 @@ async def start_backtest(req: BacktestRequest):
         raise HTTPException(status_code=400, detail=f"日付形式エラー: {e}")
     if start_d >= end_d:
         raise HTTPException(status_code=400, detail="開始日は終了日より前にしてください")
+
+    if _select_backtest_engine() == "v2":
+        # v2: ポートフォリオwalk-forward。単一銘柄の指定はその1銘柄だけの
+        # ポートフォリオとして扱う。legacyとは入力も出力も違うため、
+        # 結果は BacktestRun.strategy_version / execution_model_version で
+        # 区別できる形で保存する（旧エンジンの結果と混ぜない）。
+        return await _run_backtest_v2(req, start_d, end_d)
+
+    from src.backtest.engine import run_backtest
     try:
         run_id = await asyncio.to_thread(
             run_backtest, req.symbol, start_d, end_d, req.initial_capital, req.use_ml,
@@ -1387,6 +1409,242 @@ async def start_backtest(req: BacktestRequest):
         logger.error(f"バックテスト失敗: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     return {"run_id": run_id, "status": "completed"}
+
+
+async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
+    """v2のポートフォリオwalk-forwardでバックテストする。
+
+    旧エンジンとは入力も出力も違う。結果は strategy_version と
+    execution_model_version を付けて保存し、旧エンジンの結果と混ぜない
+    （設計書 §10）。
+    """
+    from src.backtest import execution, walkforward as wf
+    from src.data.market_data import load_ohlcv
+    from src.strategy import dataset as ds
+    from src.strategy import policy
+    from src.strategy.indicators import build_feature_frame
+
+    policy_conf = policy.config_from_settings()
+    costs = execution.config_from_settings()
+
+    # 価格基準を用途で分ける（段階A）。
+    #   raw      … 約定価格・必要資金・出来高
+    #   adjusted … 特徴量・リターン
+    # 生OHLCVだけを walk-forward へ渡すと、判断側の行に rule_score も
+    # 特徴量も存在せず、`row.get(col, 0.0)` で0に埋まる。既定の正の買い閾値
+    # では全候補が落ち、「取引ゼロの正常なバックテスト」に見えるが、
+    # 実際には特徴量が一度も繋がっていない（外部レビューR03）。
+    raw = load_ohlcv(req.symbol, limit=2000, price_basis="raw")
+    adjusted = load_ohlcv(req.symbol, limit=2000, price_basis="adjusted")
+    if raw.empty or adjusted.empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{req.symbol} の日足がありません。先にデータを取得してください")
+
+    # 調整系列から因果的に特徴量とルールスコアを作る。
+    # feature_valid=False の行は判断対象外になる（助走期間・欠損）。
+    features = build_feature_frame(adjusted)
+    features["rule_score"] = ds.rule_scores(features)
+    covered = features.index[features["feature_valid"]]
+    if len(covered) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"{req.symbol} は特徴量の助走期間を満たしていません"
+                    f"（{len(adjusted)}本）"))
+    if covered.min().date() > start_d or covered.max().date() < end_d:
+        # 期間がデータに覆われていない。黙って短い期間で回さない
+        raise HTTPException(
+            status_code=400,
+            detail=(f"指定期間がデータに覆われていません: "
+                    f"利用可能 {covered.min().date()}〜{covered.max().date()} / "
+                    f"指定 {start_d}〜{end_d}"))
+
+    bars = {req.symbol: raw}
+    sectors = {req.symbol: watchlist_store.get_sectors().get(req.symbol, "")}
+    md = wf.MarketData(bars=bars, sectors=sectors,
+                       features={req.symbol: features})
+
+    strategy_conf = wf.StrategyConfig(
+        buy_threshold=cfg.get_section("strategy").get("buy_threshold", 0.25),
+        # 設定値を明示的に渡す。渡さないと halt_new 指定が既定の
+        # rule_only へ戻る（外部レビューR05）
+        on_model_failure=cfg.get_section("strategy").get(
+            "on_model_failure", wf.ON_FAILURE_RULE_ONLY),
+    )
+    decide = wf.make_rule_then_ml(strategy_conf, _v2_score_fn(req.use_ml))
+
+    # 過去評価には**各判断時点で利用可能なモデル**を使う。
+    # load_current() の戻り値を閉包に固定して過去の全日付へ当てると、
+    # 評価期間を学習済みのモデルでも使えてしまう（外部レビューR04）。
+    # 再学習を結線しない実行は run_walkforward 側で degraded になる。
+    retrain, train_model = _v2_retrain(req, policy_conf, costs)
+
+    result = await asyncio.to_thread(
+        wf.run_walkforward, md, start_d, end_d,
+        initial_capital=req.initial_capital, decide=decide,
+        policy_conf=policy_conf,
+        costs=costs,
+        sizing=_v2_sizing_config(),
+        liquidity=_v2_liquidity_config(),
+        exit_score_fn=_v2_exit_score_fn(req.use_ml),
+        retrain=retrain,
+        train_model=train_model,
+    )
+
+    run_config = _v2_run_config(req, start_d, end_d, strategy_conf, policy_conf,
+                                 costs, features=features)
+    snapshot = wf.RunSnapshot(
+        strategy_version="rule_then_ml_v1",
+        config_hash=run_config.config_hash,
+        config_json=run_config.config_json,
+        dataset_id=run_config.dataset_id,
+        code_version=run_config.code_version,
+        execution_model_version="t1_open_v1",
+    )
+    run_id = await asyncio.to_thread(
+        wf.save_run, result, snapshot, symbol_label=req.symbol,
+        start=start_d, end=end_d,
+        initial_capital=req.initial_capital,
+        costs=costs)
+
+    return {"run_id": run_id, "engine_version": "v2",
+            "degraded": result.degraded,
+            "degraded_reasons": list(result.degraded_reasons),
+            "final_capital": float(result.daily["nav"].iloc[-1]) if len(result.daily) else req.initial_capital,
+            "trade_count": len(result.trades)}
+
+
+def _v2_sizing_config():
+    from src.backtest import portfolio as pf
+
+    trading_conf = cfg.get_section("trading")
+    return pf.SizingConfig(
+        max_position_ratio=trading_conf.get("max_position_ratio", 0.25),
+        max_positions=trading_conf.get("max_positions", 5),
+        max_sector_ratio=trading_conf.get("max_sector_ratio", 0.40),
+    )
+
+
+def _v2_liquidity_config():
+    from src.backtest import execution
+
+    return execution.LiquidityConfig(
+        max_volume_share=cfg.get_section("backtest").get("max_volume_share", 0.0))
+
+
+def _v2_run_config(req: BacktestRequest, start_d: date, end_d: date,
+                    strategy_conf, policy_conf, costs, *, features):
+    """実行条件を**開始時に固定**して返す（外部レビューの残件）。
+
+    戦略節だけでは足りない。リスク・手数料・数量制限・流動性設定・
+    入力データID・コード版まで含める。終了後に `config.yaml` を読み直すと、
+    実行中に設定が変わっていた場合に「実際に使った設定」とずれる。
+    """
+    from dataclasses import asdict
+
+    from src.strategy import dataset as ds
+    from src.strategy.evaluation import RunConfig, _code_version
+
+    payload = {
+        "symbol": req.symbol,
+        "start": str(start_d), "end": str(end_d),
+        "initial_capital": req.initial_capital,
+        "use_ml": bool(req.use_ml),
+        "strategy": asdict(strategy_conf),
+        "policy": asdict(policy_conf),
+        "costs": asdict(costs),
+        "sizing": asdict(_v2_sizing_config()),
+        "liquidity": asdict(_v2_liquidity_config()),
+        "n_feature_rows": int(features["feature_valid"].sum()),
+    }
+    config_json = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                              separators=(",", ":"), default=str)
+    return RunConfig(
+        dataset_id=None,
+        label_contract_id=ds.make_label_contract_id(policy_conf, costs),
+        feature_version=ds.FEATURE_VERSION,
+        execution_model_version=ds.EXECUTION_MODEL_VERSION,
+        code_version=_code_version(),
+        config_json=config_json,
+        config_hash=hashlib.sha256(
+            config_json.encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _v2_retrain(req: BacktestRequest, policy_conf, costs):
+    """(RetrainConfig, train_model) を返す。
+
+    過去評価では**各判断時点で利用可能なモデル**を使う。
+    `load_current()` の戻り値を閉包に固定して過去の全日付へ当てると、
+    評価期間を学習済みのモデルでもそのまま使えてしまう（外部レビューR04）。
+
+    「現在の昇格モデルを固定して過去へ当てる」診断が必要なときは
+    `req.use_current_model_fixed=True` を渡す。その実行は
+    `run_walkforward` が degraded として記録し、昇格の根拠から外れる。
+    採否用の walk-forward 成績とは別物として扱う。
+    """
+    from src.backtest import walkforward as wf
+    from src.data.market_data import load_ohlcv
+    from src.strategy import dataset as ds
+    from src.strategy import validation
+    from src.strategy.evaluation import CurrentLightGBM
+    from src.strategy.indicators import FEATURE_COLS
+
+    if req.use_current_model_fixed or not req.use_ml:
+        return None, None
+
+    backtest_conf = cfg.get_section("backtest")
+    retrain = wf.RetrainConfig(
+        every_sessions=backtest_conf.get("retrain_every_sessions", 20),
+        warmup_sessions=backtest_conf.get("retrain_warmup_sessions", 120),
+    )
+
+    adjusted = {req.symbol: load_ohlcv(req.symbol, limit=2000,
+                                       price_basis="adjusted")}
+    all_events = ds.build_events_multi(adjusted, policy_conf, costs)
+
+    def train_model(as_of):
+        """`as_of` の引けを学習締切としてモデルを作る。
+
+        締切の適用は `validation.training_inputs()` に任せる。判断日だけで
+        なくラベル確定日も締切で切られるので、その時点で観測できない
+        イベントは入らない（段階C・外部レビューR06）。
+        """
+        fold = validation.Fold(
+            index=0,
+            train_start=min(all_events["decision_at"]) if len(all_events) else as_of,
+            train_end=as_of,
+            val_start=as_of + timedelta(days=1),
+            val_end=as_of + timedelta(days=1),
+        )
+        inputs = validation.training_inputs(
+            all_events, fold, feature_cols=list(FEATURE_COLS))
+        if len(inputs.events) == 0 or inputs.events["label"].nunique() < 2:
+            return None, len(inputs.events)
+        model = CurrentLightGBM()
+        model.fit(inputs.events[list(FEATURE_COLS)].astype("float64"),
+                  inputs.events["label"].astype(int), inputs.weights)
+        return model, len(inputs.events)
+
+    return retrain, train_model
+
+
+def _v2_score_fn(use_ml: bool):
+    """`score_fn(symbol, row) -> (rule_score, ml_proba|None)` を返す。
+
+    ML推論部分はTask 5で完成させる（本タスクでは経路の選択とlegacy不変を通す）。
+    """
+    def score_fn(symbol, row):
+        rule = float(row.get("rule_score", 0.0) or 0.0)
+        return rule, None
+    return score_fn
+
+
+def _v2_exit_score_fn(use_ml: bool):
+    """保有銘柄の売りスコア。Task 5でML推論を結線するまではルールスコアのみ。"""
+    def exit_score_fn(symbol, row):
+        return float(row.get("rule_score", 0.0) or 0.0)
+    return exit_score_fn
 
 
 def _serialize_run(r: BacktestRun) -> dict:
