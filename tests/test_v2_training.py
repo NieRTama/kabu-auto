@@ -216,18 +216,20 @@ class TestTrainV2:
         assert row is not None
         assert row.dataset_id == res.dataset_id
 
-    def test_records_metrics_with_the_engine_version(self, isolated_db, tmp_path):
+    def test_records_metrics_with_the_engine_version(self, isolated_db, tmp_path, monkeypatch):
         from src.data.database import ModelMetrics
         from src.strategy import v2_training
 
+        monkeypatch.setattr(
+            v2_training, "MIN_RESOLVED_EVENTS", _TEST_MIN_RESOLVED_EVENTS)
         v2_training.train_v2(
             self._bars(), policy_conf=_policy_conf(), costs=_costs(),
             base_dir=str(tmp_path / "models"))
 
         with get_session() as session:
             rows = list(session.scalars(select(ModelMetrics)).all())
-        if rows:
-            assert rows[-1].engine_version == "v2"
+        assert rows
+        assert rows[-1].engine_version == "v2"
 
     def test_skips_when_there_are_too_few_events(self, isolated_db, tmp_path):
         """イベントが足りなければ学習せず理由を返す（例外にしない）"""

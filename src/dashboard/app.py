@@ -1419,13 +1419,17 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
     execution_model_version を付けて保存し、旧エンジンの結果と混ぜない
     （設計書 §10）。
     """
+    from dataclasses import replace as dc_replace
+
     from src.backtest import execution, walkforward as wf
     from src.data.market_data import load_ohlcv
     from src.strategy import dataset as ds
     from src.strategy import policy
-    from src.strategy.indicators import build_feature_frame
+    from src.strategy.indicators import build_feature_frame, FEATURE_COLS
 
     policy_conf = policy.config_from_settings()
+    if req.sell_threshold is not None:
+        policy_conf = dc_replace(policy_conf, sell_threshold=req.sell_threshold)
     costs = execution.config_from_settings()
 
     # 価格基準を用途で分ける（段階A）。
@@ -1460,25 +1464,40 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
                     f"利用可能 {covered.min().date()}〜{covered.max().date()} / "
                     f"指定 {start_d}〜{end_d}"))
 
+    # walk-forwardの判断行はraw OHLCV（bars）にfeaturesを重ねて作られる
+    # （_row_for()）。features側にopen/high/low/close/volumeを残したまま渡すと、
+    # adjusted価格でraw値が上書きされ、約定価格・必要資金の計算が狂う
+    # （最終ブランチレビューI1、実測: 本番DB108,297行中90,232行でclose!=adjusted_close）。
+    # 判断・退出に使う列だけへ絞り、価格列はraw（bars）側に残す。
+    features_for_md = features[list(FEATURE_COLS) + ["rule_score", "feature_valid"]]
+
     bars = {req.symbol: raw}
     sectors = {req.symbol: watchlist_store.get_sectors().get(req.symbol, "")}
     md = wf.MarketData(bars=bars, sectors=sectors,
-                       features={req.symbol: features})
+                       features={req.symbol: features_for_md})
 
     strategy_conf = wf.StrategyConfig(
-        buy_threshold=cfg.get_section("strategy").get("buy_threshold", 0.25),
+        buy_threshold=(req.buy_threshold if req.buy_threshold is not None
+                       else cfg.get_section("strategy").get("buy_threshold", 0.25)),
         # 設定値を明示的に渡す。渡さないと halt_new 指定が既定の
         # rule_only へ戻る（外部レビューR05）
         on_model_failure=cfg.get_section("strategy").get(
             "on_model_failure", wf.ON_FAILURE_RULE_ONLY),
     )
-    decide = wf.make_rule_then_ml(strategy_conf, _v2_score_fn(req.use_ml))
 
     # 過去評価には**各判断時点で利用可能なモデル**を使う。
     # load_current() の戻り値を閉包に固定して過去の全日付へ当てると、
     # 評価期間を学習済みのモデルでも使えてしまう（外部レビューR04）。
     # 再学習を結線しない実行は run_walkforward 側で degraded になる。
-    retrain, train_model = _v2_retrain(req, policy_conf, costs)
+    retrain, train_model, model_holder = _v2_retrain(req, policy_conf, costs)
+    decide = wf.make_rule_then_ml(strategy_conf, _v2_score_fn(req.use_ml, model_holder=model_holder))
+
+    diagnostic_model = None
+    if req.use_current_model_fixed and req.use_ml:
+        from src.strategy import model_store as ms
+        loaded = ms.load_current()
+        if loaded is not None:
+            diagnostic_model = loaded[0]
 
     result = await asyncio.to_thread(
         wf.run_walkforward, md, start_d, end_d,
@@ -1488,6 +1507,7 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
         sizing=_v2_sizing_config(),
         liquidity=_v2_liquidity_config(),
         exit_score_fn=_v2_exit_score_fn(req.use_ml),
+        model=diagnostic_model,
         retrain=retrain,
         train_model=train_model,
     )
@@ -1573,16 +1593,21 @@ def _v2_run_config(req: BacktestRequest, start_d: date, end_d: date,
 
 
 def _v2_retrain(req: BacktestRequest, policy_conf, costs):
-    """(RetrainConfig, train_model) を返す。
+    """(RetrainConfig, train_model, model_holder) を返す。
 
     過去評価では**各判断時点で利用可能なモデル**を使う。
     `load_current()` の戻り値を閉包に固定して過去の全日付へ当てると、
     評価期間を学習済みのモデルでもそのまま使えてしまう（外部レビューR04）。
 
+    `model_holder`（{"model": ...}という可変dict）は `train_model` が学習の
+    たびに更新する。`_v2_score_fn` はこの holder 経由で point-in-time モデルを
+    読み、`load_current()`（現在の昇格モデル）には一切フォールバックしない。
+
     「現在の昇格モデルを固定して過去へ当てる」診断が必要なときは
-    `req.use_current_model_fixed=True` を渡す。その実行は
-    `run_walkforward` が degraded として記録し、昇格の根拠から外れる。
-    採否用の walk-forward 成績とは別物として扱う。
+    `req.use_current_model_fixed=True` を渡す。この場合 `model_holder` は
+    `None` を返し（再学習を結線しない）、`_v2_score_fn` は `load_current()` を
+    使う。呼び出し元（`_run_backtest_v2`）が `run_walkforward(model=...)` へ
+    明示的に渡すことで `degraded` として記録される。
     """
     from src.backtest import walkforward as wf
     from src.data.market_data import load_ohlcv
@@ -1592,7 +1617,7 @@ def _v2_retrain(req: BacktestRequest, policy_conf, costs):
     from src.strategy.indicators import FEATURE_COLS
 
     if req.use_current_model_fixed or not req.use_ml:
-        return None, None
+        return None, None, None
 
     backtest_conf = cfg.get_section("backtest")
     retrain = wf.RetrainConfig(
@@ -1603,6 +1628,7 @@ def _v2_retrain(req: BacktestRequest, policy_conf, costs):
     adjusted = {req.symbol: load_ohlcv(req.symbol, limit=2000,
                                        price_basis="adjusted")}
     all_events = ds.build_events_multi(adjusted, policy_conf, costs)
+    model_holder: dict = {"model": None}
 
     def train_model(as_of):
         """`as_of` の引けを学習締切としてモデルを作る。
@@ -1610,6 +1636,9 @@ def _v2_retrain(req: BacktestRequest, policy_conf, costs):
         締切の適用は `validation.training_inputs()` に任せる。判断日だけで
         なくラベル確定日も締切で切られるので、その時点で観測できない
         イベントは入らない（段階C・外部レビューR06）。
+        学習できたモデルは `model_holder` へ書き込み、`_v2_score_fn` が
+        同じインスタンスを判断・退出のスコアリングに使えるようにする
+        （外部レビューR04・最終ブランチレビューC1）。
         """
         fold = validation.Fold(
             index=0,
@@ -1625,9 +1654,10 @@ def _v2_retrain(req: BacktestRequest, policy_conf, costs):
         model = CurrentLightGBM()
         model.fit(inputs.events[list(FEATURE_COLS)].astype("float64"),
                   inputs.events["label"].astype(int), inputs.weights)
+        model_holder["model"] = model
         return model, len(inputs.events)
 
-    return retrain, train_model
+    return retrain, train_model, model_holder
 
 
 class ModelInferenceError(RuntimeError):
@@ -1664,41 +1694,61 @@ def _rule_score_of(row) -> float:
     return float(row["rule_score"])
 
 
-def _v2_score_fn(use_ml: bool):
+def _v2_score_fn(use_ml: bool, model_holder: Optional[dict] = None):
     """(ルールスコア, ML確率 or None) を返す関数を作る。
 
-    3つの状態を**区別する**（外部レビューR05）。
+    4つの状態を**区別する**（外部レビューR05・最終ブランチレビューC1）。
 
       1. 意図したML無効（`use_ml=False`） … `(rule, None)`。劣化ではない
-      2. モデル未昇格 … `(rule, None)`。劣化ではない
-      3. 推論障害 … `ModelInferenceError` を**送出する**。
+      2. 再学習が結線されているが、まだ1回も学習が済んでいない
+         （ウォームアップ期間中） … `(rule, None)`。劣化ではない
+         （**`load_current()` へは絶対にフォールバックしない**。現在の
+         昇格モデルを過去の日付へ当てると先読みになるため）
+      3. 再学習が結線されておらず診断用に現在の昇格モデルを固定
+         （`model_holder is None`）… `load_current()` を使う。未昇格なら
+         `(rule, None)`
+      4. 推論障害 … `ModelInferenceError` を**送出する**。
          walk-forward が捕まえて `degraded_reasons` へ積み、
          その実行は比較・昇格の対象から外れる
 
-    3を `(rule, None)` に落とすと1・2と見分けがつかず、
+    4を `(rule, None)` に落とすと1・2・3と見分けがつかず、
     「MLが効いていない実行」が正常な成績として保存される。
 
-    モデルは昇格済みのものだけを読む（`model_store.load_current`）。
+    `model_holder` が渡されている（再学習が結線されている）場合は、
+    `run_walkforward` が `train_model()` で学習したその時点までのモデル
+    だけを使う。`model_holder` が `None`（`use_current_model_fixed=True`の
+    診断経路）のときだけ `model_store.load_current()`（現在の昇格済み
+    モデル）を使う。
     """
-    from src.strategy import model_store as ms
-
-    loaded = ms.load_current() if use_ml else None
-    if loaded is None:
+    if not use_ml:
         def rule_only(symbol, row):
-            # 未昇格・ML無効。意図した状態なので degraded にしない
             return _rule_score_of(row), None
         return rule_only
 
-    model, meta = loaded
-    cols = list(meta.feature_cols)
+    from src.strategy import model_store as ms
+    from src.strategy.indicators import FEATURE_COLS
 
     def score_fn(symbol, row):
         rule = _rule_score_of(row)
+        if model_holder is not None:
+            # 再学習が結線されている通常経路。point-in-timeモデルだけを使う。
+            model = model_holder.get("model")
+            if model is None:
+                # ウォームアップ期間中でまだ学習済みモデルが無い。
+                # load_current()へは絶対にフォールバックしない（先読み防止）。
+                return rule, None
+            cols = list(FEATURE_COLS)
+        else:
+            # use_current_model_fixed=True の診断専用経路。
+            loaded = ms.load_current()
+            if loaded is None:
+                return rule, None
+            model, meta = loaded
+            cols = list(meta.feature_cols)
         features = _required_feature_row(row, cols)
         try:
             proba = float(model.predict(pd_mod.DataFrame([features]))[0])
         except Exception as e:
-            # ここで飲み込まない。degraded を立てられるよう外へ出す
             logger.error(f"v2バックテストのML推論に失敗: {symbol} {e}")
             raise ModelInferenceError(f"{symbol}: {e}") from e
         return rule, proba

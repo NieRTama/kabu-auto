@@ -98,15 +98,17 @@ strategy:
   # 既定 false = fail-closed（メタが無ければロード拒否。改ざん検知の迂回を防ぐため）。
   # 既存モデルを一度だけ移行したい場合のみ true にし、移行後は false に戻すこと。
   allow_unverified_model_load: false
-  # ─── 評価基盤の段階投入（2026-09-12〜）────────────────────────
-  # 段階D後半時点で実際に読むのは TradingServices._engine_version() のみで、
-  # 効果は paper 経路の執行タイミング（当日終値で即約定 / 翌営業日の寄りで約定）
-  # に限られる。run_walkforward にはプロダクションの呼び出し元がまだ無く、
-  # 学習データの生成元（labeling.build_training_set / dataset.build_events）や
-  # CV分割（TimeSeriesSplit / validation.calendar_split）を本設定で切り替える
-  # 結線は存在しない（最終ブランチレビュー Minor 5）。
-  # legacy = 従来のpaper執行（当日終値で即シミュレート）
-  # v2     = paper執行を翌営業日の寄りへ変更（walkforwardエンジン本体は未結線）
+  # ─── 評価基盤の段階投入（2026-09-12〜、段階Fで結線完了）────────────
+  # v2にすると、次の3箇所が新しい評価エンジン（src/strategy/dataset.py・
+  # validation.py・src/backtest/walkforward.py等、段階A〜E）へ切り替わる:
+  #   1. paper執行のタイミング（当日終値で即約定 → 翌営業日の寄りで約定）
+  #   2. 週次再学習（TradingServices.ml_retrain）: v2_training.train_v2()で
+  #      候補モデルを学習しmodels/candidates/へ保存するが、運用モデル
+  #      （self.model・model_store.load_current()が返す現行）は自動では
+  #      差し替わらない。昇格はpromotion.promote()の明示操作のみ
+  #   3. ダッシュボードのバックテスト実行主体（engine.run_backtest →
+  #      walkforward.run_walkforward、単一銘柄のポートフォリオとして実行）
+  # legacy = 従来の挙動（既定）。v2 = 上記3箇所が新エンジンへ切り替わる。
   # 既定は legacy。旧方式へいつでも戻せることが段階投入の前提（設計書§10）。
   engine_version: "legacy"
   # MLモデルが無い・推論に失敗したときの新規候補の扱い。
@@ -114,9 +116,8 @@ strategy:
   # halt_new  = 新規候補の生成を止める（既存ポジションの退出管理は続ける）
   # 現行は暗黙にルール重みだけが残り、ML欠落時の縮尺が変わって同じ閾値でも
   # 売買判断が変わっていた。どちらの動作を採るかを設定として明示する。
-  # 未使用（段階D後半時点）: walk-forwardエンジン（src/backtest/walkforward.py の
-  # StrategyConfig）を呼ぶ本番経路がまだ結線されていないため、この値を変えても
-  # 挙動は変わらない（最終ブランチレビュー Important 2）。
+  # v2のバックテスト（src/dashboard/app.py _run_backtest_v2）でも本設定を読む
+  # （段階Fで結線）。週次再学習・paper執行のtiming分岐はこの値を使わない。
   on_model_failure: "rule_only"
 
 # ─── 流動性フィルタ（レビュー P0-6）──────────────────────────────────────────
