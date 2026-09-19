@@ -159,6 +159,7 @@ class TestStopLossCheckWiring:
     def _run(self, svc, price=900.0):
         with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
              patch("src.services.trading.watchlist_store") as watchlist_mock, \
+             patch("src.services.trading._held_symbols", return_value=[]), \
              patch("src.services.trading._get_position_qty", return_value=100), \
              patch("src.services.trading.load_ohlcv") as load_ohlcv_mock, \
              patch("src.services.trading.alert") as alert_mock:
@@ -215,6 +216,7 @@ class TestExitOrderRejected:
             svc = TradingServices(client, risk, order_mgr)
         with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
              patch("src.services.trading.watchlist_store") as watchlist_mock, \
+             patch("src.services.trading._held_symbols", return_value=[]), \
              patch("src.services.trading._get_position_qty", return_value=100), \
              patch("src.services.trading.load_ohlcv") as load_ohlcv_mock, \
              patch("src.services.trading.alert") as alert_mock:
@@ -254,3 +256,50 @@ class TestExitOrderRejected:
         alert_mock = self._run_with_result(order_id=None, exit_reason="stop_loss")
         title = alert_mock.call_args[0][0]
         assert "損切り" in title and "失敗" in title
+
+
+class TestHeldPositionOutsideWatchlist:
+    """保有建玉がウォッチリストのアクティブリスト外でも監視されること
+    （2026-09-19、9434がアクティブリスト外に出て損切り監視から漏れていた実害の再発防止）。
+    """
+
+    def test_held_symbol_not_in_watchlist_is_still_checked(self, isolated_db):
+        """アクティブリストが空でも、実際の建玉があれば損切り判定が行われる"""
+        _add_position(symbol="9434", avg_cost=1000.0, peak_price=1000.0, quantity=100)
+        client, risk, order_mgr = MagicMock(), MagicMock(), MagicMock()
+        risk.evaluate_exit.return_value = (True, "stop_loss")
+        with patch("src.services.trading.cfg") as cfg_mock:
+            cfg_mock.get_section.return_value = {"mode": "paper"}
+            svc = TradingServices(client, risk, order_mgr)
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
+             patch("src.services.trading.watchlist_store") as watchlist_mock, \
+             patch("src.services.trading.load_ohlcv") as load_ohlcv_mock, \
+             patch("src.services.trading.alert"):
+            watchlist_mock.get_codes.return_value = []  # 9434はアクティブリスト外
+            df_mock = MagicMock()
+            df_mock.__len__.return_value = 1
+            df_mock.__getitem__.return_value.iloc.__getitem__.return_value = 920.0
+            load_ohlcv_mock.return_value = df_mock
+            svc.stop_loss_check()
+        risk.evaluate_exit.assert_called_once_with("9434", 920.0)
+        order_mgr.sell_market.assert_called_once_with("9434", 100, reason="stop_loss")
+
+    def test_watchlist_and_holdings_are_unioned_without_duplicate_checks(self, isolated_db):
+        """ウォッチリストと保有建玉の両方に載っている銘柄は二重評価しない"""
+        _add_position(symbol="7203", avg_cost=1000.0, peak_price=1000.0, quantity=100)
+        client, risk, order_mgr = MagicMock(), MagicMock(), MagicMock()
+        risk.evaluate_exit.return_value = (False, "")
+        with patch("src.services.trading.cfg") as cfg_mock:
+            cfg_mock.get_section.return_value = {"mode": "paper"}
+            svc = TradingServices(client, risk, order_mgr)
+        with patch.object(scheduler_mod.TradingScheduler, "is_market_open", return_value=True), \
+             patch("src.services.trading.watchlist_store") as watchlist_mock, \
+             patch("src.services.trading.load_ohlcv") as load_ohlcv_mock, \
+             patch("src.services.trading.alert"):
+            watchlist_mock.get_codes.return_value = ["7203"]  # 保有中かつアクティブリスト内
+            df_mock = MagicMock()
+            df_mock.__len__.return_value = 1
+            df_mock.__getitem__.return_value.iloc.__getitem__.return_value = 1000.0
+            load_ohlcv_mock.return_value = df_mock
+            svc.stop_loss_check()
+        risk.evaluate_exit.assert_called_once_with("7203", 1000.0)

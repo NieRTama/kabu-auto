@@ -149,6 +149,22 @@ def _get_position_qty(symbol: str) -> int:
     return qty
 
 
+def _held_symbols() -> list[str]:
+    """現在保有している全銘柄コード（ウォッチリストの所属・アクティブ切替に関わらず）。
+
+    2026-09-19、9434がウォッチリストのアクティブリストから外れていたため
+    `stop_loss_check()` の監視対象（`watchlist_store.get_codes()`）に含まれず、
+    保有建玉があるのに損切り・トレーリングストップが一切機能していなかった
+    実害が発覚した（リストの切替・銘柄整理は日常的に行われるが、保有中の
+    銘柄がその対象になり得ることを想定していなかった）。リスク管理（保有建玉の
+    監視）は新規シグナル判断（ウォッチリストのアクティブ切替）から独立させ、
+    ここでDBの実際の建玉を直接見る。
+    """
+    with get_session() as session:
+        rows = session.scalars(select(Position).where(Position.quantity > 0)).all()
+    return [p.symbol for p in rows]
+
+
 # REJECTED/CANCELLED は実際には成立しなかった発注なので「未購入」扱いにし、
 # 同日中の再挑戦を許す（板薄・スプレッド超過等での見送りは次のスロットで拾い直したい）。
 _NOT_BOUGHT_STATUSES = (st.REJECTED, st.CANCELLED)
@@ -434,7 +450,13 @@ class TradingServices:
         if not TradingScheduler.is_market_open():
             return
         is_paper = self.trading_conf.get("mode", "paper") == "paper"
-        for sym in watchlist_store.get_codes():
+        # 監視対象は「ウォッチリスト（新規候補の母集団）」と「実際の保有建玉」の
+        # 和集合にする。ウォッチリストのアクティブ切替・銘柄整理は新規シグナル
+        # 判断のためのものであり、既に保有している建玉のリスク管理（損切り・
+        # トレーリングストップ）はそれとは独立に、保有している限り必ず行う
+        # （2026-09-19、9434がアクティブリスト外に出て監視から漏れていた実害を修正）。
+        symbols = sorted(set(watchlist_store.get_codes()) | set(_held_symbols()))
+        for sym in symbols:
             try:
                 qty = _get_position_qty(sym)
                 if qty <= 0:
