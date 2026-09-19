@@ -404,6 +404,13 @@ class ModelMetrics(Base):
     n_estimators = Column(Integer)
     feature_importances_json = Column(Text)  # JSON: {"feature": importance_score}
     trigger = Column(String(20), default="manual")  # "weekly_schedule" / "manual"
+    # ─── v2（段階F）で書く列。legacy の _save_metrics は書かないので全てnullable ───
+    # 同じテーブルに legacy と v2 の記録が混ざるため、どちらの方式で出た数字かを
+    # 残す。これが無いと比較できない。
+    model_id = Column(String(64))
+    positive_rate = Column(Float)
+    training_window_sessions = Column(Integer)
+    engine_version = Column(String(16))
 
 
 class BacktestRun(Base):
