@@ -36,8 +36,8 @@ from src.risk.manager import RiskManager
 from src.strategy import ml_model
 from src.services.trading import TradingServices, _select_latest_signals  # noqa: F401  (テスト互換のため再エクスポート)
 from src.dashboard.app import (
-    app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn, update_status,
-    _get_lan_ip,
+    app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn,
+    set_kabu_client, update_status, _get_lan_ip,
 )
 
 
@@ -106,6 +106,7 @@ def main() -> None:
         logger.warning(f"【{tm.description(mode)}】実際の資金を使用して取引します。")
 
     client = KabuClient()
+    set_kabu_client(client)  # ダッシュボードの銘柄名自動入力（日本語優先）用
 
     def _live_prices(symbols: list) -> dict:
         """保有銘柄の現在値をブローカーの板からまとめて取得する（含み損益用）。

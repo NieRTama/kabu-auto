@@ -42,6 +42,7 @@ app = FastAPI(title="kabu-auto Dashboard")
 _order_manager = None
 _ml_retrain_fn = None
 _data_update_fn = None
+_kabu_client = None
 _emergency_token: Optional[str] = None
 _dashboard_token: Optional[str] = None
 _auth_required: bool = False
@@ -246,6 +247,16 @@ def set_ml_retrain_fn(fn) -> None:
 def set_data_update_fn(fn) -> None:
     global _data_update_fn
     _data_update_fn = fn
+
+
+def set_kabu_client(client) -> None:
+    """銘柄検索フォームの自動入力で、日本語の正式銘柄名をブローカー（kabuステーション）
+    から引けるようにする（2026-09-19: yfinance頼みだと日本株でも英語名しか
+    返らず、ウォッチリスト登録名が英語のまま残ってしまう実害があった）。
+    発注系の境界（BrokerGateway）とは別の、読み取り専用の参照。
+    """
+    global _kabu_client
+    _kabu_client = client
 
 
 def set_order_manager(om) -> None:
@@ -1300,12 +1311,37 @@ async def get_symbol_names():
     return watchlist_store.get_names()
 
 
+def _lookup_company_name_ja(code: str) -> str:
+    """ブローカー（kabuステーション）の銘柄情報から日本語の会社名を取得する。
+
+    2026-09-19: 従来はyfinanceの`.info`だけを使っており、日本株でも
+    longName/shortNameが英語名しか返らないため、ウォッチリスト追加フォームの
+    自動入力経由で英語名がそのまま登録されてしまっていた。kabuステーションは
+    国内証券会社のAPIなので`/symbol`のDisplayName/SymbolNameは日本語で返る。
+    未接続・取得失敗時は空文字を返し、呼び出し元がyfinanceへフォールバックする。
+    """
+    if _kabu_client is None:
+        return ""
+    try:
+        info = _kabu_client.get_symbol(code)
+    except Exception as e:
+        logger.warning(f"ブローカーからの銘柄名取得に失敗（yfinanceへフォールバックします）: {code} {e}")
+        return ""
+    return info.get("DisplayName") or info.get("SymbolName") or ""
+
+
 @app.get("/api/symbol_lookup/{code}")
 async def lookup_symbol_name(code: str):
-    """yfinanceから銘柄コードに対応する会社名を取得する（ウォッチリスト追加フォームの自動入力用）"""
+    """銘柄コードに対応する会社名を取得する（ウォッチリスト追加フォームの自動入力用）。
+
+    kabuステーションに接続できていれば日本語の正式銘柄名を優先し、
+    未接続・取得失敗時のみyfinance（英語名）にフォールバックする。
+    """
     from src.data.market_data import lookup_company_name
     code = watchlist_store.normalize_code(code)
-    name = await asyncio.to_thread(lookup_company_name, code)
+    name = await asyncio.to_thread(_lookup_company_name_ja, code)
+    if not name:
+        name = await asyncio.to_thread(lookup_company_name, code)
     return {"code": code, "name": name}
 
 
