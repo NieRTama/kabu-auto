@@ -321,15 +321,42 @@ class TradingServices:
         # 作ってから連結する（移動平均/RSI/トリプルバリア法が銘柄境界をまたいで
         # 壊れるのを防ぐため。詳細は ml_model.train_multi() のdocstring参照）。
         dfs = []
+        trained_symbols = []
         for sym in watchlist_store.get_all_codes():
             try:
                 df = load_ohlcv(sym)
                 if len(df) < 200:
                     continue
                 dfs.append(df)
+                trained_symbols.append(sym)
             except Exception as e:
                 logger.error(f"データ読み込み失敗: {sym} {e}")
         if dfs:
+            if self._engine_version() == "v2":
+                # v2: 候補を作るだけで self.model を差し替えない。
+                # 学習成功は候補の生成であって運用モデルの更新ではない（設計書 §9）。
+                # 昇格は promotion.promote() による明示的な操作でのみ起きる。
+                from src.strategy import policy
+                from src.strategy import v2_training
+                from src.backtest import execution
+
+                try:
+                    result = v2_training.train_v2(
+                        {sym: df for sym, df in zip(trained_symbols, dfs)},
+                        policy_conf=policy.config_from_settings(),
+                        costs=execution.config_from_settings(),
+                    )
+                    if result.model_id:
+                        logger.warning(
+                            f"v2候補モデルを作成しました: {result.model_id}"
+                            "（運用モデルは変更していません。昇格は明示操作が必要です）"
+                        )
+                    else:
+                        logger.warning(f"v2候補モデルは作られませんでした: {result.skipped_reason}")
+                except Exception as e:
+                    logger.error(f"v2再学習失敗: {e}")
+                return
+
             try:
                 self.model = ml_model.train_multi(dfs, trigger="weekly_schedule")
             except Exception as e:
