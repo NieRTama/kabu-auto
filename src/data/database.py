@@ -138,6 +138,67 @@ class RunModelUsage(Base):
     __table_args__ = (Index("ix_run_model_usage_run_id", "run_id"),)
 
 
+class ModelPromotion(Base):
+    """モデルを現行へ昇格した記録。
+
+    自動昇格は行わない。**誰が・何を根拠に・なぜ切り替えたか**を残す
+    （spec §9）。学習が成功しただけで運用モデルが入れ替わる経路を無くす。
+    """
+    __tablename__ = "model_promotions"
+    id = Column(Integer, primary_key=True)
+    model_id = Column(String(64), nullable=False)
+    evaluation_run_id = Column(String(64))
+    decided_by = Column(String(64))
+    reason = Column(Text)
+    previous_model_id = Column(String(64))
+    # 参照の切替が完了したか。pending / committed / failed。
+    # 参照ファイルとDBは別の永続化先なので、片方だけが進んだ状態が
+    # 起こりうる。それを検出して決着できるように持つ（外部レビューR11）。
+    state = Column(String(16), default="committed")
+    # 実際に切り替わった時刻。pending / failed では None
+    switched_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_model_promotions_model_id", "model_id"),
+        Index("ix_model_promotions_state", "state"),
+    )
+
+
+class ShadowComparisonRow(Base):
+    """shadow運用での「現行 vs 候補」の比較1件。
+
+    `Prediction` には候補の確率しか入らない。それだけでは再起動後に
+    「その時どちらを採り、なぜ見送ったか」を復元できない（外部レビューR21）。
+    **両モデルID・両確率・判断閾値・採否・一致区分**を同じ行に置く。
+
+    現行が未昇格のときも行は作る。`current_model_id` と
+    `current_probability` を NULL にして「現行が無かった」という状態を残す。
+    行ごと作らないと「比較しなかった」のか「現行が無かった」のかを
+    後から区別できない。
+    """
+    __tablename__ = "shadow_comparisons"
+    id = Column(Integer, primary_key=True)
+    evaluation_run_id = Column(String(64), nullable=False)
+    event_id = Column(String(64), nullable=False)
+    label_contract_id = Column(String(32), nullable=False)
+    current_model_id = Column(String(64))          # 未昇格なら NULL
+    candidate_model_id = Column(String(64), nullable=False)
+    current_probability = Column(Float)            # 未昇格なら NULL
+    candidate_probability = Column(Float, nullable=False)
+    threshold = Column(Float, nullable=False)
+    current_takes = Column(Integer, default=0)
+    candidate_takes = Column(Integer, default=0)
+    agreement = Column(String(24))
+    recorded_at = Column(DateTime, default=clock.now)
+
+    __table_args__ = (
+        Index("ix_shadow_comparisons_run", "evaluation_run_id"),
+        Index("ix_shadow_comparisons_event",
+              "evaluation_run_id", "label_contract_id", "event_id",
+              unique=True),
+    )
+
+
 class PredictionOutcome(Base):
     """イベントの実績。予測より後に確定するため別テーブルに持つ。
 
