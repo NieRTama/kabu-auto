@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.parse import quote
 
 import numpy as np
+import pandas as pd_mod
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -1629,21 +1630,95 @@ def _v2_retrain(req: BacktestRequest, policy_conf, costs):
     return retrain, train_model
 
 
-def _v2_score_fn(use_ml: bool):
-    """`score_fn(symbol, row) -> (rule_score, ml_proba|None)` を返す。
+class ModelInferenceError(RuntimeError):
+    """v2バックテストのML推論に失敗した。
 
-    ML推論部分はTask 5で完成させる（本タスクでは経路の選択とlegacy不変を通す）。
+    **握り潰さない。** 例外を捕まえて `(rule, None)` を返すと、
+    「意図してMLを使っていない」実行と区別がつかなくなり、
+    walk-forward 側の degraded も立たない（外部レビューR05）。
+    degraded を立てるのは外へ届いた例外なので、ここで飲み込んではいけない。
     """
+
+
+def _required_feature_row(row, cols: list) -> dict:
+    """推論に必要な特徴量を行から取り出す。**欠けていたら例外。**
+
+    `row.get(col, 0.0)` で埋めると、特徴量が一度も繋がっていない状態が
+    「全部0の入力」として通り、正の買い閾値の下で全候補が落ちる。
+    結果は「取引ゼロの正常なバックテスト」に見える（外部レビューR03）。
+    """
+    missing = [c for c in cols if c not in row or pd_mod.isna(row[c])]
+    if missing:
+        raise ModelInferenceError(
+            f"特徴量が供給されていません: {missing}。"
+            "MarketData.features に特徴量フレームを渡してください")
+    return {c: float(row[c]) for c in cols}
+
+
+def _rule_score_of(row) -> float:
+    """判断行からルールスコアを取り出す。**無ければ例外。**"""
+    if "rule_score" not in row or pd_mod.isna(row["rule_score"]):
+        raise ModelInferenceError(
+            "rule_score が供給されていません。"
+            "MarketData.features に rule_score 列を含めてください")
+    return float(row["rule_score"])
+
+
+def _v2_score_fn(use_ml: bool):
+    """(ルールスコア, ML確率 or None) を返す関数を作る。
+
+    3つの状態を**区別する**（外部レビューR05）。
+
+      1. 意図したML無効（`use_ml=False`） … `(rule, None)`。劣化ではない
+      2. モデル未昇格 … `(rule, None)`。劣化ではない
+      3. 推論障害 … `ModelInferenceError` を**送出する**。
+         walk-forward が捕まえて `degraded_reasons` へ積み、
+         その実行は比較・昇格の対象から外れる
+
+    3を `(rule, None)` に落とすと1・2と見分けがつかず、
+    「MLが効いていない実行」が正常な成績として保存される。
+
+    モデルは昇格済みのものだけを読む（`model_store.load_current`）。
+    """
+    from src.strategy import model_store as ms
+
+    loaded = ms.load_current() if use_ml else None
+    if loaded is None:
+        def rule_only(symbol, row):
+            # 未昇格・ML無効。意図した状態なので degraded にしない
+            return _rule_score_of(row), None
+        return rule_only
+
+    model, meta = loaded
+    cols = list(meta.feature_cols)
+
     def score_fn(symbol, row):
-        rule = float(row.get("rule_score", 0.0) or 0.0)
-        return rule, None
+        rule = _rule_score_of(row)
+        features = _required_feature_row(row, cols)
+        try:
+            proba = float(model.predict(pd_mod.DataFrame([features]))[0])
+        except Exception as e:
+            # ここで飲み込まない。degraded を立てられるよう外へ出す
+            logger.error(f"v2バックテストのML推論に失敗: {symbol} {e}")
+            raise ModelInferenceError(f"{symbol}: {e}") from e
+        return rule, proba
+
     return score_fn
 
 
 def _v2_exit_score_fn(use_ml: bool):
-    """保有銘柄の売りスコア。Task 5でML推論を結線するまではルールスコアのみ。"""
+    """保有銘柄の売りスコアを返す関数を作る。
+
+    結線しないと policy の SIGNAL_SELL 条件が一度も成立せず、
+    ストップか満了まで持ち続ける挙動になる（外部レビューR10）。
+
+    **ラベル生成（`dataset.simulate_event`）と同じ契約にする。** ラベル側が
+    ルールスコアで売りを判定しているなら、ここも同じ値を使う。片方だけ
+    MLを混ぜると、学習したラベルと検証時の退出が別物になる。
+    """
     def exit_score_fn(symbol, row):
-        return float(row.get("rule_score", 0.0) or 0.0)
+        return _rule_score_of(row)
+
     return exit_score_fn
 
 
