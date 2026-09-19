@@ -93,7 +93,17 @@ def record_shadow(comparisons: list, *, evaluation_run_id: str,
     実績（PredictionOutcome）はここでは書かない。予測時点では確定して
     いないため、満期後に別途関連付ける（spec §7）。結合キーは
     `(label_contract_id, event_id)`。
+
+    `save_predictions()` と同じく、同一 `evaluation_run_id` の既存比較行を
+    削除してから挿入する（run単位の置換）。`shadow_comparisons` には
+    `(evaluation_run_id, label_contract_id, event_id)` の UNIQUE索引があり、
+    素の INSERT のままだと同じ run を2回目に実行した時点で必ず
+    IntegrityError になる。その結果、先に commit 済みの Prediction 側だけが
+    新しい内容に置き換わり、比較行側は古いまま残る恒久的な食い違いが
+    起きていた（外部レビュー最終ブランチレビュー M1）。
     """
+    from sqlalchemy import delete as sa_delete
+
     from src.data.database import ShadowComparisonRow, get_session
 
     if not comparisons:
@@ -113,6 +123,8 @@ def record_shadow(comparisons: list, *, evaluation_run_id: str,
     # 比較の内訳はこちらへ。これが「並行記録」の実体
     now = clock.now()
     with get_session() as session:
+        session.execute(sa_delete(ShadowComparisonRow).where(
+            ShadowComparisonRow.evaluation_run_id == evaluation_run_id))
         for c in comparisons:
             session.add(ShadowComparisonRow(
                 evaluation_run_id=evaluation_run_id,

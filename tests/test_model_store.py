@@ -174,6 +174,43 @@ class TestSaveWrapperModels:
         # 失敗したときにディレクトリを残さない
         assert not (Path(tmp_path) / "candidates" / "x0001").exists()
 
+    def test_binary_logistic_regression_raises_a_clear_type_error(self, tmp_path):
+        """LogisticRegressionModelはis_constant/constant_probabilityを公開する
+        が booster を持たない（外部レビュー最終ブランチレビュー M2）。
+
+        `is_constant` の有無だけで判定すると、二値が揃った
+        LogisticRegressionModel の保存時に `booster` 属性アクセスの
+        AttributeError になり、契約どおりの明示的な TypeError にならない。
+        """
+        from src.strategy.evaluation import LogisticRegressionModel
+
+        rng = np.random.default_rng(1)
+        X = pd.DataFrame({"f1": rng.normal(0, 1, 200), "f2": rng.normal(0, 1, 200)})
+        y = pd.Series((X["f1"] > 0).astype(int))
+        model = LogisticRegressionModel()
+        model.fit(X, y, np.ones(len(X)))
+        assert model.is_constant is False
+        assert not hasattr(model, "booster")
+
+        with pytest.raises(TypeError, match="保存できないモデル型"):
+            ms.save_candidate(model, _meta("lr0001"), base_dir=str(tmp_path))
+        assert not (Path(tmp_path) / "candidates" / "lr0001").exists()
+
+    def test_constant_logistic_regression_still_saves(self, tmp_path):
+        """定数へ縮退した場合は従来どおり保存できる（is_constant=Trueの分岐）"""
+        from src.strategy.evaluation import LogisticRegressionModel
+
+        X = pd.DataFrame({"f1": np.arange(10, dtype=float)})
+        y = pd.Series(np.ones(10, dtype=int))
+        model = LogisticRegressionModel()
+        model.fit(X, y, np.ones(len(X)))
+        assert model.is_constant is True
+
+        path = ms.save_candidate(model, _meta("lr0002"), base_dir=str(tmp_path))
+        assert (path / "constant.json").exists()
+        meta = ms.read_meta("lr0002", base_dir=str(tmp_path))
+        assert meta.model_kind == ms.KIND_CONSTANT
+
 
 class TestCandidateDirectoriesAreImmutable:
     """候補ディレクトリは不変であること（外部レビューR12）。
@@ -287,6 +324,26 @@ class TestCurrentRef:
         ms.set_current("m0001", base_dir=str(tmp_path))
         assert (path / "model.txt").read_bytes() == before
         assert ms.current_ref_path(str(tmp_path)).stat().st_size < 1000
+
+    def test_resetting_the_same_current_does_not_corrupt_previous(self, tmp_path):
+        """既に現行のモデルへ再度 set_current しても previous を壊さない（M4）。
+
+        修正前は再設定のたびに previous_model_id が自分自身になり、
+        rollback() が過去のモデルへ永久に戻れなくなっていた。
+        """
+        model, _ = _trained_model()
+        for mid in ("m0001", "m0002"):
+            ms.save_candidate(model, _meta(mid), base_dir=str(tmp_path))
+        ms.set_current("m0001", base_dir=str(tmp_path))
+        ms.set_current("m0002", base_dir=str(tmp_path))
+
+        # m0002 を再度現行に設定（既に現行と同じ）
+        ref = ms.set_current("m0002", base_dir=str(tmp_path))
+        assert ref.model_id == "m0002"
+        assert ref.previous_model_id == "m0001"
+
+        rolled = ms.rollback(base_dir=str(tmp_path))
+        assert rolled.model_id == "m0001"
 
 
 class TestAtomicSwitch:

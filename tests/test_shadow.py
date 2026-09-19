@@ -208,6 +208,45 @@ class TestShadowRecordsBothSides:
         assert len(shadow.load_shadow_comparisons("shadow1")) == 2
         assert len(shadow.load_shadow_comparisons("shadow2")) == 2
 
+    def test_rerunning_the_same_run_replaces_the_comparison_rows(self, isolated_db):
+        """同じrunを2回記録しても例外にならず、2回目の内容で上書きされる（M1）。
+
+        save_predictions() と同じ「run単位の置換」に揃える前は、
+        shadow_comparisons のUNIQUE索引にひっかかり2回目がIntegrityErrorに
+        なった上、先にcommit済みのPredictionだけが新しい内容になり
+        比較行だけ古いまま残る恒久的な食い違いが起きていた。
+        """
+        comparisons1 = shadow.compare(
+            ["a", "b"], _features(2),
+            current=_FixedModel([0.2, 0.2]), candidate=_FixedModel([0.7, 0.7]),
+            threshold=0.5)
+        n1 = shadow.record_shadow(
+            comparisons1, evaluation_run_id="shadow1",
+            candidate_model_id="m0002", current_model_id="m0001",
+            threshold=0.5, label_contract_id=_LC)
+        assert n1 == 2
+
+        comparisons2 = shadow.compare(
+            ["a", "b", "c"], _features(3),
+            current=_FixedModel([0.2, 0.2, 0.2]),
+            candidate=_FixedModel([0.2, 0.2, 0.2]),
+            threshold=0.5)
+        n2 = shadow.record_shadow(
+            comparisons2, evaluation_run_id="shadow1",
+            candidate_model_id="m0002", current_model_id="m0001",
+            threshold=0.5, label_contract_id=_LC)
+        assert n2 == 3
+
+        got = shadow.load_shadow_comparisons("shadow1")
+        assert len(got) == 3
+        assert set(got["event_id"]) == {"a", "b", "c"}
+        assert (got["candidate_probability"] == 0.2).all()
+
+        with get_session() as session:
+            preds = list(session.scalars(select(db.Prediction)).all())
+        assert len(preds) == 3
+        assert all(p.calibrated_probability == 0.2 for p in preds)
+
 
 class TestDisagreementSummary:
     def test_counts_each_category(self):

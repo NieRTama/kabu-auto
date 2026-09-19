@@ -102,16 +102,32 @@ def _extract_artifact(model) -> tuple:
     （外部レビューR02）。保存できる形は次の3つだけと決め、
     それ以外は**その場で例外にする**。
 
-      1. 段階Cのラッパー … `is_constant` / `constant_probability` / `booster`
+      1. 段階Cのラッパー（LightGBM系） … `is_constant` / `constant_probability` / `booster`
       2. scikit-learn API の LGBMClassifier … `booster_`
       3. `lgb.Booster` そのもの
 
     単一クラスしか見なかった定数モデルには Booster が存在しない。
     「二値がそろったモデル」と「定数モデル」で保存方式を分ける。
+
+    **`is_constant` だけでは「段階Cのラッパーである」判定として不十分。**
+    段階C2の `LogisticRegressionModel` も `_LightGbmBase` と全く同じ
+    `is_constant` / `constant_probability` を意図的に公開しているが、
+    `booster` はLightGBM固有の概念なので持たない（evaluation.py の
+    コメント参照）。`is_constant` の有無だけで分岐すると、二値が揃った
+    `LogisticRegressionModel` を保存しようとしたときに契約どおりの
+    `TypeError` ではなく `booster` 属性アクセス時の `AttributeError` に
+    なってしまう（外部レビュー最終ブランチレビュー M2）。
+    `hasattr(model, "booster")` を先に確認し、無ければその場で
+    明示的な `TypeError` にする（黙って握り潰さない・外部レビューR02）。
     """
     if hasattr(model, "is_constant"):
         if model.is_constant:
             return KIND_CONSTANT, float(model.constant_probability)
+        if not hasattr(model, "booster"):
+            raise TypeError(
+                f"保存できないモデル型です: {type(model).__name__}。"
+                "is_constant/constant_probability はありますが booster を"
+                "公開していません。LightGBM系モデル以外は現状保存できません")
         booster = model.booster
         if booster is None:
             raise TypeError(
@@ -298,7 +314,15 @@ def set_current(model_id: str, *, base_dir: str = "models",
 
     if previous_model_id is None:
         existing = read_current(base_dir=base_dir)
-        previous_model_id = existing.model_id if existing else None
+        if existing is not None and existing.model_id == model_id:
+            # 既に現行と同じモデルへの再設定。ここで previous_model_id を
+            # 自分自身（＝existing.model_id）に書き換えると、以後
+            # rollback() が過去のモデルへ永久に戻れなくなる
+            # （外部レビュー最終ブランチレビュー M4）。既存の previous を
+            # そのまま引き継ぎ、ロールバック可能な状態を壊さない
+            previous_model_id = existing.previous_model_id
+        else:
+            previous_model_id = existing.model_id if existing else None
 
     ref = CurrentRef(model_id=model_id, switched_at=clock.now(),
                      previous_model_id=previous_model_id)

@@ -27,7 +27,11 @@ def isolated_db(tmp_path):
     return tmp_path
 
 
-def _saved_model(tmp_path, model_id="m0001", feature_cols=("f1", "f2")):
+_LC = "testcontract"
+
+
+def _saved_model(tmp_path, model_id="m0001", feature_cols=("f1", "f2"),
+                  label_contract_id=_LC):
     rng = np.random.default_rng(1)
     X = pd.DataFrame({c: rng.normal(0, 1, 200) for c in feature_cols})
     y = pd.Series((X[feature_cols[0]] > 0).astype(int))
@@ -36,12 +40,9 @@ def _saved_model(tmp_path, model_id="m0001", feature_cols=("f1", "f2")):
     meta = ms.ModelMeta(
         model_id=model_id, trained_at=datetime(2026, 9, 12, 10, 0, 0),
         feature_cols=list(feature_cols), dataset_id="ds0001",
-        lightgbm_version=lgb.__version__)
+        lightgbm_version=lgb.__version__, label_contract_id=label_contract_id)
     ms.save_candidate(m, meta, base_dir=str(tmp_path))
     return model_id
-
-
-_LC = "testcontract"
 
 
 def _recorded_evaluation(run_id="run1", model_id="m0001", *,
@@ -223,6 +224,73 @@ class TestPromote:
                               expected_feature_cols=["f1", "f2"])
 
 
+class TestAlreadyCurrentBlocksPromotion:
+    """既に現行のモデルを再昇格すると previous_model_id が自分自身になり、
+    rollback() が過去のモデルへ永久に戻れなくなる（外部レビュー最終
+    ブランチレビュー M4）。自動昇格を実装しない契約に沿い、明示的に拒否する。
+    """
+
+    def test_check_promotable_blocks_the_current_model(self, isolated_db, tmp_path):
+        self_id = "m0001"
+        _saved_model(tmp_path, model_id=self_id)
+        _recorded_evaluation(model_id=self_id)
+        ms.set_current(self_id, base_dir=str(tmp_path))
+
+        got = promotion.check_promotable(
+            self_id, evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("既に現行" in b for b in got.blockers)
+
+    def test_promote_refuses_the_current_model(self, isolated_db, tmp_path):
+        _saved_model(tmp_path, model_id="m0001")
+        _saved_model(tmp_path, model_id="m0002")
+        _recorded_evaluation(model_id="m0001")
+        _recorded_evaluation(run_id="run2", model_id="m0002")
+        promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+        promotion.promote("m0002", evaluation_run_id="run2", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+
+        with pytest.raises(ValueError, match="昇格できません"):
+            promotion.promote("m0002", evaluation_run_id="run2", decided_by="g",
+                              reason="再昇格", degraded=False,
+                              base_dir=str(tmp_path),
+                              expected_feature_cols=["f1", "f2"])
+
+        # 拒否後も rollback() は正しく過去のモデルへ戻れる
+        ref = ms.rollback(base_dir=str(tmp_path))
+        assert ref.model_id == "m0001"
+
+
+class TestMissingLabelContractIdBlocksPromotion:
+    """meta.label_contract_id が None（既定値のまま）だと、ラベル契約の
+    食い違い検査そのものが黙ってスキップされていた（外部レビュー最終
+    ブランチレビュー 保留Ruling m5 の再確認）。欠落は沈黙ではなく拒否にする。
+    """
+
+    def test_missing_meta_label_contract_id_blocks_promotion(
+            self, isolated_db, tmp_path):
+        _saved_model(tmp_path, label_contract_id=None)
+        _recorded_evaluation()
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is False
+        assert any("ラベル契約ID" in b for b in got.blockers)
+
+    def test_matching_label_contract_id_still_passes(self, isolated_db, tmp_path):
+        """既存の一致ケースは従来どおり通る（回帰確認）"""
+        _saved_model(tmp_path, label_contract_id=_LC)
+        _recorded_evaluation()
+        got = promotion.check_promotable(
+            "m0001", evaluation_run_id="run1", degraded=False,
+            base_dir=str(tmp_path), expected_feature_cols=["f1", "f2"])
+        assert got.ok is True, got.blockers
+
+
 class TestUnresolvedEvaluationBlocksPromotion:
     """予測だけでは「評価済み」にしない（外部レビューR13）。
 
@@ -399,3 +467,68 @@ class TestPromotionIsRecoverable:
         for row in promotion.promotion_history():
             if row.state == promotion.PROMOTION_COMMITTED:
                 assert row.switched_at is not None
+
+
+class TestPromotionRollback:
+    """`promotion.rollback()` — ロールバックも ModelPromotion に記録を
+    残す（外部レビュー最終ブランチレビュー M3）。`model_store.rollback()`
+    は参照の切替だけで、DBには何も残さないため監査証跡と実際の現行が
+    食い違っていた。
+    """
+
+    def _promoted_twice(self, tmp_path):
+        _saved_model(tmp_path, model_id="m0001")
+        _saved_model(tmp_path, model_id="m0002")
+        _recorded_evaluation(run_id="run1", model_id="m0001")
+        _recorded_evaluation(run_id="run2", model_id="m0002")
+        promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+        promotion.promote("m0002", evaluation_run_id="run2", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+
+    def test_rollback_switches_the_reference(self, isolated_db, tmp_path):
+        self._promoted_twice(tmp_path)
+        pid = promotion.rollback(
+            decided_by="garnet", reason="候補で異常検知のため",
+            base_dir=str(tmp_path))
+        assert pid is not None
+        assert ms.read_current(base_dir=str(tmp_path)).model_id == "m0001"
+
+    def test_rollback_records_who_and_why(self, isolated_db, tmp_path):
+        self._promoted_twice(tmp_path)
+        pid = promotion.rollback(
+            decided_by="garnet", reason="候補で異常検知のため",
+            base_dir=str(tmp_path))
+
+        with get_session() as session:
+            row = session.get(db.ModelPromotion, pid)
+        assert row.model_id == "m0001"
+        assert row.previous_model_id == "m0002"
+        assert row.decided_by == "garnet"
+        assert row.reason == "候補で異常検知のため"
+        assert row.state == promotion.PROMOTION_COMMITTED
+        assert row.switched_at is not None
+
+    def test_rollback_requires_a_decider_and_a_reason(self, isolated_db, tmp_path):
+        self._promoted_twice(tmp_path)
+        with pytest.raises(ValueError, match="判断者"):
+            promotion.rollback(decided_by="", reason="ok", base_dir=str(tmp_path))
+        with pytest.raises(ValueError, match="理由"):
+            promotion.rollback(decided_by="g", reason="", base_dir=str(tmp_path))
+
+    def test_rollback_with_nothing_to_roll_back_to_records_nothing(
+            self, isolated_db, tmp_path):
+        _saved_model(tmp_path, model_id="m0001")
+        _recorded_evaluation(model_id="m0001")
+        promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
+                          reason="ok", degraded=False, base_dir=str(tmp_path),
+                          expected_feature_cols=["f1", "f2"])
+
+        result = promotion.rollback(
+            decided_by="g", reason="ok", base_dir=str(tmp_path))
+        assert result is None
+        with get_session() as session:
+            rows = list(session.scalars(select(db.ModelPromotion)).all())
+        assert len(rows) == 1  # promote() の1件のみ。rollback()は何も残さない

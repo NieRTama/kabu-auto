@@ -56,6 +56,14 @@ def check_promotable(model_id: str, *, evaluation_run_id: Optional[str],
         return PromotionCheck(ok=False,
                               blockers=[f"候補として保存されていません: {model_id}"])
 
+    # 既に現行のモデルを再昇格すると、previous_model_id が自分自身を指し、
+    # 以後 rollback() が過去のモデルへ永久に戻れなくなる（外部レビュー
+    # 最終ブランチレビュー M4）。自動昇格を実装しない契約に沿い、
+    # 何もせず成功にはせず明示的に拒否する
+    current = ms.read_current(base_dir=base_dir)
+    if current is not None and current.model_id == model_id:
+        blockers.append(f"既に現行のモデルです: {model_id}")
+
     if degraded:
         blockers.append("degraded な実行の成績は昇格の根拠にできません")
 
@@ -72,7 +80,18 @@ def check_promotable(model_id: str, *, evaluation_run_id: Optional[str],
             if run.degraded:
                 blockers.append(
                     "保存済みの実行記録が degraded です。その成績は昇格の根拠にできません")
-            if (run.label_contract_id and meta.label_contract_id
+            if run.label_contract_id and not meta.label_contract_id:
+                # meta.label_contract_id が None（既定値のまま）だと、
+                # 食い違い検査そのものが黙ってスキップされてしまう。
+                # 学習パイプラインがこのフィールドを埋め忘れた場合、
+                # ラベル契約の食い違いが永久に検出できなくなるため、
+                # 欠落を沈黙ではなく拒否にする（外部レビュー最終ブランチ
+                # レビュー 保留Ruling m5 の再確認・推奨事項）
+                blockers.append(
+                    "モデルにラベル契約IDが記録されていません"
+                    "（meta.label_contract_id）。食い違いを検査できないため"
+                    "昇格できません")
+            elif (run.label_contract_id and meta.label_contract_id
                     and run.label_contract_id != meta.label_contract_id):
                 blockers.append(
                     "ラベル契約が一致しません: "
@@ -206,6 +225,60 @@ def promotion_history(*, limit: int = 50) -> list:
         for r in rows:
             session.expunge(r)
         return rows
+
+
+def rollback(*, decided_by: str, reason: str, base_dir: str = "models") -> Optional[int]:
+    """1つ前のモデルへ戻し、`promote()` と同じ形式で `ModelPromotion` に記録する。
+
+    `model_store.rollback()` は現行参照を切り替えるだけで、DBには何も残さない。
+    そのため、ロールバック後は監査証跡（誰が・いつ・なぜ切り替えたか）と
+    実際の現行モデルが食い違う（外部レビュー最終ブランチレビュー M3）。
+    切り替える方向を問わず、判断者と理由を必須にする（自動昇格を作らない
+    という契約は戻す方向にも及ぶ）。
+
+    `promote()` と同じ2段階（pending → committed/failed）で記録する。
+    戻り先が無ければ何もせず None を返す（記録も作らない）。
+    """
+    from src.data.database import ModelPromotion, get_session
+
+    if not decided_by:
+        raise ValueError("判断者（decided_by）は必須です")
+    if not reason:
+        raise ValueError("理由（reason）は必須です")
+
+    current = ms.read_current(base_dir=base_dir)
+    if current is None or current.previous_model_id is None:
+        return None
+    target_id = current.previous_model_id
+
+    with get_session() as session:
+        row = ModelPromotion(
+            model_id=target_id, evaluation_run_id=None,
+            decided_by=decided_by, reason=reason,
+            previous_model_id=current.model_id,
+            state=PROMOTION_PENDING, switched_at=None,
+        )
+        session.add(row)
+        session.commit()
+        promotion_id = row.id
+
+    try:
+        ref = ms.rollback(base_dir=base_dir)
+    except BaseException:
+        _close_promotion(promotion_id, PROMOTION_FAILED, switched_at=None)
+        raise
+
+    if ref is None:
+        # 記録作成後・切替前の間に現行が別経路で変わっていた（並行変更）。
+        # 切替は起きていないので failed として閉じる
+        _close_promotion(promotion_id, PROMOTION_FAILED, switched_at=None)
+        return None
+
+    _close_promotion(promotion_id, PROMOTION_COMMITTED, switched_at=ref.switched_at)
+    logger.warning(
+        f"モデルをロールバック: {current.model_id} → {ref.model_id}"
+        f"（判断者={decided_by}）")
+    return promotion_id
 
 
 def promote(model_id: str, *, evaluation_run_id: Optional[str],
