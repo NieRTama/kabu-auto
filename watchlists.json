@@ -24,331 +24,7 @@
       },
       {
         "code": "9432",
-        "name": "NTT",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "9433",
-        "name": "KDDI",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "9984",
-        "name": "ソフトバンクグループ",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "6702",
-        "name": "富士通",
-        "sector": "Technology"
-      },
-      {
-        "code": "6758",
-        "name": "Sony Group Corporation",
-        "sector": "Technology"
-      },
-      {
-        "code": "8058",
-        "name": "三菱商事",
-        "sector": "Industrials"
-      },
-      {
-        "code": "3489",
-        "name": "FaithNetwork Co.,Ltd",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "4755",
-        "name": "Rakuten Group, Inc.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "9602",
-        "name": "Toho Co., Ltd.",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "3166",
-        "name": "Ochi Holdings Co., Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "9418",
-        "name": "U-NEXT HOLDINGS Co.,Ltd.",
-        "sector": "Industrials"
-      },
-      {
-        "code": "7453",
-        "name": "Ryohin Keikaku Co., Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "2702",
-        "name": "McDonald's Holdings Company (Japan), Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "7867",
-        "name": "TOMY Company, Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "4503",
-        "name": "Astellas Pharma Inc.",
-        "sector": "Healthcare"
-      },
-      {
-        "code": "7872",
-        "name": "Estelle Holdings Co.,Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "7033",
-        "name": "Management Solutions co.,Ltd.",
-        "sector": "Industrials"
-      },
-      {
-        "code": "7839",
-        "name": "Shoei Co., Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "5401",
-        "name": "Nippon Steel Corporation",
-        "sector": "Basic Materials"
-      },
-      {
-        "code": "5527",
-        "name": "Property Technologies Inc.",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "2502",
-        "name": "Asahi Group Holdings, Ltd.",
-        "sector": "Consumer Defensive"
-      },
-      {
-        "code": "3635",
-        "name": "Koei Tecmo Holdings Co., Ltd.",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "3387",
-        "name": "create restaurants holdings inc.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "6753",
-        "name": "Sharp Corporation",
-        "sector": "Technology"
-      },
-      {
-        "code": "9302",
-        "name": "MITSUI-SOKO HOLDINGS Co., Ltd.",
-        "sector": "Industrials"
-      },
-      {
-        "code": "8136",
-        "name": "Sanrio Company, Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "2353",
-        "name": "NIPPON PARKING DEVELOPMENT Co.,Ltd.",
-        "sector": "Industrials"
-      },
-      {
-        "code": "3289",
-        "name": "Tokyu Fudosan Holdings Corporation",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "4540",
-        "name": "Tsumura & Co.",
-        "sector": "Healthcare"
-      },
-      {
-        "code": "2229",
-        "name": "Calbee, Inc.",
-        "sector": "Consumer Defensive"
-      },
-      {
-        "code": "3563",
-        "name": "Food & Life Companies Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "3660",
-        "name": "istyle Inc.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "6306",
-        "name": "Nikko Co., Ltd.",
-        "sector": "Industrials"
-      },
-      {
-        "code": "2157",
-        "name": "Koshidaka Holdings Co., Ltd.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "3034",
-        "name": "Qol Holdings Co., Ltd.",
-        "sector": "Healthcare"
-      },
-      {
-        "code": "8934",
-        "name": "Sun Frontier Fudousan Co., Ltd.",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "8923",
-        "name": "Tosei Corporation",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "8804",
-        "name": "Tokyo Tatemono Co., Ltd.",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "8850",
-        "name": "Starts Corporation Inc.",
-        "sector": "Real Estate"
-      },
-      {
-        "code": "8001",
-        "name": "",
-        "sector": "Industrials"
-      },
-      {
-        "code": "8002",
-        "name": "Marubeni Corporation",
-        "sector": "Industrials"
-      },
-      {
-        "code": "8031",
-        "name": "",
-        "sector": "Industrials"
-      },
-      {
-        "code": "8053",
-        "name": "",
-        "sector": "Industrials"
-      },
-      {
-        "code": "6592",
-        "name": "",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "5821",
-        "name": "Hirakawa Hewtech Corp.",
-        "sector": "Industrials"
-      },
-      {
-        "code": "3449",
-        "name": "Technoflex Corporation",
-        "sector": "Industrials"
-      },
-      {
-        "code": "593a",
-        "name": "",
-        "sector": "Technology"
-      },
-      {
-        "code": "6902",
-        "name": "DENSO Corporation",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "4425",
-        "name": "",
-        "sector": "Technology"
-      },
-      {
-        "code": "336A",
-        "name": "Dynamic Map Platform Co., Ltd.",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "6237",
-        "name": "",
-        "sector": "Industrials"
-      },
-      {
-        "code": "4202",
-        "name": "Daicel Corporation",
-        "sector": "Basic Materials"
-      },
-      {
-        "code": "6504",
-        "name": "",
-        "sector": "Industrials"
-      },
-      {
-        "code": "6584",
-        "name": "",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "9434",
-        "name": "SoftBank Corp.",
-        "sector": "Communication Services"
-      }
-    ],
-    "小額リスト": [
-      {
-        "code": "9434",
-        "name": "SoftBank Corp.",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "9432",
-        "name": "NTT, Inc.",
-        "sector": "Communication Services"
-      },
-      {
-        "code": "4755",
-        "name": "Rakuten Group, Inc.",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "7813",
-        "name": "Platz Co., Ltd.",
-        "sector": "Healthcare"
-      },
-      {
-        "code": "7532",
-        "name": "Pan Pacific International Holdings Corporation",
-        "sector": "Consumer Defensive"
-      }
-    ],
-    "テスト用": [
-      {
-        "code": "8306",
-        "name": "三菱UFJフィナンシャル・グループ",
-        "sector": "Financial Services"
-      },
-      {
-        "code": "8316",
-        "name": "三井住友フィナンシャルグループ",
-        "sector": "Financial Services"
-      },
-      {
-        "code": "7203",
-        "name": "トヨタ自動車",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "7267",
-        "name": "ホンダ",
-        "sector": "Consumer Cyclical"
-      },
-      {
-        "code": "9432",
-        "name": "NTT",
+        "name": "日本電信電話",
         "sector": "Communication Services"
       },
       {
@@ -378,12 +54,336 @@
       },
       {
         "code": "3489",
-        "name": "FaithNetwork Co.,Ltd",
+        "name": "フェイスネットワーク",
         "sector": "Real Estate"
       },
       {
         "code": "4755",
-        "name": "Rakuten Group, Inc.",
+        "name": "楽天グループ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9602",
+        "name": "東宝",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "3166",
+        "name": "OCHIホールディングス",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9418",
+        "name": "U-NEXT HOLDINGS",
+        "sector": "Industrials"
+      },
+      {
+        "code": "7453",
+        "name": "良品計画",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "2702",
+        "name": "日本マクドナルドホールディングス",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7867",
+        "name": "タカラトミー",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "4503",
+        "name": "アステラス製薬",
+        "sector": "Healthcare"
+      },
+      {
+        "code": "7872",
+        "name": "エステールホールディングス",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7033",
+        "name": "マネジメントソリューションズ",
+        "sector": "Industrials"
+      },
+      {
+        "code": "7839",
+        "name": "SHOEI",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "5401",
+        "name": "日本製鉄",
+        "sector": "Basic Materials"
+      },
+      {
+        "code": "5527",
+        "name": "property technologies",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "2502",
+        "name": "アサヒグループホールディングス",
+        "sector": "Consumer Defensive"
+      },
+      {
+        "code": "3635",
+        "name": "コーエーテクモホールディングス",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "3387",
+        "name": "クリエイト・レストランツ・ホールディングス",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "6753",
+        "name": "シャープ",
+        "sector": "Technology"
+      },
+      {
+        "code": "9302",
+        "name": "三井倉庫ホールディングス",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8136",
+        "name": "サンリオ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "2353",
+        "name": "日本駐車場開発",
+        "sector": "Industrials"
+      },
+      {
+        "code": "3289",
+        "name": "東急不動産ホールディングス",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "4540",
+        "name": "ツムラ",
+        "sector": "Healthcare"
+      },
+      {
+        "code": "2229",
+        "name": "カルビー",
+        "sector": "Consumer Defensive"
+      },
+      {
+        "code": "3563",
+        "name": "フード＆ライフカンパニーズ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "3660",
+        "name": "アイスタイル",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "6306",
+        "name": "日工",
+        "sector": "Industrials"
+      },
+      {
+        "code": "2157",
+        "name": "コシダカホールディングス",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "3034",
+        "name": "クオールホールディングス",
+        "sector": "Healthcare"
+      },
+      {
+        "code": "8934",
+        "name": "サンフロンティア不動産",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "8923",
+        "name": "トーセイ",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "8804",
+        "name": "東京建物",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "8850",
+        "name": "スターツコーポレーション",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "8001",
+        "name": "伊藤忠商事",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8002",
+        "name": "丸紅",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8031",
+        "name": "三井物産",
+        "sector": "Industrials"
+      },
+      {
+        "code": "8053",
+        "name": "住友商事",
+        "sector": "Industrials"
+      },
+      {
+        "code": "6592",
+        "name": "マブチモーター",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "5821",
+        "name": "平河ヒューテック",
+        "sector": "Industrials"
+      },
+      {
+        "code": "3449",
+        "name": "テクノフレックス",
+        "sector": "Industrials"
+      },
+      {
+        "code": "593a",
+        "name": "ティアフォー",
+        "sector": "Technology"
+      },
+      {
+        "code": "6902",
+        "name": "デンソー",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "4425",
+        "name": "Kudan",
+        "sector": "Technology"
+      },
+      {
+        "code": "336A",
+        "name": "ダイナミックマッププラットフォーム",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "6237",
+        "name": "イワキ",
+        "sector": "Industrials"
+      },
+      {
+        "code": "4202",
+        "name": "ダイセル",
+        "sector": "Basic Materials"
+      },
+      {
+        "code": "6504",
+        "name": "富士電機",
+        "sector": "Industrials"
+      },
+      {
+        "code": "6584",
+        "name": "三桜工業",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9434",
+        "name": "ソフトバンク",
+        "sector": "Communication Services"
+      }
+    ],
+    "小額リスト": [
+      {
+        "code": "9434",
+        "name": "ソフトバンク",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9432",
+        "name": "日本電信電話",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "4755",
+        "name": "楽天グループ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7813",
+        "name": "プラッツ",
+        "sector": "Healthcare"
+      },
+      {
+        "code": "7532",
+        "name": "パン・パシフィック・インターナショナルホールディングス",
+        "sector": "Consumer Defensive"
+      }
+    ],
+    "テスト用": [
+      {
+        "code": "8306",
+        "name": "三菱UFJフィナンシャル・グループ",
+        "sector": "Financial Services"
+      },
+      {
+        "code": "8316",
+        "name": "三井住友フィナンシャルグループ",
+        "sector": "Financial Services"
+      },
+      {
+        "code": "7203",
+        "name": "トヨタ自動車",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "7267",
+        "name": "ホンダ",
+        "sector": "Consumer Cyclical"
+      },
+      {
+        "code": "9432",
+        "name": "日本電信電話",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9433",
+        "name": "KDDI",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "9984",
+        "name": "ソフトバンクグループ",
+        "sector": "Communication Services"
+      },
+      {
+        "code": "6702",
+        "name": "富士通",
+        "sector": "Technology"
+      },
+      {
+        "code": "6758",
+        "name": "ソニーグループ",
+        "sector": "Technology"
+      },
+      {
+        "code": "8058",
+        "name": "三菱商事",
+        "sector": "Industrials"
+      },
+      {
+        "code": "3489",
+        "name": "フェイスネットワーク",
+        "sector": "Real Estate"
+      },
+      {
+        "code": "4755",
+        "name": "楽天グループ",
         "sector": "Consumer Cyclical"
       }
     ]
