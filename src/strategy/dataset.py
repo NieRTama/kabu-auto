@@ -230,7 +230,12 @@ def simulate_event(feat: pd.DataFrame, i: int,
         peak_price=entry.price,
         sessions_held=0,
     )
-    observations = [_observation(feat, k) for k in range(entry_idx, len(feat))]
+    # run_session_series()はmax_holding_sessions個の観測で必ず退出判定
+    # （TIME_LIMIT）を返すため（policy.step()参照）、それ以降の観測列を
+    # 作るのは無駄。候補数×残り日数のO(n²)的な劣化を避けるため、消費され
+    # うる範囲だけに絞る（結果は変わらない。Knowledge.md実例参照）。
+    end_idx = min(len(feat), entry_idx + policy_conf.max_holding_sessions)
+    observations = [_observation(feat, k) for k in range(entry_idx, end_idx)]
     final, intent, _ = policy.run_session_series(
         state, observations, policy_conf, peak_basis=peak_basis)
 

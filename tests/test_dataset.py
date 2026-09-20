@@ -334,6 +334,153 @@ class TestSimulateEvent:
         assert charged.net_return < free.net_return
 
 
+class TestSimulateEventObservationBudget:
+    """simulate_event()が候補ごとに作る観測列の本数を検証する。
+
+    run_session_series()はmax_holding_sessions個の観測で必ずTIME_LIMIT
+    退出を返す（policy.step()参照）ため、それ以降の観測を作るのは無駄。
+    候補数×残り日数のO(n^2)的な劣化を防ぐため、観測列の生成本数が
+    系列長に依存せず一定であることを固定する（simulate-event-perf-brief.md）。
+    """
+
+    def test_observation_count_does_not_grow_with_series_length(self, monkeypatch):
+        calls = {"n": 0}
+        original = dataset._observation
+
+        def counting(feat, i):
+            calls["n"] += 1
+            return original(feat, i)
+
+        monkeypatch.setattr(dataset, "_observation", counting)
+
+        # 価格を動かさない（stop/trailingが発火しない）ので、必ず
+        # max_holding=5本目でTIME_LIMIT退出になる。この条件下では、
+        # 観測の生成本数は系列の全長に関わらず一定になるはず。
+        conf = _policy_conf(max_holding=5, stop=-0.5, trailing=0.0, breakeven=0.0)
+
+        def flat_frame(n):
+            bars = [
+                {"date": date(2026, 1, 1) + timedelta(days=k),
+                 "open": 1000, "high": 1005, "low": 995, "close": 1000}
+                for k in range(n)
+            ]
+            return _frame(bars)
+
+        calls["n"] = 0
+        dataset.simulate_event(flat_frame(10), 0, conf, _costs())
+        short_series_calls = calls["n"]
+
+        calls["n"] = 0
+        dataset.simulate_event(flat_frame(2000), 0, conf, _costs())
+        long_series_calls = calls["n"]
+
+        assert short_series_calls == long_series_calls
+        # entry_bar(1) + observations(max_holding=5) + exit_bar(1) + next_bar(1)
+        assert short_series_calls == 8
+
+
+class TestSimulateEventMatchesPreOptimizationBehavior:
+    """最適化前後で戻り値が1ビットも変わらないことを直接固定する。
+
+    参照実装は最適化前のロジック（観測列を entry_idx から len(feat) まで
+    毎回作る）をそのまま再現したもの。dataset.simulate_event() が
+    max_holding_sessions で打ち切って作った観測列でも、
+    run_session_series() が実際に消費する範囲は変わらないため、
+    戻り値は完全に一致するはず（simulate-event-perf-brief.md）。
+    """
+
+    @staticmethod
+    def _reference(feat, i, policy_conf, costs, *,
+                   peak_basis=policy.PEAK_BASIS_PREVIOUS):
+        """最適化前の実装を再現した参照実装（末尾まで観測列を作る）。"""
+        if "feature_valid" in feat.columns and not bool(feat["feature_valid"].iloc[i]):
+            return dataset._unresolved(dataset.STATUS_INVALID_FEATURES)
+
+        entry_idx = i + 1
+        if entry_idx >= len(feat):
+            return dataset._unresolved(dataset.STATUS_UNFILLED)
+
+        entry_bar = dataset._observation(feat, entry_idx)
+        entry = execution.entry_fill(entry_bar, dataset.NOMINAL_QUANTITY, costs)
+
+        state = policy.HoldingState(
+            symbol=str(feat.attrs.get("symbol", "")),
+            entry_at=entry.at,
+            avg_cost=entry.price,
+            quantity=entry.quantity,
+            peak_price=entry.price,
+            sessions_held=0,
+        )
+        observations = [dataset._observation(feat, k) for k in range(entry_idx, len(feat))]
+        final, intent, _ = policy.run_session_series(
+            state, observations, policy_conf, peak_basis=peak_basis)
+
+        if intent is None:
+            return dataset._unresolved(
+                dataset.STATUS_IMMATURE, entry_at=entry.at,
+                sessions_held=final.sessions_held)
+
+        intent_idx = entry_idx + final.sessions_held - 1
+        next_idx = intent_idx + 1
+        exit_bar = dataset._observation(feat, intent_idx)
+        next_bar = dataset._observation(feat, next_idx) if next_idx < len(feat) else None
+
+        fill = execution.exit_fill(intent, exit_bar, next_bar, dataset.NOMINAL_QUANTITY, costs)
+        if fill is None:
+            return dataset._unresolved(
+                dataset.STATUS_UNFILLED, entry_at=entry.at,
+                sessions_held=final.sessions_held)
+
+        ret = execution.net_return(entry, fill, costs)
+        return dataset.EventOutcome(
+            status=dataset.STATUS_RESOLVED,
+            entry_at=entry.at,
+            label_end_at=fill.at,
+            label=1 if ret > 0 else 0,
+            net_return=ret,
+            exit_reason=intent.reason,
+            entry_price=entry.price,
+            exit_price=fill.price,
+            sessions_held=final.sessions_held,
+        )
+
+    @staticmethod
+    def _long_frame(n, seed, start_price=1000.0):
+        """十分に長く、損切り・トレーリング・満了のいずれも起こりうる合成系列"""
+        rng = np.random.default_rng(seed)
+        start = date(2026, 1, 5)
+        rows = []
+        price = start_price
+        for k in range(n):
+            price *= 1 + rng.normal(0, 0.02)
+            high = price * (1 + abs(rng.normal(0, 0.012)))
+            low = price * (1 - abs(rng.normal(0, 0.012)))
+            rows.append({
+                "date": start + timedelta(days=k),
+                "open": price, "high": high, "low": low, "close": price,
+            })
+        return _frame(rows)
+
+    @pytest.mark.parametrize("max_holding", [3, 10, 20])
+    @pytest.mark.parametrize("peak_basis", [
+        policy.PEAK_BASIS_PREVIOUS, policy.PEAK_BASIS_SAME_SESSION])
+    def test_matches_reference_across_all_candidate_positions(
+            self, max_holding, peak_basis):
+        """max_holdingの6倍長い系列の全候補位置で戻り値が完全一致する
+
+        末尾付近の未成熟・未約定になる候補も含めて全位置を検査する。
+        """
+        n = max_holding * 6
+        feat = self._long_frame(n, seed=max_holding * 100 + len(peak_basis))
+        conf = _policy_conf(max_holding=max_holding)
+        costs = _costs(slip=0.001, comm=0.0005)
+
+        for i in range(n):
+            got = dataset.simulate_event(feat, i, conf, costs, peak_basis=peak_basis)
+            want = self._reference(feat, i, conf, costs, peak_basis=peak_basis)
+            assert got == want, f"i={i} max_holding={max_holding} で不一致: {got} != {want}"
+
+
 class TestBuildEvents:
     def test_columns_and_order_are_fixed(self, monkeypatch):
         feat_len = 120
