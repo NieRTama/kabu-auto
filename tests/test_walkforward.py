@@ -1171,6 +1171,22 @@ class TestRuleThenMl:
         rows = {"A": pd.Series({"close": 1000.0})}
         assert decide(date(2026, 1, 5), rows, None, ctx) == []
 
+    def test_halts_new_candidates_for_all_symbols_when_any_one_fails(self):
+        """halt_newは全銘柄一括停止。複数銘柄のうち1銘柄でもML確率が
+        取れなければ、ML確率が取れた他銘柄も含めて全員が候補から外れる
+        （`any(g[3] is None for g in gated)`という複数銘柄対応ガードの検証。
+        既存の2件は1銘柄のrowsでしか検証しておらず穴だった）。
+        """
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.30}[symbol],
+                    {"A": 0.80, "B": None}[symbol])
+
+        decide = wf.make_rule_then_ml(
+            _strategy(buy_thr=0.25, on_failure=wf.ON_FAILURE_HALT_NEW), score_fn)
+        ctx = {"sectors": {"A": "S", "B": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0}), "B": pd.Series({"close": 1000.0})}
+        assert decide(date(2026, 1, 5), rows, "m", ctx) == []
+
     def test_failure_mode_is_explicit_not_implicit(self):
         """同じ入力でも設定によって結果が変わる＝暗黙の縮尺変更ではない"""
         rows = {"A": pd.Series({"close": 1000.0})}
@@ -1195,8 +1211,16 @@ class TestRuleThenMl:
         assert [c.symbol for c in got] == ["B", "C", "A"]
         assert [c.score for c in got] == [0.80, 0.60, 0.40]
 
-    def test_all_unusable_matches_the_rule_only_ranking(self):
-        """境界ケース: 全員unusableなら結果はルールスコア順のみ（旧実装と完全一致）"""
+    def test_all_unusable_ranks_by_rule_score_descending(self):
+        """境界ケース: 全員unusableならルールスコア降順で並ぶ。
+
+        これは**旧実装と一致しない、新しい・意図した挙動**である。旧実装
+        （`git show 222628b^`）はソートせず`rows`の反復順のまま返していた。
+        このテスト名・docstringはかつて「旧実装と完全一致する」と誤って
+        主張していたが、実装は既にルールスコア降順へ変わっており記録の方が
+        誤りだった。挙動自体（降順に並べる）は反復順のままより意味があるため
+        変更しない（前回レビューImportant指摘）。
+        """
         def score_fn(symbol, row):
             return ({"A": 0.30, "B": 0.50, "C": 0.40}[symbol], None)
 
@@ -1224,6 +1248,95 @@ class TestRuleThenMl:
         # 前方: ML確率順（B=0.80 > A=0.40）。後方: ルールスコア順（C=0.90 > D=0.50）
         assert [c.symbol for c in got] == ["B", "A", "C", "D"]
         assert [c.score for c in got] == [0.80, 0.40, 0.90, 0.50]
+
+    def test_allocate_gives_the_ml_ranked_symbol_the_funding_slot_over_a_higher_raw_rule_score(self):
+        """Critical（前回レビュー再修正）: decide()の順序だけでなく、実際に
+        `portfolio.allocate()`まで通した割当結果でも2段ランキングが効くこと。
+
+        Aはtier=0（ML確率0.40）、Bはtier=1（ルールスコア0.90、ML確率なし）。
+        スコアの数値だけを見ればB(0.90)がA(0.40)より大きいが、tierが違う
+        ためscoreを直接比較してはならない。`allocate`が旧実装のまま
+        `sorted(candidates, key=lambda c: c.score, reverse=True)`だったら
+        Bが先に処理されA(ML確率のある銘柄)が資金枠を失う。tierを
+        (tier, -score)の辞書式順序で見る修正後は、Aが先に資金枠を得る。
+        """
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.90}[symbol],
+                    {"A": 0.40, "B": None}[symbol])
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {"A": "S", "B": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0}), "B": pd.Series({"close": 1000.0})}
+        candidates = decide(date(2026, 1, 5), rows, "m", ctx)
+        assert [(c.symbol, c.tier, c.score) for c in candidates] == [
+            ("A", 0, 0.40), ("B", 1, 0.90)]
+
+        state = pf.empty_portfolio(1_000_000.0)
+        # max_positions=1で枠を1つしか用意しない→AとBが取り合いになる
+        # （ratio=0.5・sector_ratio=1.0はセクター集中率の上限ちょうどを
+        # 踏まないための余裕。境界は他のテストで別途検証済み）
+        sizing = _sizing(ratio=0.5, max_positions=1, sector_ratio=1.0)
+        orders, rejected = pf.allocate(
+            state, candidates, sizing, {"A": 1000.0, "B": 1000.0})
+        assert [o.symbol for o in orders] == ["A"]
+        assert [r.symbol for r in rejected] == ["B"]
+        assert "最大保有銘柄数" in rejected[0].reason
+
+    def test_allocate_matches_decide_order_when_all_usable(self):
+        """全員usableパターンをallocateまで通す。tierが全員0なので
+        (tier, -score)は素のscore降順と一致し、decide()の順序がそのまま
+        資金枠の獲得順になる。"""
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.30, "C": 0.30}[symbol],
+                    {"A": 0.40, "B": 0.80, "C": 0.60}[symbol])
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {s: "S" for s in "ABC"}, "portfolio": None, "closes": {}}
+        rows = {s: pd.Series({"close": 1000.0}) for s in "ABC"}
+        candidates = decide(date(2026, 1, 5), rows, "m", ctx)
+        assert [c.tier for c in candidates] == [0, 0, 0]
+
+        state = pf.empty_portfolio(1_000_000.0)
+        sizing = _sizing(ratio=0.25, max_positions=3, sector_ratio=1.0)
+        orders, rejected = pf.allocate(
+            state, candidates, sizing, {s: 1000.0 for s in "ABC"})
+        assert rejected == []
+        assert [o.symbol for o in orders] == ["B", "C", "A"]
+
+    def test_allocate_matches_decide_order_when_all_unusable(self):
+        """全員unusableパターンをallocateまで通す。tierが全員1で揃うので
+        (tier, -score)はルールスコア降順と一致する。"""
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.50, "C": 0.40}[symbol], None)
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {s: "S" for s in "ABC"}, "portfolio": None, "closes": {}}
+        rows = {s: pd.Series({"close": 1000.0}) for s in "ABC"}
+        candidates = decide(date(2026, 1, 5), rows, None, ctx)
+        assert [c.tier for c in candidates] == [1, 1, 1]
+
+        state = pf.empty_portfolio(1_000_000.0)
+        sizing = _sizing(ratio=0.25, max_positions=3, sector_ratio=1.0)
+        orders, rejected = pf.allocate(
+            state, candidates, sizing, {s: 1000.0 for s in "ABC"})
+        assert rejected == []
+        assert [o.symbol for o in orders] == ["B", "C", "A"]
+
+    def test_allocate_receives_nothing_when_halt_new_fires(self):
+        """halt_newパターンをallocateまで通す。decide()が空リストを返すので
+        allocateも何も割り当てず・何も却下しない。"""
+        decide = wf.make_rule_then_ml(
+            _strategy(buy_thr=0.25, on_failure=wf.ON_FAILURE_HALT_NEW),
+            _scores(0.30, None))
+        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
+        rows = {"A": pd.Series({"close": 1000.0})}
+        candidates = decide(date(2026, 1, 5), rows, None, ctx)
+        assert candidates == []
+
+        state = pf.empty_portfolio(1_000_000.0)
+        orders, rejected = pf.allocate(state, candidates, _sizing(), {})
+        assert orders == []
+        assert rejected == []
 
 
 class TestThreeStrategiesShareTheSameLoop:

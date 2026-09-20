@@ -182,9 +182,9 @@ class StrategyConfig:
     on_model_failure: str = ON_FAILURE_RULE_ONLY
 
 
-def _candidate(symbol: str, row, ctx: dict, score: float) -> pf.Candidate:
+def _candidate(symbol: str, row, ctx: dict, score: float, tier: int = 0) -> pf.Candidate:
     return pf.Candidate(symbol=symbol, sector=ctx["sectors"].get(symbol, ""),
-                        price=float(row["close"]), score=score)
+                        price=float(row["close"]), score=score, tier=tier)
 
 
 def make_weighted_blend(conf: StrategyConfig, score_fn: Callable) -> Callable:
@@ -256,7 +256,7 @@ def make_rule_then_ml(conf: StrategyConfig, score_fn: Callable) -> Callable:
         ranked_ml = sorted(usable, key=lambda g: g[3], reverse=True)
         ranked_rule = sorted(unusable, key=lambda g: g[2], reverse=True)
         result = [_candidate(s, r, ctx, proba) for s, r, _, proba in ranked_ml]
-        result += [_candidate(s, r, ctx, rule) for s, r, rule, _ in ranked_rule]
+        result += [_candidate(s, r, ctx, rule, tier=1) for s, r, rule, _ in ranked_rule]
         return result
     return decide
 

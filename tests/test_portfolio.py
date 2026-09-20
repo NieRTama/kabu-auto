@@ -477,8 +477,9 @@ class TestCheckSectorConcentration:
         assert ok is False
 
 
-def _candidate(symbol="7203", sector="自動車", price=1000.0, score=0.5):
-    return pf.Candidate(symbol=symbol, sector=sector, price=price, score=score)
+def _candidate(symbol="7203", sector="自動車", price=1000.0, score=0.5, tier=0):
+    return pf.Candidate(symbol=symbol, sector=sector, price=price, score=score,
+                        tier=tier)
 
 
 class TestAllocate:
@@ -490,6 +491,34 @@ class TestAllocate:
             _candidate("C", "情報通信", 1000.0, score=0.50),
         ]
         orders, _ = pf.allocate(p, cands, _sizing(ratio=0.25), {})
+        assert [o.symbol for o in orders] == ["B", "C", "A"]
+
+    def test_tier_takes_priority_over_a_higher_score_in_a_worse_tier(self):
+        """tierが違う候補同士はscoreの数値を直接比較しない。
+
+        Bはscore=0.90だがtier=1、Aはscore=0.10だがtier=0。tierを見ずscore
+        だけで降順ソートする旧実装ならBが先に処理されるが、修正後は
+        (tier, -score)の辞書式順序でtierが低い(=優先度が高い)Aが必ず先に
+        処理される（最終ブランチレビュー・完了条件確認の残課題9の再修正）。
+        """
+        p = pf.empty_portfolio(1_000_000.0)
+        cands = [
+            _candidate("A", "自動車", 1000.0, score=0.10, tier=0),
+            _candidate("B", "機械", 1000.0, score=0.90, tier=1),
+        ]
+        orders, _ = pf.allocate(
+            p, cands, _sizing(ratio=0.10, max_positions=1, sector_ratio=1.0), {})
+        assert [o.symbol for o in orders] == ["A"]
+
+    def test_same_tier_candidates_still_sort_by_score_descending(self):
+        """tierが同じ候補同士は従来通りscore降順（tier追加前の挙動を維持）。"""
+        p = pf.empty_portfolio(1_000_000.0)
+        cands = [
+            _candidate("A", "自動車", 1000.0, score=0.10, tier=1),
+            _candidate("B", "機械", 1000.0, score=0.90, tier=1),
+            _candidate("C", "情報通信", 1000.0, score=0.50, tier=1),
+        ]
+        orders, _ = pf.allocate(p, cands, _sizing(ratio=0.25, sector_ratio=1.0), {})
         assert [o.symbol for o in orders] == ["B", "C", "A"]
 
     def test_cash_shrinks_for_later_candidates(self):

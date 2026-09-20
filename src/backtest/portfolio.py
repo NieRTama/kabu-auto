@@ -305,11 +305,19 @@ def check_sector_concentration(pf: Portfolio, sector: str,
 
 @dataclass(frozen=True)
 class Candidate:
-    """その日の買い候補。"""
+    """その日の買い候補。
+
+    tier は同一の数値軸で比較できないスコアを扱うための優先度区分
+    （既定0）。allocateは(tier, score)の辞書式順序でソートし、
+    tierが違う候補同士のscoreを直接比較しない
+    （make_rule_then_mlのML確率とルールスコアの混合を防ぐ。
+    最終ブランチレビュー・完了条件確認の残課題9の再修正）。
+    """
     symbol: str
     sector: str
     price: float
     score: float
+    tier: int = 0
 
 
 @dataclass(frozen=True)
@@ -363,7 +371,7 @@ def allocate(pf: Portfolio, candidates: list, conf: SizingConfig,
     orders: list = []
     rejected: list = []
 
-    for cand in sorted(candidates, key=lambda c: c.score, reverse=True):
+    for cand in sorted(candidates, key=lambda c: (c.tier, -c.score)):
         ok, reason = check_max_positions(working, cand.symbol, conf)
         if not ok:
             rejected.append(RejectedCandidate(symbol=cand.symbol, reason=reason))
