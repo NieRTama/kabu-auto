@@ -17,6 +17,11 @@ data/*.lock
 # 追跡対象のまま残っていた。公開リポジトリなので階層を問わず落とす。
 data/backups/
 models/*.pkl
+# lgb_model.meta.json は週次再学習のたびに本番プロセスが書き換えるため、
+# 追跡し続けると git status が常時dirtyになる（誤コミットの温床）。
+# 2026-09-14に一度スナップショットとしてコミット済み（047fffd）で、
+# 過去の履歴はそちらに残る。以降は追跡しない。
+models/lgb_model.meta.json
 log/
 
 # 環境変数
