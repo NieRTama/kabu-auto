@@ -340,10 +340,16 @@ class TradingServices:
                 from src.strategy import v2_training
                 from src.backtest import execution
 
-                # 学習窓（学習に使う直近セッション数）。config.yaml側に
-                # 未設定でも動く既定値運用（_v2_retrain と同じ考え方）。
-                # 渡し忘れると ModelMetrics.training_window_sessions が
-                # 常にNULLになる（段階F残課題6）。
+                # 学習窓（学習に使う直近セッション数）。既定はNone＝拡大窓
+                # （validation.apply_training_window()のdocstring参照：
+                # 現行のlegacy週次学習はload_ohlcv()の既定値500行に
+                # 意図せず切られている（レビューF07）。v2はNoneを明示的な
+                # 既定として「切らない」ことを選んでおり、これはバグではなく
+                # 設計上の正しい既定値。ModelMetrics.training_window_sessions
+                # がNULLになるのは「拡大窓を使った」という意味のある記録で
+                # あり、渡し忘れとは異なる。config.yamlに
+                # backtest.retrain_window_sessionsを設定すれば移動窓へ
+                # 切り替えられる（未設定なら拡大窓のまま）。
                 window_sessions = cfg.get_section("backtest").get(
                     "retrain_window_sessions", None)
                 try:
