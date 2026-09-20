@@ -167,10 +167,18 @@ class TestV2ScoreFunction:
         import pandas as pd
 
         from src.dashboard import app as dash
+        from src.strategy import model_store as ms
         from src.strategy.evaluation import CurrentLightGBM
         from src.strategy.indicators import FEATURE_COLS
 
         assert not hasattr(CurrentLightGBM, "predict")
+
+        def _fail_if_called(**kwargs):
+            pytest.fail(
+                "holder経由の経路でload_current()が呼ばれている"
+                "（point-in-timeモデルを無視して昇格モデルへ先読みしている疑い）")
+
+        monkeypatch.setattr(ms, "load_current", _fail_if_called)
 
         rng = np.random.default_rng(0)
         n = 40
@@ -190,6 +198,35 @@ class TestV2ScoreFunction:
         assert rule == pytest.approx(0.3)
         assert proba is not None
         assert 0.0 <= proba <= 1.0
+
+    def test_warmup_does_not_fallback_to_load_current(self, monkeypatch):
+        """ウォームアップ中（holderの中身がまだNone）はload_current()へ絶対に
+        フォールバックしない（外部レビューR04・段階F最終ブランチレビューで
+        検出されたCriticalの再発防止）。
+
+        段階Fで最も重大だったバグは、v2バックテストのスコア関数が
+        `model_store.load_current()`（現在の昇格モデル）の戻り値を生成時に
+        閉包へ固定してしまい、walk-forwardが各判断時点で作るpoint-in-time
+        モデルが捨てられて評価期間全体へ「未来に昇格したモデル」を当てる
+        先読みになる、というものだった。コミット0ad51b4でmodel_holder
+        （可変dict）方式により是正済みだが、その是正を固定するテストが
+        1件も無く、防波堤は「テスト環境に昇格モデルが無いので
+        load_current()がNoneを返す」という環境依存の偶然だけだった。
+        ここではholderを{"model": None}（ウォームアップ中を模す）にした上で
+        load_current()が呼ばれたら明示的に失敗させ、`(rule, None)`が
+        返ることを固定する。
+        """
+        from src.dashboard import app as dash
+        from src.strategy import model_store as ms
+
+        def _fail_if_called(**kwargs):
+            pytest.fail("ウォームアップ中に昇格モデルへフォールバックしている（先読み）")
+
+        monkeypatch.setattr(ms, "load_current", _fail_if_called)
+        score_fn = dash._v2_score_fn(use_ml=True, model_holder={"model": None})
+        rule, proba = score_fn("7203", {"rule_score": 0.3})
+        assert rule == pytest.approx(0.3)
+        assert proba is None
 
     def test_returns_none_probability_when_unpromoted(self, tmp_path, monkeypatch):
         """モデル未昇格ならML確率はNone（ルールだけで動く）。これは劣化ではない"""
@@ -390,3 +427,31 @@ class TestV2BacktestEndToEnd:
         # 戦略節だけでなくコスト・数量制限まで入っている
         assert "costs" in row.config_json
         assert "sizing" in row.config_json
+
+    def test_use_ml_true_is_persisted_as_1(self, isolated_db, client):
+        """use_ml=Trueのv2バックテストは BacktestRun.use_ml==1 を記録する。
+
+        `_run_backtest_v2` から `wf.save_run(..., use_ml=req.use_ml)` へ
+        引数を渡し忘れる種類のバグ（実際に発生した）の再発防止。
+        本クラスの既存E2Eテストは全て use_ml=False で、この経路を
+        一度も通していなかった。
+        """
+        from sqlalchemy import select
+
+        from src.data import database as db
+        from src.data.database import get_session
+
+        idx = self._seed_ohlcv()
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        res = client.post("/api/backtest/run", json={
+            "symbol": "7203",
+            "start": str(idx[200].date()),
+            "end": str(idx[-2].date()),
+            "initial_capital": 1_000_000.0,
+            "use_ml": True,
+        })
+        assert res.status_code == 200, res.text
+        with get_session() as session:
+            row = session.scalars(
+                select(db.BacktestRun).order_by(db.BacktestRun.id.desc())).first()
+        assert row.use_ml == 1
