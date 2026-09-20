@@ -60,9 +60,10 @@ kabu-auto/
 ├── frontend/
 │   └── index.html     # ダッシュボードUI（Chart.js）
 ├── models/
-│   ├── candidates/<model_id>/   # 候補モデル（LightGBMネイティブ形式+JSONメタ、v2）
-│   ├── current.json             # 現行モデルを指すポインタ（v2）
-│   └── lgb_model.pkl            # 学習済み LightGBM モデル（legacy）
+│   ├── lgb_model.pkl            # 学習済み LightGBM モデル（legacy・現行の運用モデル）
+│   ├── lgb_model.meta.json      # モデルのSHA256・学習日時・CV精度（改ざん検知に使用）
+│   ├── current.json             # 現行モデルを指すポインタ（v2の学習実行時に生成）
+│   └── candidates/<model_id>/   # 候補モデル（LightGBMネイティブ形式+JSONメタ、v2の学習実行時に生成）
 ├── data/              # SQLite DB・バックアップ
 ├── log/               # ログ（日付別・INFO以下/WARNING以上で別ファイル・既定15日保持。自動生成）
 ├── docs/              # 概要設計書・詳細設計書
