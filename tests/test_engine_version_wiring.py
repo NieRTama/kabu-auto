@@ -105,6 +105,27 @@ class TestV2Retrain:
             svc.ml_retrain()
         assert svc.model == "existing-model"
 
+    def test_v2_passes_window_sessions_and_trigger(self):
+        """`window_sessions`を渡し忘れると`ModelMetrics.training_window_sessions`
+        が常にNULLになる（段階F残課題6）。呼び出し時に明示的に渡すこと。
+        """
+        cfg.get_section("strategy")["engine_version"] = "v2"
+        cfg.get_section("backtest")["retrain_window_sessions"] = 250
+        svc = _service()
+        try:
+            with patch.object(trading, "load_ohlcv") as load, \
+                 patch.object(trading.watchlist_store, "get_all_codes",
+                              return_value=["7203"]), \
+                 patch("src.strategy.v2_training.train_v2",
+                       return_value=MagicMock(model_id="cand-1",
+                                               skipped_reason=None)) as v2_train:
+                load.return_value = MagicMock(__len__=lambda s: 300)
+                svc.ml_retrain()
+        finally:
+            del cfg.get_section("backtest")["retrain_window_sessions"]
+        assert v2_train.call_args.kwargs.get("window_sessions") == 250
+        assert v2_train.call_args.kwargs.get("trigger") == "weekly_schedule"
+
     def test_v2_failure_does_not_raise(self):
         cfg.get_section("strategy")["engine_version"] = "v2"
         svc = _service()

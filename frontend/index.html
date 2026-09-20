@@ -1249,8 +1249,11 @@
       const archiveBtn = r.archived
         ? `<button onclick="event.stopPropagation();unarchiveBtRun(${r.id})" style="background:#334155;color:#e2e8f0;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:0.72rem;">復元</button>`
         : `<button onclick="event.stopPropagation();archiveBtRun(${r.id})" style="background:#334155;color:#e2e8f0;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;font-size:0.72rem;">保管</button>`;
+      const degradedBadge = r.degraded
+        ? ` <span title="degraded: 先読み診断・再学習失敗等で成績の信頼性が低下した実行" style="color:#fbbf24;">⚠degraded</span>`
+        : '';
       return `<tr style="cursor:pointer;${r.archived ? 'opacity:0.55;' : ''}" onclick="loadBtDetail(${r.id})">
-        <td><strong>${symLabel(r.symbol)}</strong></td>
+        <td><strong>${symLabel(r.symbol)}</strong>${degradedBadge}</td>
         <td style="font-size:0.75rem;color:#64748b;">${period}</td>
         <td style="color:${retColor};font-weight:700;">${(ret * 100).toFixed(1)}%</td>
         <td style="color:#f87171;">${(r.max_drawdown * 100).toFixed(1)}%</td>

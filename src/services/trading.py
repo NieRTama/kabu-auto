@@ -340,11 +340,19 @@ class TradingServices:
                 from src.strategy import v2_training
                 from src.backtest import execution
 
+                # 学習窓（学習に使う直近セッション数）。config.yaml側に
+                # 未設定でも動く既定値運用（_v2_retrain と同じ考え方）。
+                # 渡し忘れると ModelMetrics.training_window_sessions が
+                # 常にNULLになる（段階F残課題6）。
+                window_sessions = cfg.get_section("backtest").get(
+                    "retrain_window_sessions", None)
                 try:
                     result = v2_training.train_v2(
                         {sym: df for sym, df in zip(trained_symbols, dfs)},
                         policy_conf=policy.config_from_settings(),
                         costs=execution.config_from_settings(),
+                        window_sessions=window_sessions,
+                        trigger="weekly_schedule",
                     )
                     if result.model_id:
                         logger.warning(

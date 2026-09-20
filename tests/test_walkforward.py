@@ -768,6 +768,32 @@ class TestWeeklyRetrain:
         assert len(res.model_usage) == 3
         assert res.model_usage["from_session"].is_monotonic_increasing
 
+    def test_model_id_is_not_a_memory_address(self):
+        """model_idはモデルオブジェクトのrepr()（メモリアドレス）を使わない
+        （段階F残課題4）。学習時刻ベースの一意なIDが振られる。
+        """
+        class DummyModel:
+            """`str()`がPythonのデフォルトrepr（メモリアドレス入り）になる
+            モデルの代わり"""
+
+        def train(as_of):
+            return DummyModel(), 100
+
+        md = _market(symbols=("A",), n=20)
+        res = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 24),
+            initial_capital=1_000_000.0, decide=_never_buy,
+            policy_conf=_policy_conf(), costs=_costs(), sizing=_sizing(),
+            liquidity=execution.LiquidityConfig(),
+            retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
+            train_model=train)
+        ids = res.model_usage["model_id"].tolist()
+        assert len(ids) == 3
+        for model_id in ids:
+            assert "object at 0x" not in model_id
+            assert model_id.startswith("walkforward-")
+        assert len(set(ids)) == len(ids)  # 各期間で一意
+
     def test_model_is_passed_to_decide(self):
         """decide はその時点で有効なモデルを受け取る"""
         md = _market(symbols=("A",), n=20)

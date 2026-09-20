@@ -415,7 +415,12 @@ def run_walkforward(md: MarketData, start: date, end: date, *,
                 })
             try:
                 current_model, current_n_train = train_model(session)
-                current_model_id = str(current_model)
+                # str(current_model) はモデルオブジェクトのrepr()
+                # （`<... object at 0x...>`）になり、Pythonプロセスの
+                # メモリアドレスに依存するため識別・追跡に使えない
+                # （段階F残課題4）。学習時刻ベースの一意なIDを別途振る。
+                current_model_id = (
+                    f"walkforward-{clock.now().strftime('%Y%m%d%H%M%S%f')}-{index}")
                 model_since = session
             except Exception as e:
                 degraded_reasons.append(f"{session}: 再学習に失敗しました: {e}")

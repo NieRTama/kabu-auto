@@ -231,6 +231,25 @@ class TestTrainV2:
         assert rows
         assert rows[-1].engine_version == "v2"
 
+    def test_window_sessions_is_recorded_in_metrics(
+            self, isolated_db, tmp_path, monkeypatch):
+        """`window_sessions` を渡すと `ModelMetrics.training_window_sessions`
+        へそのまま記録される（段階F残課題6）。
+        """
+        from src.data.database import ModelMetrics
+        from src.strategy import v2_training
+
+        monkeypatch.setattr(
+            v2_training, "MIN_RESOLVED_EVENTS", _TEST_MIN_RESOLVED_EVENTS)
+        v2_training.train_v2(
+            self._bars(), policy_conf=_policy_conf(), costs=_costs(),
+            base_dir=str(tmp_path / "models"), window_sessions=250)
+
+        with get_session() as session:
+            rows = list(session.scalars(select(ModelMetrics)).all())
+        assert rows
+        assert rows[-1].training_window_sessions == 250
+
     def test_skips_when_there_are_too_few_events(self, isolated_db, tmp_path):
         """イベントが足りなければ学習せず理由を返す（例外にしない）"""
         from src.strategy import v2_training
@@ -240,6 +259,32 @@ class TestTrainV2:
             base_dir=str(tmp_path / "models"))
         assert res.model_id is None
         assert res.skipped_reason is not None
+
+    def test_skip_due_to_too_few_events_still_records_a_metrics_row(
+            self, isolated_db, tmp_path):
+        """イベント不足でスキップしても、見送った履歴として`ModelMetrics`に
+        1行だけ残す（段階F残課題6）。model_id/positive_rateはNoneのまま、
+        n_samplesは決着イベント数、engine_versionは"v2"、triggerは
+        呼び出し元が渡した値になる。
+        """
+        from src.data.database import ModelMetrics
+        from src.strategy import v2_training
+
+        res = v2_training.train_v2(
+            {"7203": _ohlcv(n=30)}, policy_conf=_policy_conf(), costs=_costs(),
+            base_dir=str(tmp_path / "models"), trigger="manual_test")
+        assert res.model_id is None
+        assert res.skipped_reason is not None
+
+        with get_session() as session:
+            rows = list(session.scalars(select(ModelMetrics)).all())
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.model_id is None
+        assert row.positive_rate is None
+        assert row.n_samples == res.n_resolved
+        assert row.engine_version == "v2"
+        assert row.trigger == "manual_test"
 
     def test_does_not_touch_the_legacy_model_file(self, isolated_db, tmp_path):
         """models/lgb_model.pkl を壊さない"""

@@ -1418,6 +1418,25 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
     旧エンジンとは入力も出力も違う。結果は strategy_version と
     execution_model_version を付けて保存し、旧エンジンの結果と混ぜない
     （設計書 §10）。
+
+    本体は`_run_backtest_v2_sync`（同期関数）に丸ごと切り出し、ここで
+    **1回だけ** `asyncio.to_thread` に包む。load_ohlcv×2・
+    build_feature_frame・ds.rule_scores・`_v2_retrain`内のload_ohlcv・
+    ds.build_events_multi（O(n²)傾向）は重い同期処理で、ここを包まずに
+    個別の重い呼び出し（run_walkforward・save_run）だけを
+    `asyncio.to_thread` していると、その手前の処理でuvicornのイベント
+    ループが分単位でブロックされ続ける。
+    """
+    return await asyncio.to_thread(_run_backtest_v2_sync, req, start_d, end_d)
+
+
+def _run_backtest_v2_sync(req: BacktestRequest, start_d: date, end_d: date):
+    """`_run_backtest_v2` の本体（同期）。
+
+    呼び出し元がすでにバックグラウンドスレッドの中でこの関数全体を
+    実行しているため、ここでは `await` できない。`wf.run_walkforward`・
+    `wf.save_run` は（この関数の中では）単純な同期呼び出しにする
+    （二重に`asyncio.to_thread`へ投げない）。
     """
     from dataclasses import replace as dc_replace
 
@@ -1499,8 +1518,8 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
         if loaded is not None:
             diagnostic_model = loaded[0]
 
-    result = await asyncio.to_thread(
-        wf.run_walkforward, md, start_d, end_d,
+    result = wf.run_walkforward(
+        md, start_d, end_d,
         initial_capital=req.initial_capital, decide=decide,
         policy_conf=policy_conf,
         costs=costs,
@@ -1522,8 +1541,8 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
         code_version=run_config.code_version,
         execution_model_version="t1_open_v1",
     )
-    run_id = await asyncio.to_thread(
-        wf.save_run, result, snapshot, symbol_label=req.symbol,
+    run_id = wf.save_run(
+        result, snapshot, symbol_label=req.symbol,
         start=start_d, end=end_d,
         initial_capital=req.initial_capital,
         costs=costs, use_ml=req.use_ml)
@@ -1809,6 +1828,7 @@ def _serialize_run(r: BacktestRun) -> dict:
         "buy_threshold": r.buy_threshold,
         "sell_threshold": r.sell_threshold,
         "archived": bool(r.archived),
+        "degraded": bool(r.degraded),
         "created_at": r.created_at.isoformat() if r.created_at else None,
     }
 
