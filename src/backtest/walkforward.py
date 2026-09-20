@@ -219,6 +219,17 @@ def make_rule_then_ml(conf: StrategyConfig, score_fn: Callable) -> Callable:
     **まず試すのはこれ。** 全日付を機械的に買い・売りへ変換せず、
     ルールが候補としたイベントに対してのみMLの追加効果を測るため（spec §8）。
     MLが無い・失敗した場合の動作は on_model_failure で明示する。
+
+    on_model_failure == halt_new はその日の新規候補生成を全銘柄一括で
+    停止する（意図的な全体停止ポリシー。1銘柄でもML確率が取れなければ
+    空リストを返す）。
+
+    on_model_failure == rule_only は銘柄ごとに独立させる。1銘柄のML
+    推論失敗が、正常にML確率を取れた他銘柄の判断まで道連れにして
+    ルールスコアへ落とすと、その情報が失われる（項目9）。ML確率が
+    取れた銘柄は確率順で先頭に、取れなかった銘柄はルールスコア順で
+    その後ろに続ける2段ランキングにする。ML確率と生のルールスコアは
+    スケールが違うため、1つの数値として混ぜて比較しない。
     """
     def decide(session, rows, model, ctx):
         gated = []
@@ -228,15 +239,25 @@ def make_rule_then_ml(conf: StrategyConfig, score_fn: Callable) -> Callable:
                 continue
             gated.append((symbol, row, rule, proba))
 
-        usable = [g for g in gated if g[3] is not None]
-        if len(usable) < len(gated):
-            if conf.on_model_failure == ON_FAILURE_HALT_NEW:
-                return []
-            # rule_only: ML無しの候補はルールスコアで順位付けする
-            return [_candidate(s, r, ctx, rule) for s, r, rule, _ in gated]
+        if not gated:
+            return []
 
-        ranked = sorted(usable, key=lambda g: g[3], reverse=True)
-        return [_candidate(s, r, ctx, proba) for s, r, _, proba in ranked]
+        if conf.on_model_failure == ON_FAILURE_HALT_NEW:
+            if any(g[3] is None for g in gated):
+                return []
+            ranked = sorted(gated, key=lambda g: g[3], reverse=True)
+            return [_candidate(s, r, ctx, proba) for s, r, _, proba in ranked]
+
+        # rule_only: ML確率がある銘柄をまず確率順で並べ、無い銘柄は
+        # ルールスコア順で後ろへ続ける（1銘柄の推論不能が他銘柄のML判断を
+        # 道連れにしない）。
+        usable = [g for g in gated if g[3] is not None]
+        unusable = [g for g in gated if g[3] is None]
+        ranked_ml = sorted(usable, key=lambda g: g[3], reverse=True)
+        ranked_rule = sorted(unusable, key=lambda g: g[2], reverse=True)
+        result = [_candidate(s, r, ctx, proba) for s, r, _, proba in ranked_ml]
+        result += [_candidate(s, r, ctx, rule) for s, r, rule, _ in ranked_rule]
+        return result
     return decide
 
 

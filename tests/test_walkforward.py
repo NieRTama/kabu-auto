@@ -1182,6 +1182,49 @@ class TestRuleThenMl:
         assert len(keep(date(2026, 1, 5), rows, None, ctx)) != len(
             halt(date(2026, 1, 5), rows, None, ctx))
 
+    def test_all_usable_matches_the_ml_only_ranking(self):
+        """境界ケース: 全員usableなら結果はML確率順のみ（旧実装と完全一致）"""
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.30, "C": 0.30}[symbol],
+                    {"A": 0.40, "B": 0.80, "C": 0.60}[symbol])
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {s: "S" for s in "ABC"}, "portfolio": None, "closes": {}}
+        rows = {s: pd.Series({"close": 1000.0}) for s in "ABC"}
+        got = decide(date(2026, 1, 5), rows, "m", ctx)
+        assert [c.symbol for c in got] == ["B", "C", "A"]
+        assert [c.score for c in got] == [0.80, 0.60, 0.40]
+
+    def test_all_unusable_matches_the_rule_only_ranking(self):
+        """境界ケース: 全員unusableなら結果はルールスコア順のみ（旧実装と完全一致）"""
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.50, "C": 0.40}[symbol], None)
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {s: "S" for s in "ABC"}, "portfolio": None, "closes": {}}
+        rows = {s: pd.Series({"close": 1000.0}) for s in "ABC"}
+        got = decide(date(2026, 1, 5), rows, None, ctx)
+        assert [c.symbol for c in got] == ["B", "C", "A"]
+        assert [c.score for c in got] == [0.50, 0.40, 0.30]
+
+    def test_mixed_failure_keeps_ml_ranked_symbols_independent_of_the_failed_one(self):
+        """混在ケース: 1銘柄のML失敗が他銘柄のML判断を道連れにしない（項目9）。
+
+        ML確率がある銘柄は確率順で前方に、無い銘柄はルールスコア順で
+        usableの後ろに続く2段ランキングになること。
+        """
+        def score_fn(symbol, row):
+            return ({"A": 0.30, "B": 0.30, "C": 0.90, "D": 0.50}[symbol],
+                    {"A": 0.40, "B": 0.80, "C": None, "D": None}[symbol])
+
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), score_fn)
+        ctx = {"sectors": {s: "S" for s in "ABCD"}, "portfolio": None, "closes": {}}
+        rows = {s: pd.Series({"close": 1000.0}) for s in "ABCD"}
+        got = decide(date(2026, 1, 5), rows, "m", ctx)
+        # 前方: ML確率順（B=0.80 > A=0.40）。後方: ルールスコア順（C=0.90 > D=0.50）
+        assert [c.symbol for c in got] == ["B", "A", "C", "D"]
+        assert [c.score for c in got] == [0.80, 0.40, 0.90, 0.50]
+
 
 class TestThreeStrategiesShareTheSameLoop:
     def test_all_three_run_on_the_same_market_data(self):
