@@ -976,6 +976,19 @@ class TestSaveRun:
         assert len(usages) == len(res.model_usage)
         assert all(u.run_id == run_id for u in usages)
 
+    def test_use_ml_flag_is_persisted(self, isolated_db):
+        """use_ml=True を渡すと BacktestRun.use_ml へ1が入る（既定は0のまま）。
+
+        既定値のバグ: 誰も use_ml を渡さなかったため列は常に0だった。
+        """
+        wf.save_run(
+            self._result(), self._snapshot(), symbol_label="PORTFOLIO",
+            start=date(2026, 1, 5), end=date(2026, 1, 14),
+            initial_capital=1_000_000.0, costs=_costs(), use_ml=True)
+        with get_session() as session:
+            row = session.scalar(select(db.BacktestRun))
+        assert row.use_ml == 1
+
     def test_daily_nav_is_stored_as_the_equity_curve(self, isolated_db):
         wf.save_run(
             self._result(), self._snapshot(), symbol_label="PORTFOLIO",

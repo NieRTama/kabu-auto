@@ -1526,7 +1526,7 @@ async def _run_backtest_v2(req: BacktestRequest, start_d: date, end_d: date):
         wf.save_run, result, snapshot, symbol_label=req.symbol,
         start=start_d, end=end_d,
         initial_capital=req.initial_capital,
-        costs=costs)
+        costs=costs, use_ml=req.use_ml)
 
     return {"run_id": run_id, "engine_version": "v2",
             "degraded": result.degraded,
@@ -1738,6 +1738,21 @@ def _v2_score_fn(use_ml: bool, model_holder: Optional[dict] = None):
                 # load_current()へは絶対にフォールバックしない（先読み防止）。
                 return rule, None
             cols = list(FEATURE_COLS)
+            features = _required_feature_row(row, cols)
+            # ここに来るモデルは常に _v2_retrain の train_model() が作る
+            # src.strategy.evaluation.CurrentLightGBM（_LightGbmBase の
+            # サブクラス）。これは再学習のたびに使い捨てで作る「評価用
+            # ラッパー」であり、公開APIは predict_proba(X) だけで
+            # predict() は存在しない（AttributeError→ModelInferenceErrorに
+            # なり、ウォームアップ後の全推論日で必ず失敗していた実バグ）。
+            # model_store.load_current() 経由のモデルとは保存形式もAPIも
+            # 別物なので、ダックタイピングで曖昧に分岐せずここで確定させる。
+            try:
+                proba = float(model.predict_proba(pd_mod.DataFrame([features]))[0])
+            except Exception as e:
+                logger.error(f"v2バックテストのML推論に失敗: {symbol} {e}")
+                raise ModelInferenceError(f"{symbol}: {e}") from e
+            return rule, proba
         else:
             # use_current_model_fixed=True の診断専用経路。
             loaded = ms.load_current()
@@ -1745,13 +1760,18 @@ def _v2_score_fn(use_ml: bool, model_holder: Optional[dict] = None):
                 return rule, None
             model, meta = loaded
             cols = list(meta.feature_cols)
-        features = _required_feature_row(row, cols)
-        try:
-            proba = float(model.predict(pd_mod.DataFrame([features]))[0])
-        except Exception as e:
-            logger.error(f"v2バックテストのML推論に失敗: {symbol} {e}")
-            raise ModelInferenceError(f"{symbol}: {e}") from e
-        return rule, proba
+            features = _required_feature_row(row, cols)
+            # ここに来るモデルは常に model_store.load_current() /
+            # load_model() が返す「昇格済みモデルの保存形式」
+            # （lgb.Booster か model_store.ConstantModel）。どちらも
+            # predict(X) -> 正例確率の1次元配列を持つ（model_store の
+            # docstringに明記）が、predict_proba() は持たない。
+            try:
+                proba = float(model.predict(pd_mod.DataFrame([features]))[0])
+            except Exception as e:
+                logger.error(f"v2バックテストのML推論に失敗: {symbol} {e}")
+                raise ModelInferenceError(f"{symbol}: {e}") from e
+            return rule, proba
 
     return score_fn
 

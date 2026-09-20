@@ -150,6 +150,47 @@ class TestBacktestEngineSelection:
 
 
 class TestV2ScoreFunction:
+    def test_holder_path_uses_predict_proba_not_predict(self, monkeypatch):
+        """回帰テスト: model_holder経由は必ずCurrentLightGBM(predict_proba専用)。
+
+        既存テスト（本クラスの他のテスト）は load_current() を
+        `.predict()` だけのスタブに差し替えるだけで、holder経由の経路を
+        一度も通していなかった。そのため `_v2_score_fn` が holder 側にも
+        `.predict()` を呼ぶ実バグ（AttributeError→ModelInferenceError、
+        ウォームアップ後の全推論日で必ず失敗し degraded になっていた）を
+        検出できなかった。ここでは実物の CurrentLightGBM
+        （predict_proba() のみを持ち predict() を持たない）を
+        model_holder へ入れて score_fn を呼び、例外にならず確率が
+        返ることを固定する。
+        """
+        import numpy as np
+        import pandas as pd
+
+        from src.dashboard import app as dash
+        from src.strategy.evaluation import CurrentLightGBM
+        from src.strategy.indicators import FEATURE_COLS
+
+        assert not hasattr(CurrentLightGBM, "predict")
+
+        rng = np.random.default_rng(0)
+        n = 40
+        X = pd.DataFrame(
+            rng.normal(size=(n, len(FEATURE_COLS))), columns=list(FEATURE_COLS))
+        y = pd.Series([0, 1] * (n // 2))
+        model = CurrentLightGBM()
+        model.fit(X, y, np.ones(n))
+
+        model_holder = {"model": model}
+        score_fn = dash._v2_score_fn(use_ml=True, model_holder=model_holder)
+        row = {"rule_score": 0.3}
+        row.update({c: 0.1 for c in FEATURE_COLS})
+
+        rule, proba = score_fn("7203", row)
+
+        assert rule == pytest.approx(0.3)
+        assert proba is not None
+        assert 0.0 <= proba <= 1.0
+
     def test_returns_none_probability_when_unpromoted(self, tmp_path, monkeypatch):
         """モデル未昇格ならML確率はNone（ルールだけで動く）。これは劣化ではない"""
         from src.dashboard import app as dash

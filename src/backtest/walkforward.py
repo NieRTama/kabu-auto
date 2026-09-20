@@ -113,12 +113,18 @@ class RunSnapshot:
 
 def save_run(result: WalkForwardResult, snapshot: RunSnapshot, *,
              symbol_label: str, start: date, end: date,
-             initial_capital: float, costs: execution.CostConfig) -> int:
+             initial_capital: float, costs: execution.CostConfig,
+             use_ml: bool = False) -> int:
     """実行結果と来歴を保存し、run_id を返す。
 
     日次NAVは equity_curve_json に、モデル使用履歴は RunModelUsage に入れる。
     degraded な実行も**保存する**（比較から外すのは読む側の責任で、
     「失敗した実行があったこと」自体は残す）。
+
+    `use_ml` は既定 False（キーワード専用）。legacyの `engine.run_backtest`
+    は use_ml を記録しているが、v2のこの関数はこれまで渡していなかった
+    ため BacktestRun.use_ml が常に0のままだった。既定値があるので
+    既存の呼び出しは壊れない。
     """
     from src.data.database import BacktestRun, RunModelUsage, get_session
 
@@ -143,6 +149,7 @@ def save_run(result: WalkForwardResult, snapshot: RunSnapshot, *,
             code_version=snapshot.code_version,
             execution_model_version=snapshot.execution_model_version,
             degraded=1 if result.degraded else 0,
+            use_ml=1 if use_ml else 0,
         )
         session.add(run)
         session.flush()
