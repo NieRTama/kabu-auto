@@ -279,3 +279,74 @@ python scripts/gen_graph_notes.py
 - 生成物はgit管理外。派生データなので再生成すれば復元できる
 - iCloudがオフラインだと出力先の親が見えず中断する。その場合は同期を待って再実行する
 - ノート名がvault内の既存ノートと衝突した場合も中断する。表示された名前を確認すること
+
+---
+
+## 候補モデルの学習・評価・昇格（手動）
+
+**このツールはスケジューラに登録されていない。人間が叩いたときだけ動く。**
+週次再学習（`ml_retrain`）が作る候補とは独立に、任意のタイミングで候補を
+作り・評価し・昇格できる。
+
+### 1. 候補モデルを学習する
+
+```bash
+python -m scripts.promote_workflow train
+```
+
+- ウォッチリスト全リストの銘柄（200本以上のOHLCVがあるもの）で学習する
+- `risk_profile.json`（現状 high_risk）を適用した実効値でラベルを作る
+- 既定は全期間を使う（分析報告書と同条件）。直近N本に絞りたいときは
+  `--ohlcv-limit N`（週次再学習の既定500本は意図しない切り詰めのため
+  踏襲しない）
+- **運用モデルは変更されない。** 候補が `models/candidates/<model_id>/` に
+  保存されるだけ
+- 決着イベントが200件に届かないと候補は作られず終了コード1になる
+
+### 2. 候補を評価する
+
+```bash
+python -m scripts.promote_workflow evaluate <model_id>
+```
+
+- 学習時に保存されたイベント表（`data/datasets/<dataset_id>.csv.gz`）を
+  読み直し、walk-forward（5分割）で評価する
+- fold別のAUC・Brierと、その平均を表示する
+- 最後に `evaluation_run_id: <id>` を表示する。これが昇格の根拠になる
+- `degraded: N件` と出た評価記録では昇格できない（縮退した成績は根拠に
+  できない）
+
+**読み方の注意**: AUC 0.5 は「予測力が無い」のと区別できない。実データでの
+5モデル比較では現行相当モデルのAUCは 0.5018（p=0.7231）だった
+（`docs/kabu-auto-ml-real-data-comparison_20260921.md`）。数字が出たこと
+自体は昇格の理由にならない。
+
+### 3. 昇格できるか確認する（現行は変えない）
+
+```bash
+python -m scripts.promote_workflow promote <model_id> <evaluation_run_id> \
+    --reason "..." --decided-by "..." --dry-run
+```
+
+拒否理由は**全件**表示される。1つ直しては再実行、を繰り返さずに済む。
+
+### 4. 昇格する
+
+```bash
+python -m scripts.promote_workflow promote <model_id> <evaluation_run_id> \
+    --reason "AUC・Brierを確認し現行より悪化がないため" --decided-by "garnet"
+```
+
+- `--reason` と `--decided-by` は必須。空文字・空白のみは拒否される
+- 検査に通らなければ**現行を一切変更せず**終了コード1で終わる
+- 成功すると `models/current.json` が新しい候補を指し、`model_promotions`
+  に `state=committed` の記録が残る
+
+### 5. 戻す（ロールバック）
+
+CLIには実装していない。Pythonから `promotion.rollback()` を呼ぶ
+（判断者と理由は戻す方向でも必須）:
+
+```bash
+python -c "from src.core import config as cfg; from src.data import database as db; from src.core import risk_profile as rp; cfg.load('config.yaml'); rp.load('risk_profile.json'); db.init(); from src.strategy import promotion; print(promotion.rollback(decided_by='garnet', reason='昇格後に成績が悪化したため'))"
+```
