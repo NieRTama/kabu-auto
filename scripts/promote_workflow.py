@@ -28,6 +28,8 @@ import argparse
 import sys
 from typing import Optional
 
+import pandas as pd
+
 if hasattr(sys.stdout, "reconfigure"):
     # Windowsのcp932環境で日本語出力が UnicodeEncodeError で落ちるのを防ぐ
     # （scripts/gen_graph_notes.py と同じ対処）
@@ -155,6 +157,96 @@ def cmd_train(args) -> int:
     return EXIT_OK
 
 
+# ─── evaluate ─────────────────────────────────────────────────────────────
+
+
+def _mean_or_none(series) -> Optional[float]:
+    """NaN を除いた平均。全て NaN なら None を返す。
+
+    `roc_auc` / `average_precision` は検証側が片側クラスだと None になる
+    （src/strategy/evaluation.py:429-430）。その fold を 0 とみなして平均すると
+    成績を過小評価するため、除いて平均する。
+    """
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    return float(values.mean()) if len(values) else None
+
+
+def cmd_evaluate(args) -> int:
+    """候補モデルと同じ構成（CurrentLightGBM）でwalk-forward評価し、記録を残す。
+
+    評価対象のイベント表は**学習時に保存されたもの**を読み直す。作り直すと
+    設定やデータの更新で別のイベント表になり、候補が学習したものと違う
+    ラベル契約で評価してしまう（check_promotable がラベル契約の不一致で拒否する）。
+    """
+    from src.strategy import dataset as ds
+    from src.strategy import evaluation
+    from src.strategy import model_store as ms
+
+    _bootstrap(args.config)
+
+    try:
+        meta = ms.read_meta(args.model_id, base_dir=args.base_dir)
+    except FileNotFoundError as e:
+        print(f"候補モデルが見つかりません: {e}")
+        return EXIT_ERROR
+
+    path = ds.dataset_path(meta.dataset_id)
+    if not path.exists():
+        print(f"イベント表がありません: {path}"
+              f"（model_id={args.model_id} の dataset_id={meta.dataset_id}）")
+        print("先に train を実行してください（イベント表は学習時に保存されます）")
+        return EXIT_ERROR
+    events = ds.load_events(meta.dataset_id)
+
+    contracts = sorted(set(events["label_contract_id"].dropna().astype(str)))
+    print(f"候補: {args.model_id}")
+    print(f"dataset_id: {meta.dataset_id} / イベント {len(events)}件")
+    print(f"ラベル契約: events={contracts} model={meta.label_contract_id}")
+    if meta.label_contract_id not in contracts:
+        print("警告: ラベル契約が一致しません。この評価記録では昇格できません")
+
+    # **候補の model_id をキーにする。** check_promotable() は
+    # load_prediction_details(evaluation_run_id, model_id=model_id) で
+    # この鍵と突き合わせる（src/strategy/promotion.py:106）。"current_lightgbm"
+    # のような汎用名で保存すると予測明細が見つからず永久に昇格できない。
+    # window_sessions / feature_cols はメタから取る（学習時の条件を再現する）。
+    out = evaluation.run_evaluation(
+        events,
+        model_factories={args.model_id: evaluation.CurrentLightGBM},
+        n_splits=args.n_splits,
+        window_sessions=meta.training_window_sessions,
+        feature_cols=list(meta.feature_cols),
+        persist=True,
+    )
+
+    summary = out["summary"]
+    if summary.empty:
+        print("fold結果が0件でした（分割できるイベントがありません）")
+        return EXIT_ERROR
+
+    print("")
+    print(summary.to_string(index=False))
+    print("")
+    print(f"AUC平均: {_mean_or_none(summary['roc_auc'])}")
+    print(f"Brier平均: {_mean_or_none(summary['brier'])}")
+    print(f"Brier vs 定数(平均): {_mean_or_none(summary['brier_vs_constant'])}")
+    print("（Brier vs 定数が正なら定数モデルより良い。"
+          "AUC 0.5 は予測力が無いのと区別できない）")
+
+    reasons = out["degraded_reasons"]
+    if reasons:
+        print(f"degraded: {len(reasons)}件。この評価記録では昇格できません")
+        for reason in reasons:
+            print(f"  - {reason}")
+
+    print("")
+    print(f"evaluation_run_id: {out['evaluation_run_id']}")
+    print("昇格する場合（昇格するかどうかは評価結果を見てから判断すること）:")
+    print(f"  python -m scripts.promote_workflow promote {args.model_id} "
+          f"{out['evaluation_run_id']} --reason \"...\" --decided-by \"...\"")
+    return EXIT_OK
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────
 
 
@@ -178,6 +270,14 @@ def build_parser() -> argparse.ArgumentParser:
              "500本既定は意図しない切り詰め＝レビューF07の対象であり、"
              "本ワークフローでは踏襲しない）")
     p_train.set_defaults(func=cmd_train)
+
+    p_eval = sub.add_parser(
+        "evaluate", help="候補モデルをwalk-forwardで評価し評価記録を残す")
+    p_eval.add_argument("model_id", help="train が表示した候補のmodel_id")
+    p_eval.add_argument(
+        "--n-splits", type=int, default=5,
+        help="walk-forwardの分割数（既定: 5＝train_v2 と同じfold構造）")
+    p_eval.set_defaults(func=cmd_evaluate)
 
     return parser
 

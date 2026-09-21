@@ -227,3 +227,200 @@ class TestTrain:
         monkeypatch.setattr(pw, "_collect_ohlcv", lambda limit: ({}, ["7203(10本)"]))
 
         assert pw.main(["--base-dir", str(tmp_path / "models"), "train"]) == 1
+
+
+class TestEvaluate:
+    def _meta(self):
+        from datetime import datetime
+
+        from src.strategy import model_store as ms
+
+        return ms.ModelMeta(
+            model_id="v2-20260921T120000-abcdef12",
+            trained_at=datetime(2026, 9, 21, 12, 0, 0),
+            training_window_sessions=None,
+            feature_cols=["rsi", "ma_dev"],
+            dataset_id="ds000001",
+            label_contract_id="lc0001",
+        )
+
+    def test_uses_the_candidate_model_id_as_the_factory_key(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        """model_factories の鍵は候補の model_id 自身であること
+
+        check_promotable() は load_prediction_details(run_id, model_id=候補ID)
+        で突き合わせる（src/strategy/promotion.py:106）。"current_lightgbm"
+        のような汎用名で保存すると予測明細が見つからず永久に昇格できない。
+        """
+        from src.strategy import dataset as ds
+        from src.strategy import evaluation
+        from src.strategy import model_store as ms
+
+        meta = self._meta()
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_meta",
+                            lambda model_id, base_dir="models": meta)
+
+        stored = tmp_path / "ds000001.csv.gz"
+        stored.write_bytes(b"")
+        events = pd.DataFrame({"label_contract_id": ["lc0001", "lc0001"]})
+        monkeypatch.setattr(
+            ds, "dataset_path",
+            lambda dataset_id, base_dir="data/datasets": stored)
+        monkeypatch.setattr(
+            ds, "load_events",
+            lambda dataset_id, base_dir="data/datasets": events)
+
+        captured = {}
+
+        def fake_run_evaluation(ev, **kwargs):
+            captured["events"] = ev
+            captured.update(kwargs)
+            return {
+                "evaluation_run_id": "20260921T130000-0badf00d",
+                "fold_results": [],
+                "summary": pd.DataFrame([
+                    {"fold_index": 0, "model_id": meta.model_id, "n_val": 100,
+                     "roc_auc": 0.5123, "brier": 0.2476,
+                     "brier_vs_constant": -0.0004},
+                ]),
+                "degraded_reasons": [],
+            }
+
+        monkeypatch.setattr(evaluation, "run_evaluation", fake_run_evaluation)
+
+        assert pw.main(["evaluate", meta.model_id]) == 0
+        assert captured["model_factories"] == {
+            meta.model_id: evaluation.CurrentLightGBM}
+        assert captured["persist"] is True
+        assert captured["n_splits"] == 5
+        assert captured["window_sessions"] is None
+        assert captured["feature_cols"] == ["rsi", "ma_dev"]
+        assert "evaluation_run_id: 20260921T130000-0badf00d" in capsys.readouterr().out
+
+    def test_reports_degraded_reasons_and_still_succeeds(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        """degraded は評価の失敗ではない。記録は残し、昇格できない旨を伝える"""
+        from src.strategy import dataset as ds
+        from src.strategy import evaluation
+        from src.strategy import model_store as ms
+
+        meta = self._meta()
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_meta",
+                            lambda model_id, base_dir="models": meta)
+        stored = tmp_path / "ds000001.csv.gz"
+        stored.write_bytes(b"")
+        monkeypatch.setattr(
+            ds, "dataset_path", lambda dataset_id, base_dir="data/datasets": stored)
+        monkeypatch.setattr(
+            ds, "load_events", lambda dataset_id, base_dir="data/datasets":
+            pd.DataFrame({"label_contract_id": ["lc0001"]}))
+        monkeypatch.setattr(
+            evaluation, "run_evaluation",
+            lambda ev, **kw: {
+                "evaluation_run_id": "run-x", "fold_results": [],
+                "summary": pd.DataFrame([{"fold_index": 0, "roc_auc": None,
+                                          "brier": 0.25,
+                                          "brier_vs_constant": 0.0}]),
+                "degraded_reasons": ["fold 0 model=v2-x: モデルが定数に縮退"]})
+
+        assert pw.main(["evaluate", meta.model_id]) == 0
+        out = capsys.readouterr().out
+        assert "degraded: 1件" in out
+        assert "モデルが定数に縮退" in out
+        assert "AUC平均: None" in out
+
+    def test_warns_when_the_label_contract_does_not_match(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        from src.strategy import dataset as ds
+        from src.strategy import evaluation
+        from src.strategy import model_store as ms
+
+        meta = self._meta()
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_meta",
+                            lambda model_id, base_dir="models": meta)
+        stored = tmp_path / "ds000001.csv.gz"
+        stored.write_bytes(b"")
+        monkeypatch.setattr(
+            ds, "dataset_path", lambda dataset_id, base_dir="data/datasets": stored)
+        monkeypatch.setattr(
+            ds, "load_events", lambda dataset_id, base_dir="data/datasets":
+            pd.DataFrame({"label_contract_id": ["OTHER"]}))
+        monkeypatch.setattr(
+            evaluation, "run_evaluation",
+            lambda ev, **kw: {
+                "evaluation_run_id": "run-x", "fold_results": [],
+                "summary": pd.DataFrame([{"fold_index": 0, "roc_auc": 0.5,
+                                          "brier": 0.25,
+                                          "brier_vs_constant": 0.0}]),
+                "degraded_reasons": []})
+
+        assert pw.main(["evaluate", meta.model_id]) == 0
+        assert "ラベル契約が一致しません" in capsys.readouterr().out
+
+    def test_errors_when_the_candidate_is_missing(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        from src.strategy import model_store as ms
+
+        def raise_missing(model_id, base_dir="models"):
+            raise FileNotFoundError(f"メタが見つかりません: {base_dir}/candidates/{model_id}/meta.json")
+
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_meta", raise_missing)
+
+        assert pw.main(["evaluate", "v2-nope"]) == 1
+        assert "候補モデルが見つかりません" in capsys.readouterr().out
+
+    def test_errors_when_the_saved_event_table_is_missing(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        """イベント表が無ければ評価しない（無言で作り直して別データを評価しない）"""
+        from src.strategy import dataset as ds
+        from src.strategy import model_store as ms
+
+        meta = self._meta()
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_meta",
+                            lambda model_id, base_dir="models": meta)
+        monkeypatch.setattr(
+            ds, "dataset_path",
+            lambda dataset_id, base_dir="data/datasets":
+            tmp_path / "missing" / "ds000001.csv.gz")
+
+        assert pw.main(["evaluate", meta.model_id]) == 1
+        out = capsys.readouterr().out
+        assert "イベント表がありません" in out
+        assert "ds000001" in out
+
+    def test_errors_when_no_fold_produced_a_result(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        from src.strategy import dataset as ds
+        from src.strategy import evaluation
+        from src.strategy import model_store as ms
+
+        meta = self._meta()
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_meta",
+                            lambda model_id, base_dir="models": meta)
+        stored = tmp_path / "ds000001.csv.gz"
+        stored.write_bytes(b"")
+        monkeypatch.setattr(
+            ds, "dataset_path", lambda dataset_id, base_dir="data/datasets": stored)
+        monkeypatch.setattr(
+            ds, "load_events", lambda dataset_id, base_dir="data/datasets":
+            pd.DataFrame({"label_contract_id": ["lc0001"]}))
+        monkeypatch.setattr(
+            evaluation, "run_evaluation",
+            lambda ev, **kw: {"evaluation_run_id": "run-x", "fold_results": [],
+                              "summary": pd.DataFrame(),
+                              "degraded_reasons": []})
+
+        assert pw.main(["evaluate", meta.model_id]) == 1
+        assert "fold結果が0件" in capsys.readouterr().out
