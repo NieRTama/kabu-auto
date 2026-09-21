@@ -22,6 +22,15 @@ models/*.pkl
 # 2026-09-14に一度スナップショットとしてコミット済み（047fffd）で、
 # 過去の履歴はそちらに残る。以降は追跡しない。
 models/lgb_model.meta.json
+
+# v2の生成物（イベント表・候補モデル・現行参照）。
+# data/datasets/ は train_v2() が dataset_id ごとに .csv.gz を書き足す。
+# models/candidates/ は候補1件につき1ディレクトリ（model.txt / meta.json）。
+# models/current.json は現行モデルの参照で、昇格のたびに書き換わる運用状態。
+# lgb_model.meta.json と同じ理由で追跡しない。
+data/datasets/
+models/candidates/
+models/current.json
 log/
 
 # 環境変数
