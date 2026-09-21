@@ -424,3 +424,151 @@ class TestEvaluate:
 
         assert pw.main(["evaluate", meta.model_id]) == 1
         assert "fold結果が0件" in capsys.readouterr().out
+
+
+class TestPromote:
+    _MODEL = "v2-20260921T120000-abcdef12"
+    _RUN = "20260921T130000-0badf00d"
+
+    def _args(self, *extra):
+        return ["promote", self._MODEL, self._RUN,
+                "--reason", "AUC・Brierを確認し現行より悪化がないため",
+                "--decided-by", "garnet", *extra]
+
+    def test_missing_reason_or_decided_by_exits_with_argparse_error(self):
+        """--reason / --decided-by は必須引数。argparse が終了コード2で落とす"""
+        with pytest.raises(SystemExit) as e:
+            pw.main(["promote", self._MODEL, self._RUN, "--decided-by", "garnet"])
+        assert e.value.code == 2
+
+        with pytest.raises(SystemExit) as e:
+            pw.main(["promote", self._MODEL, self._RUN, "--reason", "良さそう"])
+        assert e.value.code == 2
+
+    def test_blank_reason_is_rejected_before_anything_runs(
+            self, monkeypatch, capsys):
+        """空白のみの理由は promote() を呼ぶ前にCLIで拒否する
+
+        promotion.promote() の `if not reason` は "   " を通してしまう。
+        """
+        from src.strategy import promotion
+
+        called = []
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": called.append("bootstrap"))
+        monkeypatch.setattr(promotion, "promote",
+                            lambda *a, **kw: called.append("promote"))
+
+        assert pw.main(["promote", self._MODEL, self._RUN,
+                        "--reason", "   ", "--decided-by", "garnet"]) == 1
+        assert called == []
+        assert "--reason が空です" in capsys.readouterr().out
+
+    def test_blank_decided_by_is_rejected_before_anything_runs(
+            self, monkeypatch, capsys):
+        from src.strategy import promotion
+
+        called = []
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": called.append("bootstrap"))
+        monkeypatch.setattr(promotion, "promote",
+                            lambda *a, **kw: called.append("promote"))
+
+        assert pw.main(["promote", self._MODEL, self._RUN,
+                        "--reason", "良い", "--decided-by", "  "]) == 1
+        assert called == []
+        assert "--decided-by が空です" in capsys.readouterr().out
+
+    def test_forwards_arguments_to_promotion_promote(
+            self, tmp_path, monkeypatch, capsys):
+        from src.strategy import model_store as ms
+        from src.strategy import promotion
+        from src.strategy.indicators import FEATURE_COLS
+
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        refs = iter([
+            None,
+            ms.CurrentRef(model_id=self._MODEL, previous_model_id=None,
+                          switched_at=None),
+        ])
+        monkeypatch.setattr(ms, "read_current",
+                            lambda base_dir="models": next(refs))
+
+        captured = {}
+
+        def fake_promote(model_id, **kwargs):
+            captured["model_id"] = model_id
+            captured.update(kwargs)
+            return 7
+
+        monkeypatch.setattr(promotion, "promote", fake_promote)
+
+        base = str(tmp_path / "models")
+        assert pw.main(["--base-dir", base, *self._args()]) == 0
+        assert captured["model_id"] == self._MODEL
+        assert captured["evaluation_run_id"] == self._RUN
+        assert captured["decided_by"] == "garnet"
+        assert captured["reason"] == "AUC・Brierを確認し現行より悪化がないため"
+        assert captured["degraded"] is False
+        assert captured["base_dir"] == base
+        assert captured["expected_feature_cols"] == list(FEATURE_COLS)
+        assert "promotion_id=7" in capsys.readouterr().out
+
+    def test_blockers_are_reported_and_current_is_untouched(
+            self, monkeypatch, capsys):
+        """check_promotable に落ちたら promote() が ValueError を投げる。
+        CLIはその文面をそのまま出して終了コード1にする（再実装しない）。
+        """
+        from src.strategy import model_store as ms
+        from src.strategy import promotion
+
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        monkeypatch.setattr(ms, "read_current", lambda base_dir="models": None)
+
+        def raise_blocked(model_id, **kwargs):
+            raise ValueError(
+                "昇格できません: 実績が1件も確定していません（予測だけでは"
+                "成績を測れません） / shadow記録だけでは昇格できません")
+
+        monkeypatch.setattr(promotion, "promote", raise_blocked)
+
+        assert pw.main(self._args()) == 1
+        out = capsys.readouterr().out
+        assert "実績が1件も確定していません" in out
+        assert "shadow記録だけでは昇格できません" in out
+
+    def test_dry_run_only_checks_and_never_promotes(self, monkeypatch, capsys):
+        from src.strategy import promotion
+
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        called = []
+        monkeypatch.setattr(promotion, "promote",
+                            lambda *a, **kw: called.append("promote"))
+        monkeypatch.setattr(
+            promotion, "check_promotable",
+            lambda model_id, **kw: promotion.PromotionCheck(
+                ok=False, blockers=["未評価です（evaluation_run_id がありません）"]))
+
+        assert pw.main(self._args("--dry-run")) == 1
+        assert called == []
+        assert "未評価です" in capsys.readouterr().out
+
+    def test_dry_run_reports_ok_without_changing_current(
+            self, monkeypatch, capsys):
+        from src.strategy import promotion
+
+        monkeypatch.setattr(pw, "_bootstrap",
+                            lambda config_path="config.yaml": "high_risk")
+        called = []
+        monkeypatch.setattr(promotion, "promote",
+                            lambda *a, **kw: called.append("promote"))
+        monkeypatch.setattr(
+            promotion, "check_promotable",
+            lambda model_id, **kw: promotion.PromotionCheck(ok=True, blockers=[]))
+
+        assert pw.main(self._args("--dry-run")) == 0
+        assert called == []
+        assert "昇格可能です" in capsys.readouterr().out

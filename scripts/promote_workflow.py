@@ -247,6 +247,80 @@ def cmd_evaluate(args) -> int:
     return EXIT_OK
 
 
+# ─── promote ──────────────────────────────────────────────────────────────
+
+
+def cmd_promote(args) -> int:
+    """評価記録を根拠に候補を現行へ昇格する。
+
+    **昇格可否の判断は promotion.check_promotable() が唯一の判断者である。**
+    CLI側に二重チェックを作らない。検査に落ちた場合 promotion.promote() は
+    現行を一切変更せずに ValueError を投げるので、その文面をそのまま出す。
+    """
+    from src.strategy import model_store as ms
+    from src.strategy import promotion
+    from src.strategy.indicators import FEATURE_COLS
+
+    # 空文字は promotion.promote() も ValueError にするが、空白のみの文字列は
+    # 通ってしまう。DB接続やモデル読み込みより前に、CLIの言葉で落とす。
+    reason = args.reason.strip()
+    decided_by = args.decided_by.strip()
+    if not reason:
+        print("--reason が空です。なぜ昇格するのかを必ず書いてください")
+        return EXIT_ERROR
+    if not decided_by:
+        print("--decided-by が空です。誰の判断かを必ず書いてください")
+        return EXIT_ERROR
+
+    _bootstrap(args.config)
+
+    # train_v2() は meta.feature_cols に list(FEATURE_COLS) を書く
+    # （src/strategy/v2_training.py:131）。同じものを期待値として渡す。
+    expected_feature_cols = list(FEATURE_COLS)
+
+    if args.dry_run:
+        check = promotion.check_promotable(
+            args.model_id,
+            evaluation_run_id=args.evaluation_run_id,
+            degraded=False,
+            base_dir=args.base_dir,
+            expected_feature_cols=expected_feature_cols,
+        )
+        if check.ok:
+            print("昇格可能です（--dry-run なので現行は変更していません）")
+            return EXIT_OK
+        print("昇格できません:")
+        for blocker in check.blockers:
+            print(f"  - {blocker}")
+        return EXIT_ERROR
+
+    before = ms.read_current(base_dir=args.base_dir)
+    print(f"現行: {before.model_id if before else '(未昇格)'}")
+
+    try:
+        promotion_id = promotion.promote(
+            args.model_id,
+            evaluation_run_id=args.evaluation_run_id,
+            decided_by=decided_by,
+            reason=reason,
+            # 引数の degraded は補助的な早期拒否にすぎず、真偽は
+            # check_promotable() が保存済みの EvaluationRun.degraded から読む
+            # （src/strategy/promotion.py:74-82）。CLIは常に False を渡す。
+            degraded=False,
+            base_dir=args.base_dir,
+            expected_feature_cols=expected_feature_cols,
+        )
+    except ValueError as e:
+        print(str(e))
+        return EXIT_ERROR
+
+    after = ms.read_current(base_dir=args.base_dir)
+    print(f"昇格しました: promotion_id={promotion_id}")
+    print(f"現行: {after.model_id if after else '(未昇格)'} / "
+          f"previous: {after.previous_model_id if after else None}")
+    return EXIT_OK
+
+
 # ─── CLI ──────────────────────────────────────────────────────────────────
 
 
@@ -278,6 +352,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-splits", type=int, default=5,
         help="walk-forwardの分割数（既定: 5＝train_v2 と同じfold構造）")
     p_eval.set_defaults(func=cmd_evaluate)
+
+    p_promote = sub.add_parser(
+        "promote", help="評価記録を根拠に候補を現行へ昇格する")
+    p_promote.add_argument("model_id", help="昇格させる候補のmodel_id")
+    p_promote.add_argument("evaluation_run_id",
+                           help="evaluate が表示した evaluation_run_id")
+    p_promote.add_argument("--reason", required=True,
+                           help="なぜ昇格するのか（必須・空文字不可）")
+    p_promote.add_argument("--decided-by", required=True,
+                           help="誰の判断か（必須・空文字不可）")
+    p_promote.add_argument(
+        "--dry-run", action="store_true",
+        help="check_promotable() の判定だけを表示し、現行は変更しない")
+    p_promote.set_defaults(func=cmd_promote)
 
     return parser
 
