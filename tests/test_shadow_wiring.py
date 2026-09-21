@@ -513,3 +513,166 @@ class TestShadowFailureDoesNotAffectTrading:
         assert not collect.called
         assert not flush.called
         assert svc.order_mgr.buy.called
+
+
+def _seed_ohlcv(symbol, *, periods=120, end=date(2026, 9, 10)):
+    """合成の日足をDBへ入れる（load_ohlcv 経由で実際に読ませる）"""
+    frame = _ohlcv_frame(periods=periods, end=end)
+    with get_session() as session:
+        for ts, row in frame.iterrows():
+            session.add(OHLCV(
+                symbol=symbol, date=ts.date(),
+                open=float(row["open"]), high=float(row["high"]),
+                low=float(row["low"]), close=float(row["close"]),
+                volume=int(row["volume"]), adjusted_close=float(row["close"])))
+        session.commit()
+
+
+class TestSignalScanRecordsShadow:
+    """signal_scan を実際に走らせ、DBに入った行の件数と中身を確かめる"""
+
+    def _run(self, svc, symbols):
+        svc._bar_states = _fresh_states(symbols)
+        with patch.object(trading.clock, "now",
+                          return_value=datetime(2026, 9, 10, 16, 20)), \
+             patch.object(trading.clock, "today", return_value=date(2026, 9, 10)), \
+             patch.object(trading.watchlist_store, "get_codes",
+                          return_value=list(symbols)), \
+             patch.object(trading.watchlist_store, "get_sectors",
+                          return_value={}), \
+             patch.object(trading.TradingScheduler, "is_maintenance_window",
+                          return_value=False):
+            svc.signal_scan()
+
+    def _services(self, model=None):
+        return trading.TradingServices(client=MagicMock(), risk=MagicMock(),
+                                       order_mgr=MagicMock(), model=model)
+
+    def test_records_one_row_per_scanned_symbol(self, isolated_db, tmp_path,
+                                                monkeypatch):
+        _seed_ohlcv("7203")
+        _seed_ohlcv("9984")
+        _promote_constant_candidate(tmp_path / "models")
+        # prepare() は既定の相対パス "models" を見る。実リポジトリを汚さない
+        # よう、cfg.load / db.init を済ませた後に作業ディレクトリを移す
+        monkeypatch.chdir(tmp_path)
+
+        self._run(self._services(), ["7203", "9984"])
+
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert len(got) == 2
+        assert set(got["event_id"]) == {"7203:20260910", "9984:20260910"}
+        assert set(got["candidate_model_id"]) == {"v2-test-0001"}
+        assert got["candidate_probability"].tolist() == pytest.approx([0.7, 0.7])
+        assert set(got["threshold"]) == {0.5}
+        assert set(got["label_contract_id"]) == {_current_contract()}
+        # 現行モデル未ロード（model=None）なので「現行が無かった」状態が残る
+        assert got["current_model_id"].isna().all()
+        assert set(got["agreement"]) == {shadow.AGREEMENT_ONLY_CANDIDATE}
+
+    def test_records_the_current_models_probability_too(self, isolated_db,
+                                                        tmp_path, monkeypatch):
+        _seed_ohlcv("7203")
+        _promote_constant_candidate(tmp_path / "models")
+        monkeypatch.chdir(tmp_path)
+
+        self._run(self._services(model=_FakeClassifier([0.9])), ["7203"])
+
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert len(got) == 1
+        # ラベル(1)ではなく確率(0.9)が入っていること＝アダプタが効いている
+        assert got["current_probability"].tolist() == pytest.approx([0.9])
+        assert got["current_model_id"].tolist() == \
+            [shadow_recording.LEGACY_MODEL_ID_UNKNOWN]
+        assert got["agreement"].tolist() == [shadow.AGREEMENT_BOTH_TAKE]
+
+    def test_the_candidate_never_touches_the_signal(self, isolated_db, tmp_path,
+                                                    monkeypatch):
+        """保存されたシグナルが、候補の有無で変わらないこと"""
+        _seed_ohlcv("7203")
+        monkeypatch.chdir(tmp_path)
+        svc = self._services()
+        self._run(svc, ["7203"])
+        with get_session() as session:
+            without = [(r.action, r.combined_score)
+                       for r in session.scalars(select(Signal)).all()]
+            session.query(Signal).delete()
+            session.commit()
+
+        _promote_constant_candidate(tmp_path / "models")
+        self._run(self._services(), ["7203"])
+
+        with get_session() as session:
+            with_candidate = [(r.action, r.combined_score)
+                              for r in session.scalars(select(Signal)).all()]
+        assert with_candidate == without
+        assert len(shadow.load_shadow_comparisons("shadow-2026-09-10")) == 1
+
+    def test_no_candidate_records_nothing_and_still_saves_signals(
+            self, isolated_db, tmp_path, monkeypatch):
+        _seed_ohlcv("7203")
+        monkeypatch.chdir(tmp_path)   # models/current.json が無い状態
+
+        self._run(self._services(), ["7203"])
+
+        assert len(shadow.load_shadow_comparisons("shadow-2026-09-10")) == 0
+        with get_session() as session:
+            assert session.scalar(select(Signal)) is not None
+
+    def test_a_symbol_without_enough_history_is_skipped(self, isolated_db,
+                                                        tmp_path, monkeypatch):
+        """特徴量が揃わない銘柄は記録しない（他の銘柄は記録する）"""
+        _seed_ohlcv("7203")
+        _seed_ohlcv("9984", periods=40)
+        _promote_constant_candidate(tmp_path / "models")
+        monkeypatch.chdir(tmp_path)
+
+        self._run(self._services(), ["7203", "9984"])
+
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert set(got["event_id"]) == {"7203:20260910"}
+
+    def test_running_twice_in_a_day_stays_consistent(self, isolated_db, tmp_path,
+                                                     monkeypatch):
+        _seed_ohlcv("7203")
+        _seed_ohlcv("9984")
+        _promote_constant_candidate(tmp_path / "models")
+        monkeypatch.chdir(tmp_path)
+
+        self._run(self._services(), ["7203", "9984"])
+        self._run(self._services(), ["7203", "9984"])
+
+        assert len(shadow.load_shadow_comparisons("shadow-2026-09-10")) == 2
+        with get_session() as session:
+            preds = list(session.scalars(select(db.Prediction)).all())
+        assert len(preds) == 2
+        assert {p.purpose for p in preds} == {"shadow"}
+        assert {p.fold_index for p in preds} == {-1}
+
+    def test_no_outcome_rows_are_written(self, isolated_db, tmp_path, monkeypatch):
+        """実績（勝敗）は予測時点で未確定。ここでは書かない"""
+        _seed_ohlcv("7203")
+        _promote_constant_candidate(tmp_path / "models")
+        monkeypatch.chdir(tmp_path)
+
+        self._run(self._services(), ["7203"])
+
+        with get_session() as session:
+            assert list(session.scalars(select(db.PredictionOutcome)).all()) == []
+
+    def test_no_orders_are_created(self, isolated_db, tmp_path, monkeypatch):
+        """shadowは記録だけ。注文・建玉・約定を一切作らない"""
+        _seed_ohlcv("7203")
+        _promote_constant_candidate(tmp_path / "models")
+        monkeypatch.chdir(tmp_path)
+        svc = self._services()
+
+        self._run(svc, ["7203"])
+
+        assert not svc.order_mgr.buy.called
+        assert not svc.order_mgr.sell.called
+        assert not svc.order_mgr.sell_market.called
+        with get_session() as session:
+            assert list(session.scalars(select(db.Trade)).all()) == []
+            assert list(session.scalars(select(db.Position)).all()) == []
+            assert list(session.scalars(select(db.OrderIntent)).all()) == []
