@@ -17,7 +17,21 @@
 src/strategy/shadow.py:96-103）ため、銘柄ごとに呼ぶと前の銘柄の記録が
 毎回消え、最後の1銘柄しか残らない。
 """
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
+from loguru import logger
+
+from src.backtest import execution
+from src.core import clock
+from src.strategy import dataset as ds
+from src.strategy import ml_model
+from src.strategy import model_store as ms
+from src.strategy import policy
+from src.strategy.indicators import FEATURE_COLS
 
 # 観察用の**仮の**基準点。チューニングされた閾値ではない。
 # 候補の評価で fold 別に選ばれた閾値は 0.35/0.41/0.41/0.35/1.0 とばらつきが
@@ -53,3 +67,84 @@ class _LegacyModelProbaAdapter:
                 "現行モデルの predict_proba() が2クラスの確率を返しません: "
                 f"shape={proba.shape}")
         return proba[:, 1]
+
+
+@dataclass
+class ShadowBatch:
+    """1回の signal_scan 分のshadow記録。ループ中は溜めるだけで書かない。
+
+    `event_ids` と `rows` は同じ順で1銘柄1要素ずつ増える。
+    """
+    evaluation_run_id: str
+    candidate: object
+    candidate_model_id: str
+    current: Optional[object]
+    current_model_id: Optional[str]
+    label_contract_id: str
+    threshold: float = SHADOW_THRESHOLD
+    event_ids: list = field(default_factory=list)
+    rows: list = field(default_factory=list)
+
+
+def _legacy_model_id(model) -> Optional[str]:
+    """現行モデルの記録用ID。未ロードなら None。
+
+    legacy の pickle モデルには model_id が無い。`ml_model` が本体と対で書く
+    サイドカー `models/lgb_model.meta.json` の sha256 先頭12桁で版を表す。
+    週次再学習で中身が入れ替わるため、単に "legacy" と記録すると数ヶ月後に
+    「どの現行と比べたのか」を復元できない。
+
+    メタが読めなくても**例外にしない**。shadowの都合で本来の判断を止めない。
+    """
+    if model is None:
+        return None
+    try:
+        meta_path = Path(ml_model.MODEL_PATH).with_suffix(".meta.json")
+        digest = json.loads(meta_path.read_text(encoding="utf-8"))["sha256"]
+        return f"legacy-{digest[:12]}"
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        logger.warning(
+            f"現行モデルのメタを読めません（IDは不明として記録します）: {e}")
+        return LEGACY_MODEL_ID_UNKNOWN
+
+
+def prepare(current_model, *, base_dir: str = "models") -> Optional[ShadowBatch]:
+    """このスキャンのshadowバッチを作る。候補が未昇格なら None。
+
+    **候補モデルの読み込みはここだけ。** 銘柄ごとに `load_current()` を
+    呼び直すと、ディスクI/Oが無駄なだけでなく、スキャンの途中で昇格が
+    起きた場合に同じスキャンの記録へ別のモデルが混ざる。
+    """
+    loaded = ms.load_current(base_dir=base_dir)
+    if loaded is None:
+        return None            # 未昇格は正常。静かにスキップする
+    candidate, meta = loaded
+
+    if list(meta.feature_cols) != list(FEATURE_COLS):
+        # 学習時と現在で列が違うモデルに黙って推論させると、誤った数字が
+        # 「正常な観察結果」として残る（Knowledge.md §10 desyncガード）
+        logger.error(
+            f"shadow記録を行いません: 候補 {meta.model_id} の特徴量定義が"
+            f"現行と一致しません（候補={list(meta.feature_cols)} / "
+            f"現行={list(FEATURE_COLS)}）")
+        return None
+
+    label_contract_id = ds.make_label_contract_id(
+        policy.config_from_settings(), execution.config_from_settings())
+    if meta.label_contract_id and meta.label_contract_id != label_contract_id:
+        # 実績（PredictionOutcome）を後から結合するときのキーが変わる。
+        # 記録は続けるが、あとで気づけるようにログへ残す
+        logger.warning(
+            f"shadow記録のラベル契約が候補の学習時と異なります: "
+            f"学習時={meta.label_contract_id} / 現在={label_contract_id}"
+            "（退出ポリシーかコストの設定が変わっています。記録は続けます）")
+
+    return ShadowBatch(
+        evaluation_run_id=f"shadow-{clock.today().isoformat()}",
+        candidate=candidate,
+        candidate_model_id=meta.model_id,
+        current=(_LegacyModelProbaAdapter(current_model)
+                 if current_model is not None else None),
+        current_model_id=_legacy_model_id(current_model),
+        label_contract_id=label_contract_id,
+    )

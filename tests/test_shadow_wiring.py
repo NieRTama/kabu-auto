@@ -108,3 +108,127 @@ class TestLegacyModelProbaAdapter:
 
     def test_threshold_is_the_observation_default(self):
         assert shadow_recording.SHADOW_THRESHOLD == 0.5
+
+
+class _ConstantCandidate:
+    """model_store.save_candidate() が定数モデルとして保存できる最小の形。
+
+    読み戻すと model_store.ConstantModel になり、
+    predict(X) -> np.full(len(X), probability) を返す。
+    """
+
+    is_constant = True
+
+    def __init__(self, probability):
+        self.constant_probability = float(probability)
+
+
+def _current_contract() -> str:
+    """いま設定から決まるラベル契約ID（固定文字列を書かない）"""
+    return ds.make_label_contract_id(policy.config_from_settings(),
+                                     execution.config_from_settings())
+
+
+def _promote_constant_candidate(models_dir, *, model_id="v2-test-0001",
+                                probability=0.7, feature_cols=None):
+    """tmp配下に候補を保存して現行（＝昇格済み）に設定する"""
+    meta = ms.ModelMeta(
+        model_id=model_id,
+        trained_at=clock.now(),
+        symbols=["7203"],
+        label_definition="net_return>0",
+        feature_cols=list(FEATURE_COLS) if feature_cols is None else feature_cols,
+        label_contract_id=_current_contract(),
+    )
+    ms.save_candidate(_ConstantCandidate(probability), meta,
+                      base_dir=str(models_dir))
+    ms.set_current(model_id, base_dir=str(models_dir))
+    return model_id
+
+
+class TestPrepare:
+    def test_returns_none_when_no_candidate_is_promoted(self, isolated_db, tmp_path):
+        """未昇格は異常ではない。静かにスキップする"""
+        assert shadow_recording.prepare(
+            None, base_dir=str(tmp_path / "models")) is None
+
+    def test_loads_the_promoted_candidate(self, isolated_db, tmp_path):
+        models_dir = tmp_path / "models"
+        _promote_constant_candidate(models_dir)
+
+        batch = shadow_recording.prepare(None, base_dir=str(models_dir))
+
+        assert batch is not None
+        assert batch.candidate_model_id == "v2-test-0001"
+        assert batch.candidate.predict(pd.DataFrame({"f": [1.0]})) == \
+            pytest.approx([0.7])
+        assert batch.threshold == 0.5
+        assert batch.label_contract_id == _current_contract()
+        assert batch.event_ids == []
+        assert batch.rows == []
+
+    def test_run_id_is_one_batch_per_day(self, isolated_db, tmp_path):
+        models_dir = tmp_path / "models"
+        _promote_constant_candidate(models_dir)
+
+        with patch.object(clock, "today", return_value=date(2026, 9, 10)):
+            batch = shadow_recording.prepare(None, base_dir=str(models_dir))
+
+        assert batch.evaluation_run_id == "shadow-2026-09-10"
+
+    def test_wraps_the_current_model_in_the_probability_adapter(
+            self, isolated_db, tmp_path):
+        models_dir = tmp_path / "models"
+        _promote_constant_candidate(models_dir)
+
+        batch = shadow_recording.prepare(_FakeClassifier([0.9]),
+                                         base_dir=str(models_dir))
+
+        assert isinstance(batch.current, shadow_recording._LegacyModelProbaAdapter)
+        assert batch.current.predict(pd.DataFrame({"f": [1.0]})) == \
+            pytest.approx([0.9])
+
+    def test_no_current_model_is_recorded_as_such(self, isolated_db, tmp_path):
+        """現行モデル未ロード（学習前）でも候補だけは記録できる"""
+        models_dir = tmp_path / "models"
+        _promote_constant_candidate(models_dir)
+
+        batch = shadow_recording.prepare(None, base_dir=str(models_dir))
+
+        assert batch.current is None
+        assert batch.current_model_id is None
+
+    def test_refuses_to_record_when_the_feature_definition_disagrees(
+            self, isolated_db, tmp_path):
+        """特徴量定義が食い違う候補は黙って推論しない（fail-closed）"""
+        models_dir = tmp_path / "models"
+        _promote_constant_candidate(models_dir, feature_cols=["rsi", "macd"])
+
+        assert shadow_recording.prepare(None, base_dir=str(models_dir)) is None
+
+
+class TestLegacyModelId:
+    def test_is_none_without_a_current_model(self):
+        assert shadow_recording._legacy_model_id(None) is None
+
+    def test_uses_the_sha256_of_the_saved_pickle(self, tmp_path, monkeypatch):
+        """週次再学習で中身が入れ替わるので、版を sha256 で区別する"""
+        monkeypatch.chdir(tmp_path)
+        meta_path = tmp_path / "models" / "lgb_model.meta.json"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(
+            '{"sha256": "6958ed7c114b609a1175e26703a0c60867c2a5620df1fde301da36'
+            '022a71cb3a", "trained_at": "2026-09-18T11:14:50.350372"}',
+            encoding="utf-8")
+
+        got = shadow_recording._legacy_model_id(_FakeClassifier([0.5]))
+
+        assert got == "legacy-6958ed7c114b"
+
+    def test_falls_back_when_the_sidecar_is_missing(self, tmp_path, monkeypatch):
+        """メタが読めなくても記録自体は続ける（判断を止めない）"""
+        monkeypatch.chdir(tmp_path)
+
+        got = shadow_recording._legacy_model_id(_FakeClassifier([0.5]))
+
+        assert got == shadow_recording.LEGACY_MODEL_ID_UNKNOWN
