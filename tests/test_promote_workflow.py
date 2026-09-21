@@ -572,3 +572,147 @@ class TestPromote:
         assert pw.main(self._args("--dry-run")) == 0
         assert called == []
         assert "昇格可能です" in capsys.readouterr().out
+
+
+# 合成OHLCV(n=300×2銘柄)の決着イベントは51件しかなく本番既定の200件に
+# 届かない。届かせるには n>=1500 が要り train_v2() 1回で4〜5分かかる
+# （tests/test_v2_training.py:103-110 の実測）。本番のしきい値は変えず、
+# テストだけ下げる。
+_TEST_MIN_RESOLVED_EVENTS = 10
+
+
+def _bars():
+    return {"7203": _ohlcv(seed=1), "9984": _ohlcv(seed=2, start_price=500.0)}
+
+
+def _run_train(tmp_path, monkeypatch) -> str:
+    """実データ経路で train を走らせ、できた候補の model_id を返す"""
+    from src.strategy import v2_training
+
+    monkeypatch.setattr(pw, "_bootstrap",
+                        lambda config_path="config.yaml": "high_risk")
+    monkeypatch.setattr(pw, "_collect_ohlcv", lambda limit: (_bars(), []))
+    monkeypatch.setattr(v2_training, "MIN_RESOLVED_EVENTS",
+                        _TEST_MIN_RESOLVED_EVENTS)
+
+    base = str(tmp_path / "models")
+    assert pw.main(["--base-dir", base, "train"]) == 0
+    candidates = sorted((tmp_path / "models" / "candidates").iterdir())
+    assert len(candidates) == 1
+    return candidates[0].name
+
+
+def _record_clean_evaluation(model_id, meta, run_id="run-integration-1"):
+    """degraded でない評価記録を1件作る（既存の保存関数だけを使う）。
+
+    51件の決着イベントで run_evaluation() を通すと内側foldの校正が identity へ
+    縮退して degraded_reasons が付き、check_promotable() が必ず拒否する。
+    昇格の経路そのものを固定したいので、ここは実イベント表から作った
+    予測・実績・実行記録の3点セットを degraded 無しで保存する
+    （tests/test_model_promotion.py の _recorded_evaluation と同じ考え方）。
+    """
+    from src.strategy import dataset as ds
+    from src.strategy import evaluation
+    from src.strategy.indicators import FEATURE_COLS
+
+    events = ds.load_events(meta.dataset_id)
+    resolved = events[events["status"] == ds.STATUS_RESOLVED].head(20)
+    assert len(resolved) > 0
+
+    preds = pd.DataFrame({
+        "event_id": resolved["event_id"].astype(str).values,
+        "label_contract_id": resolved["label_contract_id"].astype(str).values,
+        "raw_probability": 0.6,
+        "calibrated_probability": 0.55,
+        "fold_index": 0,
+    })
+    evaluation.save_predictions(preds, run_id, model_id)
+    evaluation.save_outcomes(events)
+    run_config = evaluation.capture_run_config(
+        events, n_splits=5, window_sessions=None,
+        feature_cols=list(FEATURE_COLS))
+    evaluation.save_evaluation_run(
+        run_id, run_config, purpose=evaluation.PURPOSE_VALIDATION,
+        model_id=model_id, n_folds=5, n_predictions=len(preds),
+        degraded_reasons=[])
+    return run_id
+
+
+class TestIntegration:
+    def test_train_then_evaluate_records_predictions_under_the_candidate_id(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        """train → evaluate で、候補ID自身の予測明細と実行記録が残ること"""
+        from sqlalchemy import select
+
+        from src.data.database import EvaluationRun, Prediction, get_session
+
+        base = str(tmp_path / "models")
+        model_id = _run_train(tmp_path, monkeypatch)
+        capsys.readouterr()
+
+        assert pw.main(["--base-dir", base, "evaluate", model_id]) == 0
+        out = capsys.readouterr().out
+        run_id = out.split("evaluation_run_id: ")[1].splitlines()[0].strip()
+
+        with get_session() as session:
+            run = session.scalar(select(EvaluationRun).where(
+                EvaluationRun.evaluation_run_id == run_id))
+            preds = list(session.scalars(select(Prediction).where(
+                Prediction.evaluation_run_id == run_id)).all())
+
+        assert run is not None
+        # model_factories が1件なので EvaluationRun.model_id に候補IDが入る
+        assert run.model_id == model_id
+        assert preds
+        assert {p.model_id for p in preds} == {model_id}
+
+    def test_promote_switches_models_current_json(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        """昇格すると models/current.json が候補を指し、記録が committed になる"""
+        from sqlalchemy import select
+
+        from src.data.database import ModelPromotion, get_session
+        from src.strategy import model_store as ms
+        from src.strategy import promotion
+
+        base = str(tmp_path / "models")
+        model_id = _run_train(tmp_path, monkeypatch)
+        capsys.readouterr()
+
+        meta = ms.read_meta(model_id, base_dir=base)
+        run_id = _record_clean_evaluation(model_id, meta)
+
+        assert ms.read_current(base_dir=base) is None
+        assert pw.main([
+            "--base-dir", base, "promote", model_id, run_id,
+            "--reason", "AUC・Brierを確認し現行より悪化がないため",
+            "--decided-by", "garnet"]) == 0
+
+        ref = ms.read_current(base_dir=base)
+        assert ref is not None
+        assert ref.model_id == model_id
+
+        with get_session() as session:
+            row = session.scalar(select(ModelPromotion).where(
+                ModelPromotion.model_id == model_id))
+        assert row.state == promotion.PROMOTION_COMMITTED
+        assert row.evaluation_run_id == run_id
+        assert row.decided_by == "garnet"
+        assert row.reason == "AUC・Brierを確認し現行より悪化がないため"
+        assert row.previous_model_id is None
+
+    def test_promote_is_refused_when_the_evaluation_is_missing(
+            self, isolated_db, tmp_path, monkeypatch, capsys):
+        """評価記録が無ければ現行は変わらない（安全機構が生きていること）"""
+        from src.strategy import model_store as ms
+
+        base = str(tmp_path / "models")
+        model_id = _run_train(tmp_path, monkeypatch)
+        capsys.readouterr()
+
+        assert pw.main([
+            "--base-dir", base, "promote", model_id, "run-does-not-exist",
+            "--reason", "とりあえず上げたい",
+            "--decided-by", "garnet"]) == 1
+        assert ms.read_current(base_dir=base) is None
+        assert "評価実行の記録がありません" in capsys.readouterr().out
