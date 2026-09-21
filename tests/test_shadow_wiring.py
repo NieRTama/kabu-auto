@@ -387,3 +387,129 @@ class TestFlush:
 
         right = shadow.load_shadow_comparisons("shadow-2026-09-11")
         assert set(right["event_id"]) == {"7203:20260910", "9984:20260910"}
+
+
+def _fresh_states(symbols, session_date=date(2026, 9, 10)):
+    return {s: BarStatus(symbol=s, last_bar_session=session_date,
+                         observed_at=datetime(2026, 9, 10, 16, 20),
+                         is_final=True, state="fresh")
+            for s in symbols}
+
+
+class TestSignalScanWiring:
+    """配線をソースで固定する（既存ロジックを変えていないことを含む）"""
+
+    def _source(self):
+        import inspect
+        return inspect.getsource(trading.TradingServices.signal_scan)
+
+    def test_existing_decision_line_is_unchanged(self):
+        src = self._source()
+        assert "sig = gen_signal(sym, df, self.model)" in src
+        assert "_save_signal(sig, data_as_of=self._bar_states[sym].last_bar_session)" in src
+
+    def test_the_scan_never_reassigns_the_operating_model(self):
+        """候補を self.model へ入れない（shadowは観察のみ）"""
+        assert "self.model =" not in self._source()
+
+    def test_calls_prepare_once_before_the_loop(self):
+        src = self._source()
+        assert src.index("shadow_recording.prepare(self.model)") < \
+            src.index("for sym in codes:")
+
+    def test_collects_before_the_action_filter(self):
+        """HOLDの銘柄も記録対象にする（絞り込まない）"""
+        src = self._source()
+        assert src.index("shadow_recording.collect(shadow_batch, sym, df)") < \
+            src.index('if sig.action not in ("BUY", "SELL"):')
+
+    def test_flushes_once_after_the_loop(self):
+        src = self._source()
+        assert src.index("shadow_recording.flush(shadow_batch)") > \
+            src.index("シグナルスキャンエラー")
+
+
+class TestShadowFailureDoesNotAffectTrading:
+    """shadow記録の失敗が本来の判断・発注を妨げないこと"""
+
+    def _services(self, model=None):
+        risk = MagicMock()
+        risk.validate_buy.return_value = (True, "ok")
+        risk.calc_position_size.return_value = 100
+        svc = trading.TradingServices(client=MagicMock(), risk=risk,
+                                      order_mgr=MagicMock(), model=model)
+        svc.trading_conf = dict(svc.trading_conf)
+        svc.trading_conf["mode"] = "paper"
+        return svc
+
+    def _scan(self, svc, symbols):
+        svc._bar_states = _fresh_states(symbols)
+        with patch.object(trading.clock, "now",
+                          return_value=datetime(2026, 9, 10, 16, 20)), \
+             patch.object(trading.clock, "today", return_value=date(2026, 9, 10)), \
+             patch.object(trading.watchlist_store, "get_codes",
+                          return_value=list(symbols)), \
+             patch.object(trading.watchlist_store, "get_sectors",
+                          return_value={}), \
+             patch.object(trading.TradingScheduler, "is_maintenance_window",
+                          return_value=False), \
+             patch.object(trading, "load_ohlcv", return_value=_ohlcv_frame()), \
+             patch.object(trading, "gen_signal",
+                          side_effect=lambda sym, df, model: TradeSignal(
+                              symbol=sym, action="BUY", rule_score=0.6,
+                              ml_score=0.2, combined_score=0.4)), \
+             patch.object(trading.liquidity, "check_liquidity",
+                          return_value=(True, "")):
+            svc.signal_scan()
+
+    def test_a_failing_collect_does_not_block_the_paper_order(self, isolated_db):
+        svc = self._services()
+        with patch.object(shadow_recording, "prepare",
+                          return_value=_batch()), \
+             patch.object(shadow_recording, "collect",
+                          side_effect=RuntimeError("shadow boom")):
+            self._scan(svc, ["7203"])
+
+        assert svc.order_mgr.buy.called
+
+    def test_a_failing_collect_does_not_stop_the_other_symbols(self, isolated_db):
+        svc = self._services()
+        with patch.object(shadow_recording, "prepare",
+                          return_value=_batch()), \
+             patch.object(shadow_recording, "collect",
+                          side_effect=RuntimeError("shadow boom")):
+            self._scan(svc, ["7203", "9984"])
+
+        with get_session() as session:
+            saved = {r.symbol for r in session.scalars(select(Signal)).all()}
+        assert saved == {"7203", "9984"}
+
+    def test_a_failing_prepare_does_not_stop_the_scan(self, isolated_db):
+        svc = self._services()
+        with patch.object(shadow_recording, "prepare",
+                          side_effect=RuntimeError("load boom")):
+            self._scan(svc, ["7203"])
+
+        assert svc.order_mgr.buy.called
+
+    def test_a_failing_flush_does_not_stop_the_scan(self, isolated_db):
+        svc = self._services()
+        with patch.object(shadow_recording, "prepare",
+                          return_value=_batch()), \
+             patch.object(shadow_recording, "flush",
+                          side_effect=RuntimeError("save boom")):
+            self._scan(svc, ["7203"])
+
+        assert svc.order_mgr.buy.called
+
+    def test_no_candidate_means_no_shadow_calls(self, isolated_db):
+        """未昇格なら collect も flush も呼ばれない"""
+        svc = self._services()
+        with patch.object(shadow_recording, "prepare", return_value=None), \
+             patch.object(shadow_recording, "collect") as collect, \
+             patch.object(shadow_recording, "flush") as flush:
+            self._scan(svc, ["7203"])
+
+        assert not collect.called
+        assert not flush.called
+        assert svc.order_mgr.buy.called
