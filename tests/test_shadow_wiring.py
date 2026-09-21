@@ -232,3 +232,158 @@ class TestLegacyModelId:
         got = shadow_recording._legacy_model_id(_FakeClassifier([0.5]))
 
         assert got == shadow_recording.LEGACY_MODEL_ID_UNKNOWN
+
+
+def _ohlcv_frame(*, periods=120, end=date(2026, 9, 10)) -> pd.DataFrame:
+    """合成の日足（日付インデックス）。
+
+    ma_long の既定が75本なので、最終行で全特徴量が有効になるよう120本入れる。
+    """
+    idx = pd.bdate_range(end=pd.Timestamp(end), periods=periods)
+    close = np.array([1000.0 + 50.0 * np.sin(i / 7.0) + i * 0.5
+                      for i in range(periods)])
+    return pd.DataFrame({
+        "open": close - 3.0,
+        "high": close + 6.0,
+        "low": close - 6.0,
+        "close": close,
+        "volume": np.array([100_000 + 300 * i for i in range(periods)]),
+    }, index=idx)
+
+
+def _batch(*, current=None, current_model_id=None,
+           run_id="shadow-2026-09-10", candidate_probability=0.7):
+    return shadow_recording.ShadowBatch(
+        evaluation_run_id=run_id,
+        candidate=_FixedProbaModel([candidate_probability] * 16),
+        candidate_model_id="v2-test-0001",
+        current=current,
+        current_model_id=current_model_id,
+        label_contract_id="lc_test",
+    )
+
+
+class TestCollect:
+    def test_event_id_is_the_symbol_and_the_decision_session(self, isolated_db):
+        batch = _batch()
+
+        assert shadow_recording.collect(batch, "7203", _ohlcv_frame()) is True
+        assert batch.event_ids == ["7203:20260910"]
+
+    def test_uses_the_same_feature_row_the_current_model_sees(self, isolated_db):
+        """gen_signal が使う build_features() の最終行と同一であること
+
+        別の行を渡すと「同じ入力に対する2つの判断」ではなくなる。
+        """
+        df = _ohlcv_frame()
+        batch = _batch()
+        shadow_recording.collect(batch, "7203", df)
+
+        expected = build_features(df)[list(FEATURE_COLS)].iloc[[-1]]
+        assert list(batch.rows[0].columns) == list(FEATURE_COLS)
+        assert batch.rows[0].to_numpy() == pytest.approx(expected.to_numpy())
+
+    def test_skips_a_symbol_whose_features_are_not_ready(self, isolated_db):
+        """助走期間が足りない銘柄は記録しない（欠損を0で埋めない）"""
+        batch = _batch()
+
+        assert shadow_recording.collect(batch, "7203",
+                                        _ohlcv_frame(periods=40)) is False
+        assert batch.event_ids == []
+        assert batch.rows == []
+
+    def test_accumulates_every_symbol(self, isolated_db):
+        batch = _batch()
+        shadow_recording.collect(batch, "7203", _ohlcv_frame())
+        shadow_recording.collect(batch, "9984", _ohlcv_frame())
+
+        assert batch.event_ids == ["7203:20260910", "9984:20260910"]
+        assert len(batch.rows) == 2
+
+
+class TestFlush:
+    def test_writes_one_row_per_collected_symbol(self, isolated_db):
+        batch = _batch()
+        shadow_recording.collect(batch, "7203", _ohlcv_frame())
+        shadow_recording.collect(batch, "9984", _ohlcv_frame())
+
+        n = shadow_recording.flush(batch)
+
+        assert n == 2
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert set(got["event_id"]) == {"7203:20260910", "9984:20260910"}
+        assert set(got["candidate_model_id"]) == {"v2-test-0001"}
+        assert got["candidate_probability"].tolist() == pytest.approx([0.7, 0.7])
+        assert set(got["threshold"]) == {0.5}
+        assert set(got["label_contract_id"]) == {"lc_test"}
+
+    def test_records_both_sides_when_a_current_model_exists(self, isolated_db):
+        batch = _batch(
+            current=shadow_recording._LegacyModelProbaAdapter(
+                _FakeClassifier([0.9, 0.9])),
+            current_model_id="legacy-6958ed7c114b")
+        shadow_recording.collect(batch, "7203", _ohlcv_frame())
+        shadow_recording.collect(batch, "9984", _ohlcv_frame())
+
+        shadow_recording.flush(batch)
+
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert set(got["current_model_id"]) == {"legacy-6958ed7c114b"}
+        assert got["current_probability"].tolist() == pytest.approx([0.9, 0.9])
+        assert set(got["agreement"]) == {shadow.AGREEMENT_BOTH_TAKE}
+
+    def test_records_the_unpromoted_current_as_its_own_state(self, isolated_db):
+        batch = _batch()
+        shadow_recording.collect(batch, "7203", _ohlcv_frame())
+
+        shadow_recording.flush(batch)
+
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert got["current_model_id"].isna().all()
+        assert got["current_probability"].isna().all()
+        assert set(got["agreement"]) == {shadow.AGREEMENT_ONLY_CANDIDATE}
+
+    def test_nothing_collected_writes_nothing(self, isolated_db):
+        assert shadow_recording.flush(_batch()) == 0
+        assert len(shadow.load_shadow_comparisons("shadow-2026-09-10")) == 0
+
+    def test_flushing_the_same_run_twice_replaces_the_rows(self, isolated_db):
+        """同じ日に2回走っても上書きで整合する（run単位の置換）"""
+        first = _batch()
+        shadow_recording.collect(first, "7203", _ohlcv_frame())
+        shadow_recording.collect(first, "9984", _ohlcv_frame())
+        shadow_recording.flush(first)
+
+        second = _batch(candidate_probability=0.2)
+        shadow_recording.collect(second, "7203", _ohlcv_frame())
+        shadow_recording.collect(second, "9984", _ohlcv_frame())
+        shadow_recording.flush(second)
+
+        got = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert len(got) == 2
+        assert got["candidate_probability"].tolist() == pytest.approx([0.2, 0.2])
+
+    def test_one_flush_per_scan_keeps_every_symbol(self, isolated_db):
+        """銘柄ごとに flush してはいけないことを、結果の差で示す
+
+        record_shadow() は同一 evaluation_run_id の既存行を削除してから
+        挿入する。銘柄ごとに flush すると最後の1銘柄しか残らない。
+        """
+        per_symbol = _batch()
+        shadow_recording.collect(per_symbol, "7203", _ohlcv_frame())
+        shadow_recording.flush(per_symbol)
+        per_symbol.event_ids.clear()
+        per_symbol.rows.clear()
+        shadow_recording.collect(per_symbol, "9984", _ohlcv_frame())
+        shadow_recording.flush(per_symbol)
+
+        wrong = shadow.load_shadow_comparisons("shadow-2026-09-10")
+        assert set(wrong["event_id"]) == {"9984:20260910"}  # 7203が消える
+
+        batched = _batch(run_id="shadow-2026-09-11")
+        shadow_recording.collect(batched, "7203", _ohlcv_frame())
+        shadow_recording.collect(batched, "9984", _ohlcv_frame())
+        shadow_recording.flush(batched)
+
+        right = shadow.load_shadow_comparisons("shadow-2026-09-11")
+        assert set(right["event_id"]) == {"7203:20260910", "9984:20260910"}

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 from loguru import logger
 
 from src.backtest import execution
@@ -31,7 +32,8 @@ from src.strategy import dataset as ds
 from src.strategy import ml_model
 from src.strategy import model_store as ms
 from src.strategy import policy
-from src.strategy.indicators import FEATURE_COLS
+from src.strategy import shadow
+from src.strategy.indicators import FEATURE_COLS, build_feature_frame
 
 # 観察用の**仮の**基準点。チューニングされた閾値ではない。
 # 候補の評価で fold 別に選ばれた閾値は 0.35/0.41/0.41/0.35/1.0 とばらつきが
@@ -148,3 +150,64 @@ def prepare(current_model, *, base_dir: str = "models") -> Optional[ShadowBatch]
         current_model_id=_legacy_model_id(current_model),
         label_contract_id=label_contract_id,
     )
+
+
+def collect(batch: ShadowBatch, symbol: str, df: pd.DataFrame) -> bool:
+    """この銘柄の特徴量1行をバッチへ溜める。DBへは書かない。
+
+    使う行は **gen_signal が現行モデルへ渡すのと同じ行**にする。
+    `ml_model.predict_proba()` は `build_features(df)`（＝欠損行を落とした
+    フレーム）の最終行を使うので、こちらは行を落とさない
+    `build_feature_frame(df)` の `feature_valid` が立った行の最終行を取る。
+    同じ条件なので同じ行になる。
+
+    特徴量が1行も揃わない銘柄（助走期間が足りない等）は記録しない。
+    欠損を0等で埋めると、未結線や不足が「正常な観察結果」に化ける
+    （Knowledge.md §10）。
+    """
+    frame = build_feature_frame(df)
+    valid = frame[frame["feature_valid"]]
+    if valid.empty:
+        logger.warning(
+            f"shadow記録をスキップ: {symbol} の特徴量が揃いません"
+            f"（{len(df)}本）")
+        return False
+    row = valid.iloc[[-1]]
+    decision_at = row.index[-1].date()
+    batch.event_ids.append(ds.make_event_id(symbol, decision_at))
+    batch.rows.append(row[list(FEATURE_COLS)].astype("float64"))
+    return True
+
+
+def flush(batch: ShadowBatch) -> int:
+    """溜めた分をまとめて記録する。保存件数を返す。
+
+    **1回のスキャンにつき一度だけ呼ぶこと。** `shadow.record_shadow()` は
+    同一 `evaluation_run_id` の既存行を削除してから挿入するため、銘柄ごとに
+    呼ぶと前の銘柄の記録が毎回消える。
+    """
+    if not batch.event_ids:
+        return 0
+    # 銘柄をまたいで日付インデックスが重複するので行番号へ振り直す。
+    # shadow.compare() は event_ids と features を位置で対応付ける
+    features = pd.concat(batch.rows, ignore_index=True)
+    comparisons = shadow.compare(
+        batch.event_ids, features,
+        current=batch.current, candidate=batch.candidate,
+        threshold=batch.threshold)
+    n = shadow.record_shadow(
+        comparisons,
+        evaluation_run_id=batch.evaluation_run_id,
+        candidate_model_id=batch.candidate_model_id,
+        current_model_id=batch.current_model_id,
+        threshold=batch.threshold,
+        label_contract_id=batch.label_contract_id)
+    summary = shadow.disagreement_summary(comparisons)
+    logger.info(
+        f"shadow並行記録: run={batch.evaluation_run_id} "
+        f"候補={batch.candidate_model_id} 現行={batch.current_model_id} "
+        f"{n}件 一致率={summary['agreement_rate']:.3f} "
+        f"(both_take={summary['both_take']} both_skip={summary['both_skip']} "
+        f"only_current={summary['only_current']} "
+        f"only_candidate={summary['only_candidate']})")
+    return n
