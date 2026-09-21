@@ -350,3 +350,57 @@ CLIには実装していない。Pythonから `promotion.rollback()` を呼ぶ
 ```bash
 python -c "from src.core import config as cfg; from src.data import database as db; from src.core import risk_profile as rp; cfg.load('config.yaml'); rp.load('risk_profile.json'); db.init(); from src.strategy import promotion; print(promotion.rollback(decided_by='garnet', reason='昇格後に成績が悪化したため'))"
 ```
+
+### 6. shadow記録を読む（昇格後の観察）
+
+**昇格済みの候補モデルは実発注に使っていない。** `signal_scan`（平日16:20）が
+毎日、現行モデルと同じ入力に対する候補の判断を `shadow_comparisons` テーブルへ
+記録するだけで、買い/売り/様子見の判断は従来どおり現行モデル（legacy）が決める。
+候補が未昇格（`models/current.json` が無い）なら何も記録されない。
+
+- 記録のID（`evaluation_run_id`）は**日ごと**に `shadow-YYYY-MM-DD`
+- 判定閾値は **0.5固定**。チューニングされた値ではなく観察用の仮の基準
+- 1日分の記録件数 ≒ その日スキャンした銘柄数（鮮度不足で除外された銘柄と、
+  日足が75本に満たない銘柄は入らない）
+
+1日分を見る:
+
+```bash
+python -c "from src.core import config as cfg; from src.core import risk_profile as rp; from src.data import database as db; cfg.load('config.yaml'); rp.load('risk_profile.json'); db.init(); from src.strategy import shadow; print(shadow.load_shadow_comparisons('shadow-2026-09-24').to_string())"
+```
+
+期間をまとめて集計する（日付範囲を書き換えて使う）:
+
+```bash
+python -c "import pandas as pd; from src.core import config as cfg; from src.core import risk_profile as rp; from src.data import database as db; cfg.load('config.yaml'); rp.load('risk_profile.json'); db.init(); from src.strategy import shadow; rows=[r for d in pd.bdate_range('2026-09-22','2026-12-30') for r in shadow.load_shadow_comparisons(f'shadow-{d.date()}').to_dict('records')]; print(shadow.disagreement_summary([shadow.ShadowComparison(event_id=r['event_id'], current_probability=r['current_probability'], candidate_probability=r['candidate_probability'], current_takes=bool(r['current_takes']), candidate_takes=bool(r['candidate_takes']), agreement=r['agreement']) for r in rows]))"
+```
+
+出力の見方:
+
+| キー | 意味 |
+| --- | --- |
+| `both_take` | 現行も候補も「採る」と判断した件数 |
+| `both_skip` | どちらも見送った件数 |
+| `only_current` | 現行だけが採ろうとした件数 |
+| `only_candidate` | 候補だけが採ろうとした件数 |
+| `agreement_rate` | 一致率（`(both_take + both_skip) / n`） |
+
+**読み方の注意**:
+
+- **これは勝ち負けの記録ではない。** 「どちらが当たったか」は実績
+  （`PredictionOutcome`）が要るが、現時点では保存していない。最大保有10営業日
+  経たないと確定しないため、今回の配線には含めていない。いま読めるのは
+  「候補が現行とどれだけ違う判断をしたか」だけである。
+- `only_current` / `only_candidate` が極端に片側へ寄っているときは、能力の差
+  ではなく**閾値の差**を見ている可能性が高い（候補の評価fold別閾値は
+  0.35〜1.0とばらついていた）。
+- 昇格済み候補の評価AUCは平均0.5032で、chanceと統計的に区別できていない
+  （`docs/kabu-auto-ml-real-data-comparison_20260921.md`）。数字が出たこと
+  自体は運用へ入れる理由にならない。
+- **観察期間の目安は最低6ヶ月、できれば1年。** 1日あたりの記録は銘柄数ぶん
+  （数十件）しかなく、日足スイングの決着は1件あたり最大10営業日かかる。
+  数週間の記録で判断しない。
+- 記録が0件の日が続くときは、①候補が昇格されているか（`models/current.json`）、
+  ②`signal_scan` が動いているか（ログの「シグナルスキャン開始」）、
+  ③ログに「shadow記録を行いません」「shadow記録の準備に失敗しました」が
+  出ていないか、の順に見る。
