@@ -709,3 +709,18 @@ class TestUnconfiguredAllowListFailsClosed:
         """空文字だけの指定も未設定と同じ扱いにする（main.py は {""} を渡す）。"""
         with patch.object(mod.DiscordBotClient, "get_me", return_value={"id": BOT_ID}):
             assert mod.build("token", "chan", {""}, {"status": lambda a: "OK"}) is None
+
+
+class TestConnectionHeaderAvoidsPersistentKeepAlive:
+    """REST呼び出しは Connection: close を送る（2026-09-25実例）。
+
+    requests のデフォルト（Keep-Alive維持）だと、Windows Defenderの
+    ネットワーク検査(NIS)が間欠的に接続を切断し、SSLEOFError
+    （'EOF occurred in violation of protocol'）で fetch_messages が
+    継続的に失敗し続けた（Connection: close を付けると再現しなくなることを
+    実機で確認済み）。
+    """
+
+    def test_headers_include_connection_close(self):
+        client = mod.DiscordBotClient("token", "chan")
+        assert client._headers["Connection"] == "close"

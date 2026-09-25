@@ -107,7 +107,10 @@ class DiscordBotClient:
 
     @property
     def _headers(self) -> dict:
-        return {"Authorization": f"Bot {self._token}"}
+        # Connection: close 必須（2026-09-25実例）。Keep-Alive維持だと
+        # Windows DefenderのNIS(ネットワーク検査)が間欠的に接続を切断し、
+        # SSLEOFErrorでポーリングが継続的に失敗し続けた。
+        return {"Authorization": f"Bot {self._token}", "Connection": "close"}
 
     def get_me(self) -> dict:
         resp = requests.get(f"{API_BASE}/users/@me", headers=self._headers,
