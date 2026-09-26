@@ -9,19 +9,8 @@ from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
-import pytest
 
-from src.core import config as cfg
-from src.data import database as db
 from src.data import market_data
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    return tmp_path
 
 
 class TestFetchSplits:

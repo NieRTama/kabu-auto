@@ -8,24 +8,8 @@ OrderIntent（発注の意図）の生成・紐付けのテスト（Phase 5 / 4.
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-import src.core.config as cfg
-import src.data.database as db
 import src.execution.order_manager as mod
 from src.data.database import OrderApproval, OrderIntent, Trade, get_session
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _cfg(mode: str) -> MagicMock:

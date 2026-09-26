@@ -6,24 +6,13 @@
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 
-import pytest
 from sqlalchemy import select
 
 from src.core import clock
-from src.core import config as cfg
-from src.data import database as db
 from src.data.bar_status import BarStatus
 from src.data.database import Signal, get_session
 from src.services import trading
 from src.strategy.signal import Signal as TradeSignal
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    return tmp_path
 
 
 class TestSignalDataAsOf:

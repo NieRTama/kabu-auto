@@ -6,24 +6,8 @@ validate_buy がスナップショットを1回だけ構築して各チェック
 """
 from unittest.mock import patch
 
-import pytest
-
-import src.core.config as cfg
-import src.data.database as db
 from src.data.database import Position, Trade, get_session
 from src.risk.manager import RiskManager, RiskSnapshot
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _add_position(symbol, qty, avg_cost, sector=""):

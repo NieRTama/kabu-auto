@@ -12,22 +12,8 @@ from datetime import datetime
 import pytest
 from sqlalchemy import select
 
-import src.core.config as cfg
-import src.data.database as db
 from src.data.database import Fill, Position, get_session
 from src.execution import lots
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _dt(h: int) -> datetime:

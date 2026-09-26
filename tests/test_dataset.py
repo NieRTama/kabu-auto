@@ -718,14 +718,6 @@ class TestSaveLoad:
         assert dataset.compute_dataset_id(loaded) == did
 
 
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    return tmp_path
-
-
 class TestInputOhlcvHash:
     def test_same_input_gives_same_hash(self):
         a = {"7203": _ohlcv(50)}

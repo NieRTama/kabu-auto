@@ -11,23 +11,14 @@ from datetime import datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
-import src.core.config as cfg
-import src.data.database as db
 import src.dashboard.app as dash
 from src.data.database import ModelMetrics, get_session
 
 
 @pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
+def isolated_db(isolated_db):
     dash._auth_required = False
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
+    return isolated_db
 
 
 def test_latest_skips_null_cv_row(isolated_db):

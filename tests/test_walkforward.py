@@ -15,7 +15,6 @@ from sqlalchemy import select
 from src.backtest import execution
 from src.backtest import portfolio as pf
 from src.backtest import walkforward as wf
-from src.core import config as cfg
 from src.data import database as db
 from src.data.database import get_session
 from src.strategy import policy
@@ -853,14 +852,6 @@ class TestWeeklyRetrain:
             retrain=wf.RetrainConfig(every_sessions=5, warmup_sessions=5),
             train_model=None)
         assert res.model_usage.empty
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    return tmp_path
 
 
 class TestDegraded:

@@ -22,14 +22,6 @@ from src.strategy import evaluation
 from src.strategy import validation
 
 
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    return tmp_path
-
-
 # テスト用のラベル契約ID。実物は dataset.make_label_contract_id() が作る
 # （退出ポリシー＋コスト＋版のハッシュ）。ここでは固定文字列で代用する。
 _LC = "testcontract"

@@ -8,26 +8,10 @@
 """
 from unittest.mock import MagicMock, patch
 
-import pytest
-
-import src.core.config as cfg
 import src.core.scheduler as scheduler_mod
-import src.data.database as db
 import src.risk.manager as risk_mod
 from src.data.database import Position, get_session
 from src.services.trading import TradingServices
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _add_position(symbol="7203", avg_cost=1000.0, peak_price=None, quantity=100):

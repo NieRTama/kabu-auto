@@ -16,16 +16,9 @@ from src.services import trading
 
 
 @pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
+def isolated_db(isolated_db):
     dash._auth_required = False
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
+    return isolated_db
 
 
 @pytest.fixture

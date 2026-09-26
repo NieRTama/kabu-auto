@@ -6,27 +6,12 @@ OrderManager.sync_on_startup() のテスト（再レビュー B-1 対応）
 """
 from unittest.mock import MagicMock, patch
 
-import pytest
 from sqlalchemy import select
 
-import src.core.config as cfg
-import src.data.database as db
 import src.execution.order_manager as mod
 import src.execution.order_status as st
 from src.data.database import Trade, get_session
 from src.execution.order_manager import OrderManager
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _add_trade(order_id, status=st.PENDING, quantity=100):

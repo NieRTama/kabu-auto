@@ -20,7 +20,6 @@ from sqlalchemy import select
 
 import src.core.config as cfg
 import src.core.scheduler as scheduler_mod
-import src.data.database as db
 from src.data.database import Signal, get_session
 from src.services import trading
 
@@ -28,18 +27,6 @@ from src.services import trading
 @pytest.fixture(autouse=True)
 def _load_config():
     cfg.load("config.yaml")
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 class TestEngineVersionDefault:

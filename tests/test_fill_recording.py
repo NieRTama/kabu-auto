@@ -13,22 +13,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy import select
 
-import src.core.config as cfg
-import src.data.database as db
 import src.execution.order_manager as mod
 from src.data.database import Fill, Position, Trade, get_session
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _cfg(mode: str) -> MagicMock:

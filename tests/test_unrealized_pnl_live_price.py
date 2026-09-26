@@ -26,23 +26,9 @@ from datetime import date
 import pandas as pd
 import pytest
 
-import src.core.config as cfg
-import src.data.database as db
 from src.data.database import Position, get_session
 from src.data.market_data import upsert_ohlcv
 from src.risk.manager import RiskManager
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _add_position(symbol, quantity, avg_cost, sector=""):

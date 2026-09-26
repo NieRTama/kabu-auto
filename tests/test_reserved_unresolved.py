@@ -5,25 +5,10 @@ RiskManager の未約定引当・未解決注文ガードのテスト（再レ�
 - check_sector_concentration が未約定BUYを集中度に加味する
 - can_place_order が UNKNOWN / CANCEL_FAILED 注文の存在時に発注を止める
 """
-import pytest
 
-import src.core.config as cfg
-import src.data.database as db
 import src.execution.order_status as st
 from src.data.database import Position, Trade, get_session
 from src.risk.manager import RiskManager
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 def _add_position(symbol, quantity, avg_cost, sector=""):

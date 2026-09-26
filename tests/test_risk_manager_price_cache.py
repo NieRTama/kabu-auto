@@ -14,23 +14,7 @@ RiskManager.get_current_prices() の短期キャッシュのテスト。
 """
 from unittest.mock import patch
 
-import pytest
-
-import src.core.config as cfg
-import src.data.database as db
 from src.risk.manager import RiskManager
-
-
-@pytest.fixture
-def isolated_db(tmp_path):
-    cfg.load("config.yaml")
-    cfg.get_section("data")["db_path"] = str(tmp_path / "test.db")
-    db.init()
-    try:
-        yield tmp_path
-    finally:
-        db._engine = None
-        db._Session = None
 
 
 class TestGetCurrentPricesCache:
