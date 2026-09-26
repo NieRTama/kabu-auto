@@ -278,6 +278,11 @@ def set_order_manager(om) -> None:
     init_auth()
 
 
+def get_emergency_token() -> Optional[str]:
+    """現在有効な緊急決済トークンを返す（Discord朝の投稿ジョブ用）。"""
+    return _emergency_token
+
+
 async def _verify_emergency_token(x_emergency_token: str = Header(...)) -> None:
     if _emergency_token is None or not secrets.compare_digest(x_emergency_token, _emergency_token):
         raise HTTPException(status_code=403, detail="Invalid emergency token")

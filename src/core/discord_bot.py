@@ -158,13 +158,25 @@ class DiscordBotClient:
             logger.warning(f"Botのロール取得に失敗しました（ロールメンションは無効）: {e}")
             return set()
 
-    def send(self, content: str) -> None:
+    def send(self, content: str) -> Optional[str]:
+        """メッセージを送信し、送信したメッセージIDを返す（削除追跡用）。"""
         if len(content) > MAX_REPLY_LENGTH:
             content = content[:MAX_REPLY_LENGTH] + "…(略)"
         resp = requests.post(
             f"{API_BASE}/channels/{self._channel_id}/messages",
             headers=self._headers, json={"content": content}, timeout=self._timeout,
         )
+        resp.raise_for_status()
+        return resp.json().get("id")
+
+    def delete(self, message_id: str) -> None:
+        """メッセージを削除する。既に無い（404）場合は成功扱いで無視する。"""
+        resp = requests.delete(
+            f"{API_BASE}/channels/{self._channel_id}/messages/{message_id}",
+            headers=self._headers, timeout=self._timeout,
+        )
+        if resp.status_code == 404:
+            return
         resp.raise_for_status()
 
 
@@ -385,6 +397,13 @@ class RemoteControl:
         if batch_last_id is not None:
             self._last_id = batch_last_id
         return executed
+
+    def send(self, content: str) -> Optional[str]:
+        """コマンド応答以外の任意送信（例: 緊急決済トークンの朝の投稿）。"""
+        return self._client.send(content)
+
+    def delete(self, message_id: str) -> None:
+        self._client.delete(message_id)
 
 
 def build(token: str, channel_id: str, allowed_user_ids: set,

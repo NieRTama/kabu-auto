@@ -8,10 +8,12 @@ kabu-auto メインエントリポイント
 src/services/trading.py の TradingServices に切り出している。
 """
 import atexit
+import json
 import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
@@ -37,7 +39,7 @@ from src.strategy import ml_model
 from src.services.trading import TradingServices, _select_latest_signals  # noqa: F401  (テスト互換のため再エクスポート)
 from src.dashboard.app import (
     app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn,
-    set_kabu_client, update_status, _get_lan_ip,
+    set_kabu_client, update_status, _get_lan_ip, get_emergency_token,
 )
 
 
@@ -526,6 +528,41 @@ def main() -> None:
     if slash is not None:
         atexit.register(slash.stop)
 
+    _emg_token_state_path = Path("data/emergency_token_post_state.json")
+
+    def _emergency_token_post_job():
+        """緊急決済トークンを毎朝Discordリモコン用チャンネルへ投稿し、前日分を削除する。
+
+        外出先からダッシュボードの X-Emergency-Token ヘッダーを使うための利便機能。
+        Discordチャンネル閲覧者にトークンが見える状態が最大1日分残る点は、
+        ユーザー了承済みのトレードオフ（既存のリモコン用チャンネルを再利用）。
+        """
+        token = get_emergency_token()
+        if not token:
+            return
+        prev_id = None
+        if _emg_token_state_path.exists():
+            try:
+                prev_id = json.loads(_emg_token_state_path.read_text(encoding="utf-8")).get("message_id")
+            except (json.JSONDecodeError, OSError):
+                prev_id = None
+        if prev_id:
+            try:
+                remote.delete(prev_id)
+            except Exception as e:
+                logger.warning(f"前日分の緊急決済トークン投稿の削除に失敗しました: {e}")
+        try:
+            new_id = remote.send(
+                f"🔑 緊急決済トークン（X-Emergency-Token ヘッダー用、{clock.today().isoformat()}時点）\n{token}"
+            )
+        except Exception as e:
+            logger.error(f"緊急決済トークンのDiscord投稿に失敗しました: {e}")
+            return
+        _emg_token_state_path.write_text(
+            json.dumps({"message_id": new_id, "date": clock.today().isoformat()}),
+            encoding="utf-8",
+        )
+
     # ─── スケジューラのコールバック登録 ──────────────────────
     scheduler.register("broker_full_login", broker_full_login_job)
     scheduler.register("risk_reset", risk.reset_daily_counters)
@@ -544,6 +581,7 @@ def main() -> None:
     scheduler.register("discord_weekly_report", services.post_weekly_summary_to_discord)
     if remote is not None:
         scheduler.register("discord_poll", remote.poll_once)
+        scheduler.register("emergency_token_post", _emergency_token_post_job)
     scheduler.register("x_daily_report", services.post_daily_summary_to_x)
     scheduler.register("discord_daily_report", services.post_daily_summary_to_discord)
 

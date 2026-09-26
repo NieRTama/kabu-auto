@@ -3,6 +3,7 @@ APSchedulerによるジョブスケジューラ
 - 毎朝8:25: 日次リスクカウンタリセット
 - 毎朝8:30: kabuステーション完全自動ログイン（broker_full_login_enabled=trueのときのみ実働）
 - 毎朝8:35: APIトークン更新（完全自動ログインの完了を待つため8:30より後ろに設定）
+- 平日8:50: 緊急決済トークンをDiscordへ投稿（前日分は削除）
 - 毎日16:00: データ更新
 - 毎日16:20: シグナルスキャン（data_updateの完了を待つため16:00より後ろに設定）
 - 毎日17:00: DBバックアップ
@@ -163,6 +164,13 @@ class TradingScheduler:
             self._scheduler.add_job(
                 cb["auth_recovery_check"], "interval",
                 minutes=5, id="auth_recovery_check",
+            )
+        if "emergency_token_post" in cb:
+            # 平日8:50（heartbeat 8:45の後・場が開く9:00より前）に緊急決済トークンを
+            # Discordリモコン用チャンネルへ投稿する。前日分の投稿は削除する。
+            self._scheduler.add_job(
+                cb["emergency_token_post"], "cron",
+                day_of_week="mon-fri", hour=8, minute=50, id="emergency_token_post",
             )
         if "discord_poll" in cb:
             # Discordリモコンの新着コマンドを取りに行く（アウトバウンドのみ・ポート開放不要）。

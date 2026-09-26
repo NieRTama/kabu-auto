@@ -48,6 +48,9 @@ data/auth.json
 # 取引停止スイッチの状態（運用状態・端末ごとに異なるため追跡しない）
 data/trading_halt.json
 
+# 緊急決済トークンのDiscord投稿状態（前日分削除用のmessage_idのみ。運用状態のため追跡しない）
+data/emergency_token_post_state.json
+
 # セッション引き継ぎメモ・個人用リスク設定（非公開・個人用のため追跡しない）
 chatlog2.md
 risk_profile.json
@@ -63,3 +66,8 @@ watchlist.json
 
 # git worktree（superpowers:using-git-worktrees 用の作業ディレクトリ）
 .worktrees/
+
+# graphify（ナレッジグラフ生成物。graph.jsonは数MB規模かつ端末ごとに再生成可能なため追跡しない。
+# .claude/settings.json のPreToolUseフックも端末固有の絶対パスを含むため同様に除外）
+graphify-out/
+.claude/

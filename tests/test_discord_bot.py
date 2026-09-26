@@ -724,3 +724,43 @@ class TestConnectionHeaderAvoidsPersistentKeepAlive:
     def test_headers_include_connection_close(self):
         client = mod.DiscordBotClient("token", "chan")
         assert client._headers["Connection"] == "close"
+
+
+class TestSendReturnsMessageIdAndDelete:
+    """緊急決済トークンの朝の投稿・前日分削除（main.py の emergency_token_post ジョブ）用。
+
+    送信したメッセージIDを取得できないと翌朝どれを消すか特定できず、削除も
+    「既に無い(404)」を成功扱いにしないと前日分が手動削除された場合に毎回失敗し続ける。
+    """
+
+    def test_send_returns_the_created_message_id(self):
+        client = mod.DiscordBotClient("tok", "chan")
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"id": "555"}
+        with patch.object(mod.requests, "post", return_value=resp):
+            assert client.send("hello") == "555"
+
+    def test_delete_calls_the_message_delete_endpoint(self):
+        client = mod.DiscordBotClient("tok", "chan")
+        resp = MagicMock(status_code=204)
+        resp.raise_for_status.return_value = None
+        with patch.object(mod.requests, "delete", return_value=resp) as req:
+            client.delete("555")
+        assert req.call_args.args[0] == f"{mod.API_BASE}/channels/chan/messages/555"
+
+    def test_delete_treats_already_gone_message_as_success(self):
+        """前日分が既に手動削除等で無い場合、404を例外にしない（毎朝の投稿処理を止めない）。"""
+        client = mod.DiscordBotClient("tok", "chan")
+        resp = MagicMock(status_code=404)
+        with patch.object(mod.requests, "delete", return_value=resp):
+            client.delete("555")  # 例外を投げないことを確認
+
+    def test_remote_control_send_and_delete_delegate_to_client(self):
+        client = MagicMock()
+        client.send.return_value = "999"
+        rc = mod.RemoteControl(client, mod.CommandHandler({}), bot_id=BOT_ID, allowed_user_ids={OWNER})
+        assert rc.send("token content") == "999"
+        client.send.assert_called_once_with("token content")
+        rc.delete("999")
+        client.delete.assert_called_once_with("999")
