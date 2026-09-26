@@ -537,6 +537,8 @@ def main() -> None:
         Discordチャンネル閲覧者にトークンが見える状態が最大1日分残る点は、
         ユーザー了承済みのトレードオフ（既存のリモコン用チャンネルを再利用）。
         """
+        if market_calendar.is_holiday(clock.today()):
+            return
         token = get_emergency_token()
         if not token:
             return
