@@ -155,18 +155,6 @@ class KabuClient:
         logger.info(f"注文キャンセル: OrderID={order_id}")
         return resp.json()
 
-    def register_push(self, symbols: list) -> None:
-        """WebSocketプッシュ配信に銘柄を登録する"""
-        payload = {"Symbols": [{"Symbol": s, "Exchange": 1} for s in symbols]}
-        self._request("PUT", "/register", json=payload)
-
-    def unregister_push(self, symbols: list) -> None:
-        payload = {"Symbols": [{"Symbol": s, "Exchange": 1} for s in symbols]}
-        self._request("PUT", "/unregister", json=payload)
-
-    def unregister_all(self) -> None:
-        self._request("PUT", "/unregister/all")
-
     # ─── WebSocket ───────────────────────────────────────
 
     def start_websocket(

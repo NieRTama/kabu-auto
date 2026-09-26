@@ -106,13 +106,6 @@ class TestExchange:
         from src.execution.broker_constants import Exchange
         assert Exchange.ORDER.value == 9
 
-    def test_quote_exchange_still_uses_tosho(self):
-        """板取得・PUSH登録は照会系なので 1 のまま（発注と混同しない）"""
-        import inspect
-        import src.api.kabu_client as kc
-        for name in ("register_push", "unregister_push"):
-            assert '"Exchange": 1' in inspect.getsource(getattr(kc.KabuClient, name))
-
 
 class TestDelivType:
     """受渡区分も売買で値が違う（2026-09-08 の退出失敗の回帰防止）。
