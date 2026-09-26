@@ -863,8 +863,8 @@
       document.getElementById('ml-trigger').textContent = triggerLabel[latest.trigger] || latest.trigger || '—';
     }
 
-    // CV精度推移チャート（古→新の順）
-    const sorted = [...metrics].reverse();
+    // CV精度推移チャート（古→新の順、CV指標を持たない行=v2候補学習は除外）
+    const sorted = metrics.filter(r => r.cv_mean_accuracy != null).reverse();
     const accLabels = sorted.map(r => r.trained_at
       ? new Date(r.trained_at).toLocaleDateString('ja-JP', { month: 'numeric', day: 'numeric' })
       : '');

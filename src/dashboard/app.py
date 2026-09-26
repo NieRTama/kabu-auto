@@ -1123,7 +1123,9 @@ async def get_model_latest():
     """最新の学習結果（特徴量重要度含む）を返す"""
     with get_session() as session:
         record = session.scalar(
-            select(ModelMetrics).order_by(ModelMetrics.id.desc())
+            select(ModelMetrics)
+            .where(ModelMetrics.cv_mean_accuracy.isnot(None))
+            .order_by(ModelMetrics.id.desc())
         )
     if record is None:
         return None
