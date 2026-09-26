@@ -1,13 +1,9 @@
 """異常時アラート通知（複数プロバイダ対応）
 
 LINE Notify は提供元により2025年3月31日に終了したため、本モジュールはこれを廃止し、
-Webhook型の通知プロバイダを複数並行で扱える抽象に置き換えた。
-新しい通知先を追加する場合は AlertProvider を満たすクラスを実装し、
-build_providers() に「設定されていれば追加する」分岐を1つ追加すればよい
-（alert() および呼び出し側は無改修で済む）。
+Webhook型の通知プロバイダ（現在は DiscordWebhookProvider のみ）を扱う。
 """
 import time
-from typing import Protocol
 
 import requests
 from loguru import logger
@@ -27,16 +23,6 @@ ALERT_RETRY_BASE_DELAY = 2.0  # 2秒 → 4秒（最大6秒の遅延で収める�
 # 通知自体が届く方を優先する）。
 DISCORD_MAX_CONTENT_LENGTH = 2000
 _TRUNCATION_SUFFIX = "…(省略)"
-
-
-class AlertProvider(Protocol):
-    """通知プロバイダの最小インターフェース。"""
-
-    name: str
-
-    def send(self, message: str) -> None:
-        """メッセージを送信する。失敗時は例外を投げてよい（alert()側が捕捉する）。"""
-        ...
 
 
 class DiscordWebhookProvider:
@@ -64,14 +50,10 @@ class DiscordWebhookProvider:
         resp.raise_for_status()
 
 
-def build_providers() -> list[AlertProvider]:
-    """config から有効な通知プロバイダの一覧を構築する。
-
-    将来プロバイダを追加する場合はここに分岐を1つ追加するだけでよい
-    （例: alerts.slack_webhook_url が設定されていれば SlackWebhookProvider を追加）。
-    """
+def build_providers() -> list[DiscordWebhookProvider]:
+    """config から有効な通知プロバイダの一覧を構築する。"""
     section = cfg.get_section("alerts")
-    providers: list[AlertProvider] = []
+    providers: list[DiscordWebhookProvider] = []
 
     discord_url = section.get("discord_webhook_url", "")
     if discord_url:
@@ -94,7 +76,7 @@ def _is_retryable(exc: Exception) -> bool:
     return status >= 500 or status == 429
 
 
-def _send_one(provider: AlertProvider, message: str, *,
+def _send_one(provider: DiscordWebhookProvider, message: str, *,
               attempts: int = ALERT_SEND_ATTEMPTS) -> bool:
     """1プロバイダへ送信する。一時的な失敗は指数バックオフで再送する。
 
