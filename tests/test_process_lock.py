@@ -91,3 +91,13 @@ class TestIsProcessRunning:
     def test_zero_or_negative_pid_is_not_running(self):
         assert process_lock._is_process_running(0) is False
         assert process_lock._is_process_running(-1) is False
+
+    def test_exited_process_with_open_handle_is_not_running(self):
+        # 強制終了直後もハンドルを握る者がいるとプロセスオブジェクトが残り、
+        # OpenProcessは成功してしまう（2026-09-27、再起動が多重起動と誤判定された実例）。
+        # Popenはハンドルを保持し続けるのでこの状態を再現できる。
+        import subprocess
+        import sys
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        assert process_lock._is_process_running(proc.pid) is False

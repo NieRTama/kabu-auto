@@ -33,10 +33,15 @@ def _is_process_running(pid: int) -> bool:
         handle = ctypes.windll.kernel32.OpenProcess(
             process_query_limited_information, False, pid,
         )
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
-        return False
+        if not handle:
+            return False
+        # 終了済みでも誰かがハンドルを握っているとOpenProcessは成功するため、
+        # 終了コードで生死を判定する（2026-09-27、強制終了直後の再起動が誤判定された）。
+        still_active = 259
+        code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return not ok or code.value == still_active
     try:
         os.kill(pid, 0)
     except OSError:
