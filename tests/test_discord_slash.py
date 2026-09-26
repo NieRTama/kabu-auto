@@ -102,6 +102,10 @@ class TestSlowCommands:
         """
         assert "full_login" in ds._SLOW_COMMANDS
 
+    def test_gmail_auth_is_deferred(self):
+        """gmail_auth はWSL上のdocker composeを起動するため10秒〜2分かかりうる。"""
+        assert "gmail_auth" in ds._SLOW_COMMANDS
+
     def test_read_only_commands_are_not_deferred(self):
         """DB照会は速いので即応答（defer すると2通に分かれて見づらい）"""
         for name in ("status", "positions", "pnl", "orders", "today"):

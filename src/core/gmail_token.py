@@ -13,7 +13,11 @@ from typing import Optional
 LIFETIME = timedelta(days=7)
 WARN_BEFORE = timedelta(days=2)
 ISSUED_AT_PATH = Path(__file__).resolve().parents[2] / "data" / "gmail_token_issued_at.txt"
-_HOW_TO = "PCで scripts\\gmail_reauth.bat をダブルクリックし、開いたブラウザで「許可」を押してください。"
+_HOW_TO = (
+    "Discordで `gmail_auth` を送る（スマホ可）か、"
+    "PCで scripts\\gmail_reauth.bat をダブルクリックし、"
+    "開いたブラウザで「許可」を押してください。"
+)
 
 
 def record_issued(at: datetime, path: Path = ISSUED_AT_PATH) -> None:

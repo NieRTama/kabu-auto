@@ -38,10 +38,11 @@ from loguru import logger
 
 # 応答に時間がかかる可能性があるコマンド（先に defer して3秒制約を回避する）。
 # full_login は broker_full_login_timeout_seconds（既定180秒）までブロックしうる、
-# このBot全体で唯一「3秒はおろか30秒すら超えうる」コマンドなので、抜けると
-# 実行自体は裏で成功していてもDiscord側は応答なしのまま失敗扱いになり、
-# 直後の再試行がクールダウンで弾かれて意味不明な状態になる（最重要）。
-_SLOW_COMMANDS = {"launch", "reconnect", "full_login"}
+# gmail_auth はWSL上でdocker composeを起動するため10秒〜2分程度かかりうる。
+# これらが抜けると実行自体は裏で成功していてもDiscord側は応答なしのまま
+# 失敗扱いになり、直後の再試行がクールダウンで弾かれて意味不明な状態になる
+# （最重要）。
+_SLOW_COMMANDS = {"launch", "reconnect", "full_login", "gmail_auth"}
 
 MAX_REPLY_LENGTH = 1900  # Discordの2000字制限に対する余裕
 

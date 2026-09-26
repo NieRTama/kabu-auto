@@ -24,7 +24,7 @@ from src.core import (
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
     discord_bot, auth_recovery, broker_launcher, broker_full_login, broker_watch, discord_queries,
-    discord_slash, gmail_token,
+    discord_slash, gmail_token, gmail_remote_auth,
     market_calendar, clock,
 )
 from src.core import alerts as alerts_mod
@@ -495,6 +495,17 @@ def main() -> None:
         broker_auth.mark_valid()
         return "再接続しました。取引を再開します"
 
+    def _cmd_gmail_auth(args: str) -> str:
+        """Gmail認証をDiscord経由（スマホ）でやり直す。
+
+        引数なし: 認証URLを発行する。引数あり: 許可後にリダイレクトされた
+        （スマホでは開けない）URLを貼り付けてトークン交換を完了する。
+        """
+        text = args.strip()
+        if text:
+            return gmail_remote_auth.finish(text)
+        return gmail_remote_auth.start()
+
     def _cmd_halt(args: str) -> str:
         halt_store.engage(args.strip() or "Discordから手動停止")
         return "取引を停止しました（新規発注を抑止。損切り・緊急決済は引き続き動作します）"
@@ -520,6 +531,7 @@ def main() -> None:
         "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),
         "launch": (_cmd_launch, "kabuステーションを起動する（認証は手動）"),
         "full_login": (_cmd_full_login, "kabuステーションの起動〜ログイン〜2段階認証入力まで完全自動化する"),
+        "gmail_auth": (_cmd_gmail_auth, "Gmail認証をやり直す（引数なし→URL発行／許可後のURLを付けて再実行→完了）"),
         "halt": (_cmd_halt, "取引を停止する（例: halt 様子見。退出は継続）"),
         "resume": (_cmd_resume, "取引を再開する"),
     }

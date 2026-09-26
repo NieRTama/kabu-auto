@@ -208,6 +208,7 @@ def run(*, manual: bool = False,
             logger.error(f"完全自動ログイン失敗: Gmail認証が失効しています: {detail_source[-300:]}")
             return False, (
                 "Gmail認証（ワンタイムパスワード取得用）が失効しています。"
+                "Discordで `gmail_auth` を送る（スマホ可）か、"
                 "PCで scripts\\gmail_reauth.bat をダブルクリックし、"
                 "開いたブラウザで「許可」を押してください"
             )
