@@ -14,14 +14,14 @@ APSchedulerによるジョブスケジューラ
 """
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from loguru import logger
 
 from src.core import market_calendar
 
-TZ = pytz.timezone("Asia/Tokyo")
+TZ = ZoneInfo("Asia/Tokyo")
 
 
 class TradingScheduler:

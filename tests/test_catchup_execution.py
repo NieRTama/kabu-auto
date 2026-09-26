@@ -12,15 +12,15 @@
 """
 from datetime import datetime
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
-import pytz
 
 import src.core.scheduler as sched_mod
 from src.core.scheduler import TradingScheduler
 from src.services.trading import TradingServices
 
-TZ = pytz.timezone("Asia/Tokyo")
+TZ = ZoneInfo("Asia/Tokyo")
 
 
 def _services(deadline=14):
@@ -35,7 +35,7 @@ def _services(deadline=14):
 
 def _run(svc, *, market_open: bool, now_hour: int, now_minute: int = 0):
     """指定時刻・市場状態で catchup_execution を実行し、発注本体が呼ばれたかを返す。"""
-    fake_now = TZ.localize(datetime(2026, 8, 31, now_hour, now_minute))
+    fake_now = datetime(2026, 8, 31, now_hour, now_minute, tzinfo=TZ)
     with patch.object(TradingScheduler, "is_market_open", return_value=market_open), \
          patch.object(sched_mod, "datetime") as dt_mock, \
          patch.object(svc, "_execute_pending_signals") as exec_mock:
@@ -100,7 +100,7 @@ class TestIsBefore:
     """締切判定そのもの（時刻ヘルパー）"""
 
     def _at(self, h, m=0):
-        return TZ.localize(datetime(2026, 8, 31, h, m))
+        return datetime(2026, 8, 31, h, m, tzinfo=TZ)
 
     def test_true_before_target(self):
         assert TradingScheduler.is_before(14, now=self._at(13, 59)) is True

@@ -2,14 +2,14 @@
 流動性フィルタ（レビュー P0-6）のテスト
 """
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
-import pytz
 
 from src.core.scheduler import TradingScheduler
 from src.risk import liquidity
 
-TZ = pytz.timezone("Asia/Tokyo")
+TZ = ZoneInfo("Asia/Tokyo")
 
 
 def _df(closes, volumes):
@@ -88,17 +88,17 @@ class TestNearClose:
         assert TradingScheduler.is_near_close(0) is False
 
     def test_true_within_window_before_close(self):
-        now = TZ.localize(datetime(2026, 6, 22, 15, 25))  # 月曜 15:25, 引け5分前
+        now = datetime(2026, 6, 22, 15, 25, tzinfo=TZ)  # 月曜 15:25, 引け5分前
         assert TradingScheduler.is_near_close(10, now=now) is True
 
     def test_false_in_morning(self):
-        now = TZ.localize(datetime(2026, 6, 22, 9, 10))
+        now = datetime(2026, 6, 22, 9, 10, tzinfo=TZ)
         assert TradingScheduler.is_near_close(10, now=now) is False
 
     def test_true_after_close(self):
-        now = TZ.localize(datetime(2026, 6, 22, 16, 0))
+        now = datetime(2026, 6, 22, 16, 0, tzinfo=TZ)
         assert TradingScheduler.is_near_close(10, now=now) is True
 
     def test_false_on_weekend(self):
-        now = TZ.localize(datetime(2026, 6, 20, 15, 25))  # 土曜
+        now = datetime(2026, 6, 20, 15, 25, tzinfo=TZ)  # 土曜
         assert TradingScheduler.is_near_close(10, now=now) is False

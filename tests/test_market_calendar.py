@@ -6,14 +6,14 @@ is_market_open() は当初「土日」しか除外しておらず、祝日を「
 誤発報する（2026-08 に昼休み・夜間で同種の誤検知を2度経験している）。
 """
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
-import pytz
 
 from src.core import market_calendar as mc
 from src.core.scheduler import TradingScheduler
 
-TZ = pytz.timezone("Asia/Tokyo")
+TZ = ZoneInfo("Asia/Tokyo")
 
 
 class TestWeekend:
@@ -81,7 +81,7 @@ class TestMarketOpenIntegration:
     """is_market_open が祝日を除外すること（本丸の回帰防止）"""
 
     def _at(self, y, m, d, hh, mm):
-        return TZ.localize(datetime(y, m, d, hh, mm))
+        return datetime(y, m, d, hh, mm, tzinfo=TZ)
 
     def test_closed_on_holiday_during_trading_hours(self):
         """祝日の場中時間帯でも「開いていない」と判定する"""

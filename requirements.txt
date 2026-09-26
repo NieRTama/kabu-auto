@@ -3,7 +3,6 @@
 # （完全固定すると古い版がYahoo仕様変更で取得不能になるため。動作確認版は 1.4.1）。
 requests==2.31.0
 yfinance>=1.4.1,<2.0.0
-pytz==2026.2
 websocket-client==1.7.0
 pandas==2.1.4
 numpy==1.26.2
