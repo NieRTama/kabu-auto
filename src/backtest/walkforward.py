@@ -187,32 +187,6 @@ def _candidate(symbol: str, row, ctx: dict, score: float, tier: int = 0) -> pf.C
                         price=float(row["close"]), score=score, tier=tier)
 
 
-def make_weighted_blend(conf: StrategyConfig, score_fn: Callable) -> Callable:
-    """案1: 既存の加重合成。`rule × rule_weight + (p−0.5)×2 × ml_weight`。"""
-    def decide(session, rows, model, ctx):
-        out = []
-        for symbol, row in rows.items():
-            rule, proba = score_fn(symbol, row)
-            ml = (proba - 0.5) * 2 if proba is not None else 0.0
-            blended = rule * conf.rule_weight + ml * conf.ml_weight
-            if blended >= conf.buy_threshold:
-                out.append(_candidate(symbol, row, ctx, blended))
-        return out
-    return decide
-
-
-def make_rule_only(conf: StrategyConfig, score_fn: Callable) -> Callable:
-    """案2: 縮尺を明示したルール単独。重みで割り引かない。"""
-    def decide(session, rows, model, ctx):
-        out = []
-        for symbol, row in rows.items():
-            rule, _ = score_fn(symbol, row)
-            if rule >= conf.buy_threshold:
-                out.append(_candidate(symbol, row, ctx, rule))
-        return out
-    return decide
-
-
 def make_rule_then_ml(conf: StrategyConfig, score_fn: Callable) -> Callable:
     """案3: ルールで候補を作り、MLで買う・見送るの順位を決める。
 

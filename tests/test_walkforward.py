@@ -1100,35 +1100,6 @@ def _scores(rule: float, ml):
     return score_fn
 
 
-class TestWeightedBlend:
-    def test_buys_when_blended_score_reaches_the_threshold(self):
-        decide = wf.make_weighted_blend(_strategy(buy_thr=0.25), _scores(0.4, 0.6))
-        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
-        rows = {"A": pd.Series({"close": 1000.0})}
-        # 0.4*0.5 + (0.6-0.5)*2*0.5 = 0.2 + 0.1 = 0.30 >= 0.25
-        assert [c.symbol for c in decide(date(2026, 1, 5), rows, "m", ctx)] == ["A"]
-
-    def test_skips_below_the_threshold(self):
-        decide = wf.make_weighted_blend(_strategy(buy_thr=0.25), _scores(0.2, 0.5))
-        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
-        rows = {"A": pd.Series({"close": 1000.0})}
-        assert decide(date(2026, 1, 5), rows, "m", ctx) == []
-
-
-class TestRuleOnly:
-    def test_uses_the_rule_score_directly(self):
-        """縮尺を明示する。重みで割り引かない"""
-        decide = wf.make_rule_only(_strategy(buy_thr=0.25), _scores(0.3, None))
-        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
-        rows = {"A": pd.Series({"close": 1000.0})}
-        assert [c.symbol for c in decide(date(2026, 1, 5), rows, None, ctx)] == ["A"]
-
-    def test_ignores_the_model(self):
-        decide = wf.make_rule_only(_strategy(buy_thr=0.25), _scores(0.3, 0.01))
-        ctx = {"sectors": {"A": "S"}, "portfolio": None, "closes": {}}
-        rows = {"A": pd.Series({"close": 1000.0})}
-        assert len(decide(date(2026, 1, 5), rows, "m", ctx)) == 1
-
 
 class TestRuleThenMl:
     def test_rule_gates_and_ml_ranks(self):
@@ -1330,18 +1301,14 @@ class TestRuleThenMl:
         assert rejected == []
 
 
-class TestThreeStrategiesShareTheSameLoop:
-    def test_all_three_run_on_the_same_market_data(self):
+class TestRuleThenMlRunsOnMarketData:
+    def test_runs_on_the_same_market_data(self):
         md = _market(symbols=("A", "B"), n=15)
-        results = {}
-        for name, maker in (("blend", wf.make_weighted_blend),
-                            ("rule", wf.make_rule_only),
-                            ("rule_ml", wf.make_rule_then_ml)):
-            decide = maker(_strategy(buy_thr=0.25), _scores(0.30, 0.70))
-            results[name] = wf.run_walkforward(
-                md, date(2026, 1, 5), date(2026, 1, 19),
-                initial_capital=1_000_000.0, decide=decide,
-                policy_conf=_policy_conf(max_holding=50), costs=_costs(),
-                sizing=_sizing(ratio=0.25), liquidity=execution.LiquidityConfig())
-        assert all(len(r.daily) == 15 for r in results.values())
-        assert all(r.degraded is False for r in results.values())
+        decide = wf.make_rule_then_ml(_strategy(buy_thr=0.25), _scores(0.30, 0.70))
+        result = wf.run_walkforward(
+            md, date(2026, 1, 5), date(2026, 1, 19),
+            initial_capital=1_000_000.0, decide=decide,
+            policy_conf=_policy_conf(max_holding=50), costs=_costs(),
+            sizing=_sizing(ratio=0.25), liquidity=execution.LiquidityConfig())
+        assert len(result.daily) == 15
+        assert result.degraded is False
