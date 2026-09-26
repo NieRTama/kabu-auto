@@ -59,37 +59,6 @@ class TestRecordLoss:
             assert risk._daily_loss_yen == 18000.0
 
 
-class TestDailyLossLimitCheck:
-    def test_under_limit_returns_false(self):
-        """損失が上限未満なら over=False を返す"""
-        with _make_risk(max_daily_loss=30000) as risk:
-            risk.record_loss(-29999)
-            over, _ = risk.is_daily_loss_limit_reached()
-            assert over is False
-
-    def test_at_limit_returns_true(self):
-        """損失が上限に達したら (True, message) を返す"""
-        with _make_risk(max_daily_loss=30000) as risk:
-            risk.record_loss(-30000)
-            over, reason = risk.is_daily_loss_limit_reached()
-            assert over is True
-            assert "30,000" in reason
-
-    def test_over_limit_returns_true(self):
-        """損失が上限を超えた場合も True を返す"""
-        with _make_risk(max_daily_loss=30000) as risk:
-            risk.record_loss(-50000)
-            over, _ = risk.is_daily_loss_limit_reached()
-            assert over is True
-
-    def test_zero_limit_disables_check(self):
-        """max_daily_loss=0 なら損失上限チェック無効"""
-        with _make_risk(max_daily_loss=0) as risk:
-            risk.record_loss(-999999)
-            over, _ = risk.is_daily_loss_limit_reached()
-            assert over is False
-
-
 class TestCanPlaceOrderWithLossLimit:
     def test_loss_limit_blocks_order(self):
         """当日損失上限到達時は can_place_order() が (False, reason) を返す"""

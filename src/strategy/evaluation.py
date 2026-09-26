@@ -851,49 +851,6 @@ def run_evaluation(events: pd.DataFrame, *, model_factories: Optional[dict] = No
     }
 
 
-def _single_column_value(df: pd.DataFrame, col: str) -> float:
-    """列の値がこの範囲内で単一値であることを確認してから返す。
-
-    `capture_run_config._one()` と同じ考え方（外部レビューI-3）。単一で
-    なければ、その範囲を跨いだ baseline を暗黙に選ぶことになり誤りうる
-    ため ValueError にする。
-    """
-    if col not in df.columns or len(df) == 0:
-        raise ValueError(
-            f"baseline_rate を省略するには、明細に{col}列が必要です")
-    values = set(df[col].dropna().tolist())
-    if len(values) != 1:
-        raise ValueError(
-            f"baseline_rate を省略するには{col}がこの範囲内で単一値である"
-            f"必要があります（fold等で絞り込んでください）: {sorted(values)}")
-    return float(values.pop())
-
-
-def recompute_metrics(details: pd.DataFrame, *, baseline_rate: Optional[float] = None,
-                      model_id: Optional[str] = None) -> dict:
-    """保存した予測明細だけから指標を計算し直す。
-
-    実績が未確定の行（shadow等）は除外する。集計済みの数値しか無い状態では
-    「その数字が何を意味するか」を後から検証できないため、明細から同じ指標を
-    再現できることを保証する（spec §14 段階C完了条件）。
-
-    `baseline_rate` を省略すると、`details` の `train_positive_rate` 列
-    （外部レビューI-3で永続化）から導出する。その列がこの呼び出しの対象
-    範囲内（`model_id` で絞り込んだ後）で単一値であることを要求し、
-    単一でなければ ValueError にする（複数foldをまたいだ明細をそのまま
-    渡すと、どのfoldのbaselineを使うべきか一意に決まらないため）。
-    """
-    sub = details if model_id is None else details[details["model_id"] == model_id]
-    sub = sub[sub["actual_label"].notna()]
-    if baseline_rate is None:
-        baseline_rate = _single_column_value(sub, "train_positive_rate")
-    return compute_metrics(
-        sub["actual_label"].astype(int),
-        sub["calibrated_probability"].astype(float).values,
-        baseline_rate=baseline_rate,
-    )
-
-
 def select_training_window(events: pd.DataFrame, fold, make_model,
                            candidates: list, *,
                            feature_cols: Optional[list] = None,
@@ -961,19 +918,3 @@ def select_training_window(events: pd.DataFrame, fold, make_model,
         if score > best_score:
             best_score, best_window = score, window
     return best_window
-
-
-def inner_validation_event_ids(events: pd.DataFrame, fold, *,
-                               feature_cols: Optional[list] = None,
-                               inner_splits: int = 3) -> list:
-    """select_training_window が使う内側検証集合の event_id を返す（検証用）。
-
-    「全候補窓で検証集合が同一である」ことをテストから確かめるために切り出す。
-    """
-    cols = list(feature_cols) if feature_cols is not None else list(FEATURE_COLS)
-    base = validation.training_inputs(events, fold, feature_cols=cols)
-    out = []
-    for inner in validation.inner_folds(base.events, n_splits=inner_splits):
-        _, inner_val = validation.split_events(base.events, inner)
-        out.extend(list(inner_val["event_id"]))
-    return out

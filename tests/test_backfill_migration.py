@@ -131,11 +131,6 @@ class TestBackfillMigration:
             assert pos.quantity == 120
             assert pos.avg_cost == pytest.approx(500.0)
 
-    def test_schema_version_becomes_2(self, v1_db):
-        _seed_legacy_trades()
-        db._run_migrations(db._engine)
-        assert db.get_schema_version() == 2
-
     def test_idempotent_rerun_does_not_duplicate(self, v1_db):
         """移行を2回走らせても、intentやFillが重複生成されないこと"""
         _seed_legacy_trades()

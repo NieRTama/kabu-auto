@@ -32,35 +32,3 @@ class TestFetchSplits:
         assert len(splits) == 0
 
 
-class TestSplitFactor:
-    def test_factor_is_product_of_splits_in_range(self, isolated_db):
-        market_data.upsert_splits("7203", pd.Series(
-            [2.0, 3.0], index=[date(2026, 6, 1), date(2026, 7, 1)]
-        ))
-        assert market_data.split_factor_between(
-            "7203", date(2026, 5, 1), date(2026, 8, 1)) == 6.0
-
-    def test_factor_is_one_when_no_split_in_range(self, isolated_db):
-        market_data.upsert_splits("7203", pd.Series(
-            [2.0], index=[date(2026, 6, 1)]
-        ))
-        assert market_data.split_factor_between(
-            "7203", date(2026, 7, 1), date(2026, 8, 1)) == 1.0
-
-
-class TestSplitInvariant:
-    def test_split_alone_does_not_change_valuation(self, isolated_db):
-        """1対2分割で株数は2倍・価格は半値になり、評価額は変わらない"""
-        market_data.upsert_splits("7203", pd.Series(
-            [2.0], index=[date(2026, 6, 1)]
-        ))
-        factor = market_data.split_factor_between(
-            "7203", date(2026, 5, 1), date(2026, 7, 1))
-
-        before_qty, before_price = 100, 1000.0
-        after_qty = int(before_qty * factor)
-        after_price = before_price / factor
-
-        assert after_qty == 200
-        assert after_price == 500.0
-        assert after_qty * after_price == before_qty * before_price

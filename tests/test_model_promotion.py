@@ -449,17 +449,6 @@ class TestPromotionIsRecoverable:
         assert promotion.recover_promotions(base_dir=str(tmp_path)) == []
         assert promotion.recover_promotions(base_dir=str(tmp_path)) == []
 
-    def test_no_committed_row_without_a_switched_at(self, isolated_db, tmp_path):
-        """不変条件: committed なら切替時刻が必ずある"""
-        self._ready(tmp_path)
-        promotion.promote("m0001", evaluation_run_id="run1", decided_by="g",
-                          reason="ok", degraded=False, base_dir=str(tmp_path),
-                          expected_feature_cols=["f1", "f2"])
-        for row in promotion.promotion_history():
-            if row.state == promotion.PROMOTION_COMMITTED:
-                assert row.switched_at is not None
-
-
 class TestPromotionRollback:
     """`promotion.rollback()` — ロールバックも ModelPromotion に記録を
     残す（外部レビュー最終ブランチレビュー M3）。`model_store.rollback()`

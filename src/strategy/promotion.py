@@ -212,21 +212,6 @@ def recover_promotions(*, base_dir: str = "models") -> list:
     return resolved
 
 
-def promotion_history(*, limit: int = 50) -> list:
-    """昇格履歴（新しい順）。pending が残っていれば混じる。"""
-    from sqlalchemy import select as sa_select
-
-    from src.data.database import ModelPromotion, get_session
-
-    with get_session() as session:
-        rows = list(session.scalars(
-            sa_select(ModelPromotion)
-            .order_by(ModelPromotion.id.desc()).limit(limit)).all())
-        for r in rows:
-            session.expunge(r)
-        return rows
-
-
 def rollback(*, decided_by: str, reason: str, base_dir: str = "models") -> Optional[int]:
     """1つ前のモデルへ戻し、`promote()` と同じ形式で `ModelPromotion` に記録する。
 

@@ -73,12 +73,3 @@ def get_api_password() -> str:
     """
     return os.environ.get("KABU_API_PASSWORD") or get_section("kabu_station").get("password", "")
 
-
-def require_api_password() -> str:
-    """APIパスワードを取得し、未設定なら例外を投げる（live/semi_live の発注前チェック用）。"""
-    pw = get_api_password()
-    if not pw:
-        raise RuntimeError(
-            "kabuステーションAPIパスワードが未設定です。.env の KABU_API_PASSWORD を設定してください"
-        )
-    return pw

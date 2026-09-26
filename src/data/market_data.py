@@ -148,29 +148,6 @@ def upsert_splits(symbol: str, splits: pd.Series) -> int:
     return added
 
 
-def split_factor_between(symbol: str, start: date, end: date) -> float:
-    """start（含む）～end（含む）の間に起きた分割比率の積を返す。
-
-    1対2分割が1回なら 2.0。分割が無ければ 1.0。
-    「当時100株だった建玉が今何株か」「当時の株価が今いくらに調整されているか」を
-    対応付けるのに使う。
-    """
-    with get_session() as session:
-        rows = session.scalars(
-            select(CorporateAction).where(
-                CorporateAction.symbol == symbol,
-                CorporateAction.action_type == "SPLIT",
-                CorporateAction.date >= start,
-                CorporateAction.date <= end,
-            )
-        ).all()
-    factor = 1.0
-    for r in rows:
-        if r.ratio:
-            factor *= float(r.ratio)
-    return factor
-
-
 def update_symbol(symbol: str, years: int = 3,
                   now: Optional[datetime] = None) -> BarStatus:
     """銘柄の過去データと分割イベントを更新し、最終足の状態を返す。

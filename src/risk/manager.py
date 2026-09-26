@@ -234,15 +234,6 @@ class RiskManager:
         unrealized = self.unrealized_pnl(snapshot)
         return self._daily_loss_yen + max(0.0, -unrealized)
 
-    def is_daily_loss_limit_reached(self) -> tuple[bool, str]:
-        """当日損失上限チェック（実現損失のみ）。(over_limit, reason) を返す"""
-        limit = self._conf.get("max_daily_loss", 0)
-        if limit <= 0:
-            return False, ""
-        if self._daily_loss_yen >= limit:
-            return True, f"当日損失上限({limit:,.0f}円)に達しました"
-        return False, ""
-
     def is_total_loss_limit_reached(
         self, snapshot: Optional[RiskSnapshot] = None
     ) -> tuple[bool, str]:

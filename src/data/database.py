@@ -641,14 +641,6 @@ def _run_migrations(engine) -> None:
             logger.info(f"スキーマバージョン: {current} → {SCHEMA_VERSION}")
 
 
-def get_schema_version() -> int:
-    """現在記録されているスキーマバージョンを返す（未初期化なら0）。"""
-    if _engine is None:
-        return 0
-    with _engine.connect() as conn:
-        return conn.execute(text("SELECT version FROM schema_version WHERE id=1")).scalar() or 0
-
-
 def _migrate_add_missing_columns(engine) -> None:
     """create_all はテーブル新規作成のみ行うため、既存DBに後から追加したカラムを
     SQLiteの ALTER TABLE ADD COLUMN で補う簡易マイグレーション。"""

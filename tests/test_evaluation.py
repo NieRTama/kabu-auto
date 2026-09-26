@@ -1227,107 +1227,6 @@ class TestDegradedReasons:
         assert any("roc_auc" in r for r in out["degraded_reasons"])
 
 
-class TestRecomputeFromDetails:
-    def test_metrics_match_the_original_run(self, isolated_db):
-        """保存した明細**だけ**から、実行時と同じ指標が出る（spec §14 完了条件）。
-
-        baseline_rate は明示的に渡さず、保存済みの train_positive_rate 列
-        （外部レビューI-3で永続化）から導出する。以前はメモリ上の
-        FoldResult から `res.train_positive_rate` を借りていたため、
-        「保存データだけからは指標を再現できない」欠陥を隠していた。
-        """
-        events = _events(n_sessions=150)
-        out = evaluation.run_evaluation(
-            events,
-            model_factories={"logistic_regression": evaluation.LogisticRegressionModel},
-            n_splits=3, feature_cols=FEATURES, persist=True)
-
-        details = evaluation.load_prediction_details(
-            out["evaluation_run_id"], model_id="logistic_regression")
-
-        for res in out["fold_results"]:
-            sub = details[details["fold_index"] == res.fold_index]
-            again = evaluation.recompute_metrics(sub)
-            assert again["n"] == res.metrics["n"]
-            assert again["brier"] == pytest.approx(res.metrics["brier"])
-            assert again["brier_vs_constant"] == pytest.approx(
-                res.metrics["brier_vs_constant"])
-            assert again["log_loss_vs_constant"] == pytest.approx(
-                res.metrics["log_loss_vs_constant"])
-            if res.metrics["roc_auc"] is not None:
-                assert again["roc_auc"] == pytest.approx(res.metrics["roc_auc"])
-
-    def test_baseline_rate_can_still_be_overridden_explicitly(self, isolated_db):
-        """任意のbaselineで引き直したい場合のため、明示指定は従来どおり効く"""
-        events = _events(n_sessions=150)
-        out = evaluation.run_evaluation(
-            events,
-            model_factories={"constant_probability": evaluation.ConstantProbability},
-            n_splits=3, feature_cols=FEATURES, persist=True)
-        details = evaluation.load_prediction_details(out["evaluation_run_id"])
-        sub = details[details["fold_index"] == out["fold_results"][0].fold_index]
-        explicit = evaluation.recompute_metrics(sub, baseline_rate=0.5)
-        auto = evaluation.recompute_metrics(sub)
-        # 明示指定した baseline=0.5 が実際に効いていること（自動導出値と違う前提）
-        assert sub["train_positive_rate"].iloc[0] != pytest.approx(0.5)
-        assert explicit["brier_vs_constant"] != pytest.approx(auto["brier_vs_constant"])
-
-    def test_raises_when_baseline_rate_is_ambiguous_without_explicit_value(
-            self, isolated_db):
-        """複数foldにまたがる明細でbaseline_rateを省略すると、train_positive_rate
-        が単一値ではないため ValueError（外部レビューI-3）"""
-        events = _events(n_sessions=150)
-        out = evaluation.run_evaluation(
-            events,
-            model_factories={"constant_probability": evaluation.ConstantProbability},
-            n_splits=3, feature_cols=FEATURES, persist=True)
-        details = evaluation.load_prediction_details(out["evaluation_run_id"])
-        assert details["train_positive_rate"].nunique() > 1
-        with pytest.raises(ValueError, match="train_positive_rate"):
-            evaluation.recompute_metrics(details)
-
-    def test_trading_decisions_can_be_recomputed(self, isolated_db):
-        """明細から採用群も引き直せる（閾値を変えた検討ができる）"""
-        events = _events(n_sessions=150)
-        out = evaluation.run_evaluation(
-            events,
-            model_factories={"constant_probability": evaluation.ConstantProbability},
-            n_splits=3, feature_cols=FEATURES, persist=True)
-        details = evaluation.load_prediction_details(out["evaluation_run_id"])
-        taken = details[details["calibrated_probability"] >= 0.0]
-        assert taken["net_return"].notna().all()
-
-    def test_the_runs_own_trading_decision_can_be_recovered(self, isolated_db):
-        """外部レビューI-3: 保存済みの threshold 列を使えば、その run自身が
-        採用した閾値（任意の閾値ではなく）で売買判断を再現できる"""
-        events = _events(n_sessions=150)
-        out = evaluation.run_evaluation(
-            events,
-            model_factories={"constant_probability": evaluation.ConstantProbability},
-            n_splits=3, feature_cols=FEATURES, persist=True)
-        details = evaluation.load_prediction_details(out["evaluation_run_id"])
-        for res in out["fold_results"]:
-            sub = details[details["fold_index"] == res.fold_index]
-            assert sub["threshold"].iloc[0] == pytest.approx(res.threshold)
-            taken = sub[sub["calibrated_probability"] >= sub["threshold"]]
-            expected_taken = res.predictions[
-                res.predictions["calibrated_probability"] >= res.threshold]
-            assert len(taken) == len(expected_taken)
-
-    def test_skips_rows_without_outcomes(self, isolated_db):
-        preds = pd.DataFrame({
-            "event_id": ["a", "b"],
-            "label_contract_id": [_LC, _LC],
-            "raw_probability": [0.6, 0.4],
-            "calibrated_probability": [0.6, 0.4],
-            "fold_index": [0, 0],
-        })
-        evaluation.save_predictions(preds, "run1", "m")
-        details = evaluation.load_prediction_details("run1")
-        got = evaluation.recompute_metrics(details, baseline_rate=0.5)
-        assert got["n"] == 0
-
-
 class TestSelectTrainingWindow:
     def test_returns_one_of_the_candidates(self):
         events = _events(n_sessions=150)
@@ -1437,20 +1336,6 @@ class TestSelectTrainingWindow:
             assert all(s == id_sets[0] for s in id_sets), (
                 f"内側fold({val_start}~{val_end})の検証集合が候補間で一致しない"
             )
-
-        # inner_validation_event_ids() が返す値とも一致する
-        all_captured_ids = set().union(*(c[3] for c in captured_inner))
-        ids = evaluation.inner_validation_event_ids(
-            events, fold, feature_cols=FEATURES)
-        assert len(ids) > 0
-        assert set(ids) == all_captured_ids
-
-        # 内側検証集合は窓候補を引数に取らない＝窓に依存しない
-        import inspect
-        params = set(inspect.signature(
-            evaluation.inner_validation_event_ids).parameters)
-        assert "candidates" not in params
-        assert "window_sessions" not in params
 
     def test_window_only_shrinks_the_training_side(self):
         """短い窓は学習件数を減らすが、検証件数は減らさない"""
