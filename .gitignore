@@ -71,3 +71,4 @@ watchlist.json
 # .claude/settings.json のPreToolUseフックも端末固有の絶対パスを含むため同様に除外）
 graphify-out/
 .claude/
+data/gmail_token_issued_at.txt

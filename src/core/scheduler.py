@@ -59,6 +59,13 @@ class TradingScheduler:
                 cb["broker_full_login"], "cron",
                 day_of_week="mon-fri", hour=8, minute=30, id="broker_full_login",
             )
+        if "gmail_token_check" in cb:
+            # Gmail認証（OTP取得用）の7日失効を事前に知らせる（gmail_token.py参照）。
+            # 月曜8:30の自動ログインに備え土日も実行する。PCの前にいそうな夜に通知する。
+            self._scheduler.add_job(
+                cb["gmail_token_check"], "cron",
+                hour=20, minute=0, id="gmail_token_check",
+            )
         if "token_refresh" in cb:
             # 休場日はトークンを取る必要が無く、取れなくても異常ではない。
             # 曜日指定が無いと土日祝にも走り、🔴「再ログインが必要です」を誤発報する

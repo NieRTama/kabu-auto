@@ -234,6 +234,8 @@ class TestScheduledJobsHaveDayRestriction:
         "data_update",
         # バックアップは休場日も取る（データ保全は取引の有無と無関係）
         "db_backup",
+        # 週末に失効すると月曜8:30の自動ログインが落ちるため、土日も予告する
+        "gmail_token_check",
     }
 
     def _cron_jobs(self):

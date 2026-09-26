@@ -202,6 +202,15 @@ def run(*, manual: bool = False,
         # 診断出力の多くが stdout に出る。stderr が空だと失敗理由が丸ごと
         # 消えるので、空のときは stdout にフォールバックする。
         detail_source = result.stderr.strip() or result.stdout.strip()
+        if "auth_gmailapi" in detail_source:
+            # OTP取得側がGmail認証失効（テスト中アプリの7日失効）を報告している。
+            # 失敗理由は長い出力の末尾にあり [:300] では切れるため、ここで判定する。
+            logger.error(f"完全自動ログイン失敗: Gmail認証が失効しています: {detail_source[-300:]}")
+            return False, (
+                "Gmail認証（ワンタイムパスワード取得用）が失効しています。"
+                "PCで scripts\\gmail_reauth.bat をダブルクリックし、"
+                "開いたブラウザで「許可」を押してください"
+            )
         logger.error(
             f"完全自動ログインが失敗しました（rc={result.returncode}）: "
             f"{detail_source[:500]}"

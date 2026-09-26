@@ -199,6 +199,8 @@ kabuステーションのログイン認証は、PCを起動したままでも�
 
 `runtime.broker_full_login_enabled: true`（既定）にすると、平日 8:30 に kabuステーションの起動・ログイン・2段階認証の入力までを自動で行う。ワンタイムパスワードは Gmail API で受け取る（WSL2 側に別途 `kabusapi-auto-login-template` の導入が必要）。Discord の `full_login` コマンドでいつでも手動で実行できる。
 
+Gmail API の認証は7日で失効する（Google Cloud の OAuth 同意画面が「テスト中」のため。`gmail.readonly` は本番公開に Google の審査が要るので、テスト中のまま使う）。失効の2日前から毎日20:00に Discord へ予告が届くので、PC で `scripts\gmail_reauth.bat` をダブルクリックし、開いたブラウザでアカウントを選んで「許可」を押す。これで次の7日間が延長される。失効したまま朝の自動ログインが失敗した場合も、同じ手順を案内する通知が届く。
+
 ### 認証切れからの自動復帰
 
 ログイン認証が切れると、次のように動く。

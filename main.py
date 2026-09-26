@@ -24,7 +24,7 @@ from src.core import (
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
     discord_bot, auth_recovery, broker_launcher, broker_full_login, broker_watch, discord_queries,
-    discord_slash,
+    discord_slash, gmail_token,
     market_calendar, clock,
 )
 from src.core import alerts as alerts_mod
@@ -298,6 +298,14 @@ def main() -> None:
                 f"{detail}\n手動でログインしてください。",
             )
 
+    def gmail_token_check_job():
+        if not bool(cfg.get_section("runtime").get("broker_full_login_enabled", False)):
+            return
+        found = gmail_token.reminder(clock.now())
+        if found:
+            level, message = found
+            alert("Gmail認証の再実施が必要です", message, level=level)
+
     def token_refresh():
         """毎朝のトークン更新。失敗＝ログイン認証切れとみなし、再ログインを待って復帰する。
 
@@ -567,6 +575,7 @@ def main() -> None:
 
     # ─── スケジューラのコールバック登録 ──────────────────────
     scheduler.register("broker_full_login", broker_full_login_job)
+    scheduler.register("gmail_token_check", gmail_token_check_job)
     scheduler.register("risk_reset", risk.reset_daily_counters)
     scheduler.register("token_refresh", token_refresh)
     scheduler.register("data_update", services.data_update)
