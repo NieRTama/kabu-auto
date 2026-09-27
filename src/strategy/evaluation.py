@@ -225,7 +225,25 @@ class MajorityClass:
         return np.full(len(X), self._label, dtype=float)
 
 
-class LogisticRegressionModel:
+class _ConstantModelMixin:
+    """`self._constant` で単一クラス縮退を表すモデル共通の契約（外部レビューI-5）。
+
+    `booster` はLightGBM固有の概念なので、このmixinには含めない
+    （_LightGbmBase側にだけ残す）。
+    """
+
+    @property
+    def is_constant(self) -> bool:
+        """単一クラスしか見なかったため定数を返すモデルか。"""
+        return self._constant is not None
+
+    @property
+    def constant_probability(self) -> Optional[float]:
+        """定数モデルのときの確率。二値モデルなら None。"""
+        return self._constant
+
+
+class LogisticRegressionModel(_ConstantModelMixin):
     """標準化した特徴量で学習するロジスティック回帰。
 
     標準化の統計量は**学習時に固定**し、推論側では fit し直さない
@@ -264,22 +282,11 @@ class LogisticRegressionModel:
         return self._model.predict_proba(Z)[:, 1]
 
     # ─── 保存のための契約（段階Eの model_store が使う）─────────────────
-    # _LightGbmBase と全く同じ `self._constant` という状態を持つため、
-    # 単一クラス縮退の検知手段も同じ形で公開する（外部レビューI-5）。
-    # `booster` はLightGBM固有の概念なのでこちらには無い。
-
-    @property
-    def is_constant(self) -> bool:
-        """単一クラスしか見なかったため定数を返すモデルか。"""
-        return self._constant is not None
-
-    @property
-    def constant_probability(self) -> Optional[float]:
-        """定数モデルのときの確率。二値モデルなら None。"""
-        return self._constant
+    # is_constant/constant_probability は _ConstantModelMixin が提供する
+    # （外部レビューI-5。_LightGbmBase と同じ `self._constant` の契約）。
 
 
-class _LightGbmBase:
+class _LightGbmBase(_ConstantModelMixin):
     """LightGBM分類器の共通部。
 
     現行 ml_model._fit() は fold ごとの best_iteration_ の平均を最終モデルの
@@ -327,17 +334,8 @@ class _LightGbmBase:
     # `getattr(model, "booster_", model).save_model(...)` のような
     # 書き方では保存できず AttributeError になる（外部レビューR02）。
     # 「二値がそろったモデル」と「単一クラス時の定数モデル」は保存形式が
-    # 違うので、どちらであるかを型として公開する。
-
-    @property
-    def is_constant(self) -> bool:
-        """単一クラスしか見なかったため定数を返すモデルか。"""
-        return self._constant is not None
-
-    @property
-    def constant_probability(self) -> Optional[float]:
-        """定数モデルのときの確率。二値モデルなら None。"""
-        return self._constant
+    # 違うので、どちらであるかを型として公開する（is_constant/constant_probability
+    # は _ConstantModelMixin が提供する）。
 
     @property
     def booster(self):
