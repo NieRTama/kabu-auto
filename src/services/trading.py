@@ -29,6 +29,7 @@ from src.data.database import OrderIntent, Position, Signal, Trade, get_session
 from src.data.market_data import load_ohlcv, update_symbol
 from src.execution import order_status as st
 from src.risk import liquidity
+from src.services import shadow_recording
 from src.strategy import ml_model
 from src.strategy.signal import Signal as TradeSignal, generate as gen_signal
 
@@ -582,6 +583,17 @@ class TradingServices:
         paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
         excluded_count = 0
         codes = watchlist_store.get_codes()
+        # ─── shadow記録の準備（観察のみ・発注には一切影響しない）───
+        # 昇格済み候補があれば、以降のループで「現行と同じ入力に対する候補の
+        # 判断」を溜める。候補が未昇格なら None で、何も記録しない。
+        # 候補モデルの読み込みはスキャン1回につきここだけ（銘柄ごとに
+        # 読み直さない）。
+        try:
+            shadow_batch = shadow_recording.prepare(self.model)
+        except Exception as e:
+            logger.error(
+                f"shadow記録の準備に失敗しました（売買判断には影響しません）: {e}")
+            shadow_batch = None
         for sym in codes:
             try:
                 if not self._is_fresh_for_new_candidate(sym):
@@ -598,6 +610,16 @@ class TradingServices:
                     continue
                 sig = gen_signal(sym, df, self.model)
                 _save_signal(sig, data_as_of=self._bar_states[sym].last_bar_session)
+                if shadow_batch is not None:
+                    # 本来の判断（sig）には一切関与しない。ここで例外を外へ
+                    # 出すと、この銘柄の以降の処理（paper執行）まで止まって
+                    # しまうので、内側で必ず捕まえる
+                    try:
+                        shadow_recording.collect(shadow_batch, sym, df)
+                    except Exception as e:
+                        logger.error(
+                            f"shadow記録に失敗しました（{sym}・売買判断には"
+                            f"影響しません）: {e}")
                 if sig.action not in ("BUY", "SELL"):
                     continue
                 logger.info(f"シグナル: {sym} → {sig.action} (score={sig.combined_score:.2f})")
@@ -635,6 +657,15 @@ class TradingServices:
                                                 source="signal_scan")
             except Exception as e:
                 logger.error(f"シグナルスキャンエラー: {sym} {e}")
+
+        # 溜めたshadow記録をまとめて1回で保存する（銘柄ごとに保存すると
+        # run単位の置換で前の銘柄が消える）
+        if shadow_batch is not None:
+            try:
+                shadow_recording.flush(shadow_batch)
+            except Exception as e:
+                logger.error(
+                    f"shadow記録の保存に失敗しました（売買判断には影響しません）: {e}")
 
         if codes and excluded_count == len(codes):
             alert(
