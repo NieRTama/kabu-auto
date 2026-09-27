@@ -188,6 +188,9 @@ def flush(batch: ShadowBatch) -> int:
     """
     if not batch.event_ids:
         return 0
+    assert len(batch.event_ids) == len(batch.rows), (
+        f"event_ids と rows の件数が一致しません: "
+        f"event_ids={len(batch.event_ids)} rows={len(batch.rows)}")
     # 銘柄をまたいで日付インデックスが重複するので行番号へ振り直す。
     # shadow.compare() は event_ids と features を位置で対応付ける
     features = pd.concat(batch.rows, ignore_index=True)
