@@ -24,6 +24,19 @@ class TestReconcileSchedulerRegistration:
         assert call.args[1] == "interval"
         assert call.kwargs.get("seconds", 0) > 0
 
+    def test_job_defaults_misfire_grace_time_and_coalesce(self):
+        """認証切れ等でジョブが遅延しても、5分以内なら見送り(missed)にせず実行し、
+        溜まった分は1回にまとめる（2026-09-28、job_defaults対応）"""
+        sched = scheduler_mod.TradingScheduler()
+        sched.register("broker_full_login", MagicMock())
+        sched.start()
+        try:
+            job = sched._scheduler.get_job("broker_full_login")
+            assert job.misfire_grace_time == 300
+            assert job.coalesce is True
+        finally:
+            sched.stop()
+
     def test_omitted_when_not_registered(self):
         """登録しなければジョブは追加されない（既存のオプショナル登録パターンと同様）"""
         sched = scheduler_mod.TradingScheduler()

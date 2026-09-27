@@ -27,7 +27,14 @@ TZ = ZoneInfo("Asia/Tokyo")
 
 class TradingScheduler:
     def __init__(self):
-        self._scheduler = BackgroundScheduler(timezone=TZ)
+        # misfire_grace_time既定値(1秒)だと、認証切れでAPI呼び出しが詰まり他ジョブの
+        # 実行が数十秒〜数分遅れただけで、平日08:30のbroker_full_login（認証を自動回復
+        # させるはずのジョブ本体）まで無言でmissed扱いになりスキップされる
+        # （2026-09-25実例、詳細設計書§1.41.6・Knowledge.md参照）。5分までの遅延なら
+        # 実行し、coalesce=Trueで積み上がった分は1回にまとめて多重実行を避ける。
+        self._scheduler = BackgroundScheduler(
+            timezone=TZ, job_defaults={"misfire_grace_time": 300, "coalesce": True},
+        )
         self._registered_callbacks: dict = {}
 
     def register(self, name: str, callback) -> None:
