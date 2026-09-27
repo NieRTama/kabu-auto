@@ -93,6 +93,8 @@ auカブコム証券の kabuステーションAPI を使い、ルールベース
 pip install -r requirements.txt
 ```
 
+テストを実行する場合は `pip install -r requirements-dev.txt`（httpx等のテスト専用依存を含む）を使う。
+
 ### 3. パスワードの設定（.env）
 
 kabuステーションの **APIパスワード**（kabuステーションの「APIシステム設定」で設定するもの。証券口座のログインパスワードや取引暗証番号とは別物）は `.env` に書く。`config.yaml` には書かない。

@@ -1,0 +1,4 @@
+# テスト専用の追加依存（本番実行には不要）。
+# 本番はrequirements.txtのみをインストールする。テスト実行時はこちらを使う。
+-r requirements.txt
+httpx==0.25.2  # fastapi.testclient.TestClient が内部で使用（本番コードはimportしない）
