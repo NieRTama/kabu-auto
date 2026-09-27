@@ -329,6 +329,21 @@ class OrderManager:
         if new_status in (st.FILLED, st.CANCELLED, st.REJECTED, st.PARTIALLY_FILLED_DONE):
             self._cancel_timeout_timer(trade.order_id)
 
+    def _precheck(self, symbol: str, quantity: int) -> bool:
+        """buy/sell共通の発注前チェック（数量・リスクゲート・ライブ二重発注防止）。"""
+        if quantity <= 0:
+            return False
+        ok, reason = self._risk.can_place_order()
+        if not ok:
+            logger.warning(f"発注スキップ: {symbol} - {reason}")
+            return False
+
+        # ライブモード: 二重発注防止
+        if not self._is_paper and self._has_pending_order(symbol):
+            logger.warning(f"未約定注文あり、重複発注スキップ: {symbol}")
+            return False
+        return True
+
     def buy(self, symbol: str, price: float, quantity: int,
             sector: Optional[str] = None, rationale: Optional[str] = None,
             source: str = "manual") -> Optional[str]:
@@ -337,16 +352,7 @@ class OrderManager:
         rationale=発注根拠（シグナルスコア等。7.6）。source=発注のきっかけ
         （signal_scan/morning_execution/manual等。OrderIntent.sourceに記録する。4.2）。
         """
-        if quantity <= 0:
-            return None
-        ok, reason = self._risk.can_place_order()
-        if not ok:
-            logger.warning(f"発注スキップ: {symbol} - {reason}")
-            return None
-
-        # ライブモード: 二重発注防止
-        if not self._is_paper and self._has_pending_order(symbol):
-            logger.warning(f"未約定注文あり、重複発注スキップ: {symbol}")
+        if not self._precheck(symbol, quantity):
             return None
 
         if self._is_paper:
@@ -430,16 +436,7 @@ class OrderManager:
     def sell(self, symbol: str, price: float, quantity: int,
              rationale: Optional[str] = None, source: str = "manual") -> Optional[str]:
         """指値売り注文を発注する（rationale=発注根拠。7.6 / source=発注のきっかけ。4.2）"""
-        if quantity <= 0:
-            return None
-        ok, reason = self._risk.can_place_order()
-        if not ok:
-            logger.warning(f"発注スキップ: {symbol} - {reason}")
-            return None
-
-        # ライブモード: 二重発注防止
-        if not self._is_paper and self._has_pending_order(symbol):
-            logger.warning(f"未約定注文あり、重複発注スキップ: {symbol}")
+        if not self._precheck(symbol, quantity):
             return None
 
         if self._is_paper:
