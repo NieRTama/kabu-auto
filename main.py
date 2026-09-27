@@ -25,7 +25,7 @@ from src.core import (
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
     discord_bot, auth_recovery, broker_launcher, broker_full_login, broker_watch, discord_queries,
     discord_slash, gmail_token, gmail_remote_auth,
-    market_calendar, clock,
+    market_calendar, clock, session_watch,
 )
 from src.core import alerts as alerts_mod
 from src.core.alerts import alert
@@ -296,6 +296,39 @@ def main() -> None:
             alert(
                 "kabuステーションの完全自動ログインに失敗しました",
                 f"{detail}\n手動でログインしてください。",
+            )
+
+    def session_check_job():
+        """スケジューラから呼ばれる画面セッション監視ジョブ（平日08:20）。
+
+        broker_full_login_enabled が false の間はGUI自動化を使わないため確認不要。
+        休場日はログイン自体が不要なため実行しない（他ジョブと同じ二重ガードの型）。
+        何も異常が無ければ通知しない（token_refreshの休場スキップと同じ思想で、
+        平常時に🟢が毎日届くと本物の異常を見落とす）。
+        """
+        rt = cfg.get_section("runtime")
+        if not bool(rt.get("broker_full_login_enabled", False)):
+            return
+        if market_calendar.is_holiday(clock.today()):
+            return
+        session_id = session_watch.is_console_disconnected()
+        if session_id is None:
+            return
+        ok, detail = session_watch.reconnect_to_console(session_id)
+        if ok:
+            alert(
+                "画面セッションを自動復帰しました",
+                "深夜のリモートデスクトップ切断後、画面セッションが切断されたままでした。"
+                f"自動的に復帰させました。詳細: {detail}",
+                level=alerts_mod.LEVEL_INFO,
+            )
+        else:
+            alert(
+                "画面セッションの自動復帰に失敗しました",
+                f"{detail}\n"
+                "このままでは8:30の完全自動ログインがGUIを操作できず失敗する見込みです。"
+                "8:30までにリモートデスクトップ等でサインインし直すか、"
+                "コンソールへ直接ログインしてください。",
             )
 
     def gmail_token_check_job():
@@ -587,6 +620,7 @@ def main() -> None:
 
     # ─── スケジューラのコールバック登録 ──────────────────────
     scheduler.register("broker_full_login", broker_full_login_job)
+    scheduler.register("session_check", session_check_job)
     scheduler.register("gmail_token_check", gmail_token_check_job)
     scheduler.register("risk_reset", risk.reset_daily_counters)
     scheduler.register("token_refresh", token_refresh)

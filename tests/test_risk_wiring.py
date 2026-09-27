@@ -24,7 +24,7 @@ class TestSchedulerJobOrdering:
         """TradingScheduler.start() を実行し、add_job呼び出し引数を {job_id: (hour, minute, day_of_week)} で返す"""
         sched = scheduler_mod.TradingScheduler()
         for name in (
-            "risk_reset", "token_refresh", "data_update", "db_backup",
+            "session_check", "risk_reset", "token_refresh", "data_update", "db_backup",
             "ml_retrain", "stop_loss_check", "signal_scan", "morning_execution",
             "reconcile_orders",
         ):
@@ -48,6 +48,21 @@ class TestSchedulerJobOrdering:
         hour, minute, dow = calls["risk_reset"]
         assert dow == "mon-fri"
         assert hour < 9, "取引開始(9:00)より前にリセットされるべき"
+
+    def test_session_check_registered_at_0820_weekdays(self):
+        """session_checkは平日08:20に登録される（RDP切断対策、2026-09-27追加）"""
+        calls = self._start_and_capture()
+        assert "session_check" in calls, "session_check ジョブが登録されていない"
+        hour, minute, dow = calls["session_check"]
+        assert (hour, minute) == (8, 20)
+        assert dow == "mon-fri"
+
+    def test_session_check_runs_before_risk_reset(self):
+        """session_checkはrisk_reset(8:25)より前に動く必要がある（GUI自動化が使う画面を先に直す）"""
+        calls = self._start_and_capture()
+        sc_hour, sc_minute, _ = calls["session_check"]
+        rr_hour, rr_minute, _ = calls["risk_reset"]
+        assert (sc_hour, sc_minute) < (rr_hour, rr_minute)
 
     def test_signal_scan_runs_after_data_update(self):
         """signal_scan は data_update より後の時刻に実行される（前日終値バグの再発防止）"""

@@ -1,5 +1,6 @@
 """
 APSchedulerによるジョブスケジューラ
+- 平日8:20: 画面セッション切断の検知・自動復帰（RDP切断対策。risk_reset/broker_full_loginより前）
 - 毎朝8:25: 日次リスクカウンタリセット
 - 毎朝8:30: kabuステーション完全自動ログイン（broker_full_login_enabled=trueのときのみ実働）
 - 毎朝8:35: APIトークン更新（完全自動ログインの完了を待つため8:30より後ろに設定）
@@ -35,6 +36,15 @@ class TradingScheduler:
     def start(self) -> None:
         cb = self._registered_callbacks
 
+        if "session_check" in cb:
+            # RDP接続後の切断で画面セッションがDisc（切断）状態のまま残ると、
+            # GUI自動化（SendKeys）がウィンドウを見つけられず静かに失敗する
+            # （2026-09-27、実際にこれで完全自動ログインが失敗し、手動tsconで復旧）。
+            # risk_reset(8:25)・broker_full_login(8:30)より前に検知・復帰させる。
+            self._scheduler.add_job(
+                cb["session_check"], "cron",
+                day_of_week="mon-fri", hour=8, minute=20, id="session_check",
+            )
         if "risk_reset" in cb:
             # 取引開始前に日次カウンタ（注文数・損失額）をリセットする
             self._scheduler.add_job(
