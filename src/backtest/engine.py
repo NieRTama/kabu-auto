@@ -120,10 +120,9 @@ def run_backtest(
             if drawdown <= stop_loss_pct:
                 stop_price = round(pos_avg_cost * (1 + stop_loss_pct), 2)
                 exit_price = _sell_fill_price(stop_price, slip)
-                proceeds = exit_price * pos_qty
-                commission = proceeds * comm
-                pnl = round((exit_price - pos_avg_cost) * pos_qty - commission - pos_entry_commission, 0)
-                cash += proceeds - commission
+                cash_delta, pnl = _close_position(
+                    exit_price, pos_qty, pos_avg_cost, comm, pos_entry_commission)
+                cash += cash_delta
                 sim_trades.append(_make_trade(
                     symbol, pos_entry_date, pos_avg_cost,
                     dt_date, exit_price, pos_qty, pnl, "STOP_LOSS",
@@ -168,10 +167,9 @@ def run_backtest(
         # ── 売り判定 ──────────────────────────────────────────────
         if combined <= sell_thr and pos_qty > 0:
             exit_price = _sell_fill_price(close_price, slip)
-            proceeds = exit_price * pos_qty
-            commission = proceeds * comm
-            pnl = round((exit_price - pos_avg_cost) * pos_qty - commission - pos_entry_commission, 0)
-            cash += proceeds - commission
+            cash_delta, pnl = _close_position(
+                exit_price, pos_qty, pos_avg_cost, comm, pos_entry_commission)
+            cash += cash_delta
             sim_trades.append(_make_trade(
                 symbol, pos_entry_date, pos_avg_cost,
                 dt_date, exit_price, pos_qty, pnl, "SIGNAL_SELL",
@@ -204,10 +202,9 @@ def run_backtest(
         last_idx = full_df.index[mask][-1]
         last_close = float(full_df.loc[last_idx, "close"])
         exit_price = _sell_fill_price(last_close, slip)
-        proceeds = exit_price * pos_qty
-        commission = proceeds * comm
-        pnl = round((exit_price - pos_avg_cost) * pos_qty - commission - pos_entry_commission, 0)
-        cash += proceeds - commission
+        cash_delta, pnl = _close_position(
+            exit_price, pos_qty, pos_avg_cost, comm, pos_entry_commission)
+        cash += cash_delta
         sim_trades.append(_make_trade(
             symbol, pos_entry_date, pos_avg_cost,
             last_idx.date(), exit_price, pos_qty, pnl, "END_OF_PERIOD",
@@ -367,6 +364,20 @@ def _log_budget_diagnostics(
         f"max_position_ratio {max_pos_ratio:.0%}）を超えるため見送られた。"
         f"このままでは{symbol}は約{min_price:,.0f}円/株以下に下がらない限り取引されない。"
     )
+
+
+def _close_position(
+    exit_price: float, quantity: int, avg_cost: float,
+    commission_pct: float, entry_commission: float,
+) -> tuple[float, float]:
+    """決済計算の共通処理: exit_price → 手取り(proceeds) → 手数料 → pnl。
+
+    STOP_LOSS/SIGNAL_SELL/END_OF_PERIODの3経路が共有する（cashへの加算額, pnl）を返す。
+    """
+    proceeds = exit_price * quantity
+    commission = proceeds * commission_pct
+    pnl = round((exit_price - avg_cost) * quantity - commission - entry_commission, 0)
+    return proceeds - commission, pnl
 
 
 def _make_trade(
