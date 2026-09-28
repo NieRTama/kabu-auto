@@ -451,6 +451,33 @@ def main() -> None:
                     f"kabuステーションの自動起動は行われませんでした: {launch_result[1]}"
                 )
 
+        # 日中に落ちたときの完全自動ログイン復帰。auto_launch_broker は preflight の
+        # 起動経路の排他性チェックにより broker_full_login_enabled と併用できないため、
+        # auto_launch側が無効な運用（現行）では上のブロックが一度も起動を試みず、
+        # 🔴を出すだけで誰も起動しない穴があった（2026-09-28朝、KabuSが落ちて
+        # 08:30の定時ジョブもmissedで終日手動になりかけた実例）。
+        full_login_enabled = bool(rt.get("broker_full_login_enabled", False))
+        if broker_watch.should_full_login_recover(
+            alive=alive, recovered=recovered, in_window=in_window,
+            full_login_enabled=full_login_enabled, auto_launch=auto_launch,
+            now_time=clock.now().time(),
+        ):
+            launch_result = _full_login_broker()
+            if launch_result[0]:
+                alert(
+                    "kabuステーションを完全自動ログインで復帰しました",
+                    launch_result[1],
+                    level=alerts_mod.LEVEL_INFO,
+                )
+            else:
+                logger.warning(
+                    f"kabuステーションの完全自動ログイン復帰に失敗しました: {launch_result[1]}"
+                )
+            # down_message() は auto_launch=True のときだけ launch_result の内容
+            # （成功文言 / 「自動起動できませんでした: …」）を使う分岐を持つ。
+            # この経路を使った回はそれに乗せるため、以降の判定では auto_launch=True 扱いにする。
+            auto_launch = True
+
         notice = broker_down.check(
             alive=alive, now=time.monotonic(), notify_window=in_window,
             auto_launch=auto_launch, launch_result=launch_result,

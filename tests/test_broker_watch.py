@@ -5,7 +5,7 @@
 自動起動の有無といった分岐を一切検証できなかった（実際にレビューで
 複数の穴が見つかった）。判断だけを切り出し、ここで実挙動を固定する。
 """
-from datetime import datetime
+from datetime import datetime, time as dtime
 
 import pytest
 
@@ -185,3 +185,43 @@ class TestNoRedAfterSuccessfulLaunch:
         notice = n.check(alive=False, now=200.0, notify_window=True,
                          auto_launch=True, launch_result=(False, "上限に達しています"))
         assert notice is not None
+
+
+class TestShouldFullLoginRecover:
+    """日中に落ちたときの完全自動ログイン復帰の判断（should_full_login_recover）。
+
+    2026-09-28朝、KabuSが落ちて08:30の定時ジョブもmissedで終日手動になりかけた
+    実例を踏まえ、auto_launch_broker を無効にした運用でも日中に完全自動ログインで
+    復帰できるようにする経路。08:30の定時ジョブと二重にログインしないよう、
+    08:40以降に限る。
+    """
+
+    def _ok(self, **overrides):
+        kwargs = dict(
+            alive=False, recovered=False, in_window=True,
+            full_login_enabled=True, auto_launch=False,
+            now_time=dtime(8, 40),
+        )
+        kwargs.update(overrides)
+        return bw.should_full_login_recover(**kwargs)
+
+    def test_true_in_the_basic_case(self):
+        assert self._ok() is True
+
+    def test_false_just_before_the_recovery_window(self):
+        assert self._ok(now_time=dtime(8, 39)) is False
+
+    def test_false_when_alive_is_true(self):
+        assert self._ok(alive=True) is False
+
+    def test_false_when_alive_is_unknown(self):
+        assert self._ok(alive=None) is False
+
+    def test_false_when_full_login_is_disabled(self):
+        assert self._ok(full_login_enabled=False) is False
+
+    def test_false_when_auto_launch_is_enabled(self):
+        assert self._ok(auto_launch=True) is False
+
+    def test_false_when_already_recovered(self):
+        assert self._ok(recovered=True) is False

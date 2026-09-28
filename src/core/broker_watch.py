@@ -28,6 +28,11 @@ DOWN_REPEAT_SECONDS = 1800
 NOTIFY_FROM = dtime(8, 0)
 NOTIFY_TO = dtime(15, 40)
 
+#: 日中の自動復帰（完全自動ログイン）を許可し始める時刻。
+#: 08:30の定時ジョブ(broker_full_login_job)が起動〜ログインを担当するため、
+#: それより前に落ちているのは夜間に閉じた通常状態であり、二重にログインさせない。
+FULL_LOGIN_RECOVERY_FROM = dtime(8, 40)
+
 
 def in_notify_window(now: datetime) -> bool:
     """通知してよい時刻か（営業日の、場が関係する時間帯のみ）。
@@ -112,3 +117,32 @@ def down_message(*, auto_launch: bool,
             "手動で起動してログインしてください。"
         )
     return "kabuステーションが起動していません", body
+
+
+def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
+                               in_window: bool, full_login_enabled: bool,
+                               auto_launch: bool, now_time: dtime) -> bool:
+    """日中にkabuステーションが落ちたとき、完全自動ログインで復帰させてよいか。
+
+    auto_launch_broker は preflight の起動経路の排他性チェックにより
+    broker_full_login_enabled と同時にtrueにできない構成のため、
+    auto_launch側の自動起動が無効な運用では日中の断が起きても
+    「🔴を出すだけで誰も起動しない」状態になっていた
+    （2026-09-28朝、KabuSが落ちて08:30の定時ジョブもmissedで終日手動になりかけた）。
+
+    08:40以降に限る（FULL_LOGIN_RECOVERY_FROM参照）: 08:30の定時ジョブが
+    朝の起動〜ログインを担当するため、それより前は夜間に閉じた通常状態であり
+    二重にログインさせない。休場日のガードは in_window（in_notify_window）が
+    営業日判定を含んでいるため別途不要。
+    """
+    if alive is not False:
+        return False
+    if recovered:
+        return False
+    if not in_window:
+        return False
+    if not full_login_enabled:
+        return False
+    if auto_launch:
+        return False
+    return now_time >= FULL_LOGIN_RECOVERY_FROM
