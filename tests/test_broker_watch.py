@@ -211,10 +211,15 @@ class TestShouldFullLoginRecover:
     def test_false_just_before_the_recovery_window(self):
         assert self._ok(now_time=dtime(8, 39)) is False
 
-    def test_false_when_alive_is_true(self):
-        assert self._ok(alive=True) is False
+    def test_true_when_alive_but_auth_expired(self):
+        # 「生きたまま認証だけ切れる」パターン（1.33.1）。既存ウィンドウを
+        # 残したまま待つのではなく、完全自動ログイン側（WSL側スクリプトが
+        # 既存プロセスをkillしてから再起動・再ログインする）で復帰させる。
+        assert self._ok(alive=True) is True
 
     def test_false_when_alive_is_unknown(self):
+        # tasklist が判定できていないだけの可能性があり、動いているものを
+        # 誤ってkillしかねないため、判定不能のときは今まで通り見送る。
         assert self._ok(alive=None) is False
 
     def test_false_when_full_login_is_disabled(self):

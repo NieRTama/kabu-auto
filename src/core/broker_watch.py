@@ -122,7 +122,7 @@ def down_message(*, auto_launch: bool,
 def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
                                in_window: bool, full_login_enabled: bool,
                                auto_launch: bool, now_time: dtime) -> bool:
-    """日中にkabuステーションが落ちたとき、完全自動ログインで復帰させてよいか。
+    """kabuステーションの認証切れから完全自動ログインで復帰させてよいか。
 
     auto_launch_broker は preflight の起動経路の排他性チェックにより
     broker_full_login_enabled と同時にtrueにできない構成のため、
@@ -130,12 +130,18 @@ def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
     「🔴を出すだけで誰も起動しない」状態になっていた
     （2026-09-28朝、KabuSが落ちて08:30の定時ジョブもmissedで終日手動になりかけた）。
 
+    `alive is True`（プロセスは生きたまま認証だけ失効。1.33.1と同型）も対象に
+    含める（2026-09-30）。完全自動ログイン（broker_full_login.run()）はWSL側
+    スクリプトが既存のKabuS.exeを一旦killしてから再起動・再ログインする設計
+    のため、二重起動にはならない。`alive is None`（tasklist判定不能）だけは
+    動いているものを誤ってkillしかねないため引き続き見送る。
+
     08:40以降に限る（FULL_LOGIN_RECOVERY_FROM参照）: 08:30の定時ジョブが
     朝の起動〜ログインを担当するため、それより前は夜間に閉じた通常状態であり
     二重にログインさせない。休場日のガードは in_window（in_notify_window）が
     営業日判定を含んでいるため別途不要。
     """
-    if alive is not False:
+    if alive is None:
         return False
     if recovered:
         return False
