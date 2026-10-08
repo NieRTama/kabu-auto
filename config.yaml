@@ -199,8 +199,9 @@ runtime:
   # まずこのタスクスケジューラ設定（LogonTypeをInteractiveへ）を疑うこと。
   broker_full_login_enabled: true
   # WSL側スクリプトのタイムアウト秒数。ハングしても親プロセス(kabu-auto本体)を
-  # 巻き込まない。
-  broker_full_login_timeout_seconds: 180
+  # 巻き込まない。普段は約1分半だが、KabuSの版更新直後の初回起動はログイン窓が出るまで
+  # 90秒以上かかるため(2026-10-05実測)、OTP待ち(最大90秒)を含めて余裕を持たせる。
+  broker_full_login_timeout_seconds: 300
   # 1日の完全自動ログイン試行上限。broker起動と同じ考え方で、無意味な
   # リトライの暴走を防ぐ。**自動実行(平日08:30)にだけ効く**。Discordの
   # full_login（人の明示操作）は上限で止めない。
