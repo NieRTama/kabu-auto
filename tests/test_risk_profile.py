@@ -28,7 +28,7 @@ class TestRiskProfile:
         rp.set_active("high_risk")
         assert rp.get_active() == "high_risk"
         assert cfg.get_section("trading")["max_position_ratio"] == 0.50
-        assert cfg.get_section("trading")["stop_loss_pct"] == -0.10
+        assert cfg.get_section("trading")["stop_loss_pct"] == -0.15
         assert cfg.get_section("trading")["max_positions"] == 8
         assert cfg.get_section("trading")["max_daily_loss"] == 60000
         assert cfg.get_section("strategy")["buy_threshold"] == 0.08
