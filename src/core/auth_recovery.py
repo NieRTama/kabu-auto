@@ -20,11 +20,24 @@
 呼ばれる前提で、待機はジョブ間隔が担う。これにより
 「待機スレッドが生き残る／タイムアウトで諦める」という状態を持たなくて済む。
 """
+from enum import Enum
 from typing import Callable, Optional
 
 from loguru import logger
 
 from src.core import broker_auth
+
+
+class RecoveryResult(Enum):
+    """attempt_recovery の結果。
+
+    以前は bool で、「認証は有効なので何もしなかった」と「試したが失敗した」が
+    同じ False だった。呼び出し側が「False＝未回復＝認証切れ」と読み、ログイン済みの
+    KabuSを強制再ログインさせる不具合になった（2026-10-13）。bool に戻さないこと。
+    """
+    NOT_NEEDED = "not_needed"   # 認証は有効。何もしていない
+    RECOVERED = "recovered"     # 認証切れから復帰した
+    FAILED = "failed"           # 認証切れで、再接続も失敗した
 
 
 def attempt_recovery(
@@ -33,17 +46,17 @@ def attempt_recovery(
     on_recovered: Optional[Callable[[], None]] = None,
     is_expired: Callable[[], bool] = broker_auth.is_expired,
     mark_valid: Callable[[], None] = broker_auth.mark_valid,
-) -> bool:
-    """認証切れなら再接続を1回試す。復帰したら True。
+) -> RecoveryResult:
+    """認証切れなら再接続を1回試し、結果を RecoveryResult で返す。
 
     認証が有効なときは何もしない（毎回APIを叩いてトークンを無駄に再発行しない）。
-    失敗しても例外を投げず False を返す（次回のジョブ実行で再試行するため）。
+    失敗しても例外を投げない（次回のジョブ実行で再試行するため）。
 
     connect: 接続を試みる呼び出し（例: client.refresh_token）
     on_recovered: 復帰したときに1度だけ呼ぶ（通知用）
     """
     if not is_expired():
-        return False
+        return RecoveryResult.NOT_NEEDED
 
     try:
         connect()
@@ -51,7 +64,7 @@ def attempt_recovery(
         # 認証切れ中は失敗が続くのが通常。ログを重ねないよう DEBUG に落とす
         # （切れたこと自体は broker_auth.mark_expired が CRITICAL で記録済み）。
         logger.debug(f"認証復帰の試行に失敗（次回再試行）: {e}")
-        return False
+        return RecoveryResult.FAILED
 
     mark_valid()
     logger.warning("kabuステーションの認証が回復しました。取引を再開します")
@@ -60,4 +73,4 @@ def attempt_recovery(
             on_recovered()
         except Exception as e:
             logger.warning(f"認証回復の通知に失敗しました（復帰処理は完了）: {e}")
-    return True
+    return RecoveryResult.RECOVERED

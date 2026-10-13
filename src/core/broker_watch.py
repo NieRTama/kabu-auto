@@ -17,9 +17,13 @@
   解除されると、鳴る間隔が縮む。
 """
 from datetime import datetime, time as dtime
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
-from src.core import market_calendar
+from loguru import logger
+
+from src.core import broker_auth, market_calendar
+from src.core.alerts import LEVEL_INFO
+from src.core.auth_recovery import RecoveryResult, attempt_recovery
 
 #: 落ちている間の再通知の間隔。一度きりだと、その1通を見落として終日気づけない。
 DOWN_REPEAT_SECONDS = 1800
@@ -119,9 +123,8 @@ def down_message(*, auto_launch: bool,
     return "kabuステーションが起動していません", body
 
 
-def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
-                               expired: bool, in_window: bool,
-                               full_login_enabled: bool,
+def should_full_login_recover(*, alive: Optional[bool], auth: RecoveryResult,
+                               in_window: bool, full_login_enabled: bool,
                                auto_launch: bool, now_time: dtime) -> bool:
     """kabuステーションの認証切れから完全自動ログインで復帰させてよいか。
 
@@ -142,18 +145,18 @@ def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
     二重にログインさせない。休場日のガードは in_window（in_notify_window）が
     営業日判定を含んでいるため別途不要。
 
-    生存中は **認証が実際に切れているとき（expired）だけ** 対象にする（2026-10-13）。
-    attempt_recovery は認証が有効なときは何もせず recovered=False を返すため、
-    この条件が無いと、ログイン済みのKabuSを08:40以降5分ごとにkillして再ログインし、
-    トークンを無効化し続けた（日次上限3回で止まるまで発注不可）。プロセスが
-    落ちている場合（alive is False）は、場中のクラッシュが401ではなく接続エラーに
-    なり認証切れとして記録されないため、認証状態に関わらず対象のまま。
+    生存中は **認証が実際に切れていて再接続も失敗したとき（auth=FAILED）だけ**
+    対象にする（2026-10-13）。認証が有効（NOT_NEEDED）なのに「未回復」と読んで、
+    ログイン済みのKabuSを08:40以降5分ごとにkillして再ログインし、トークンを
+    無効化し続けた（日次上限3回で止まるまで発注不可）。プロセスが落ちている場合
+    （alive is False）は、場中のクラッシュが401ではなく接続エラーになり認証切れと
+    して記録されないため、認証状態に関わらず対象のまま。
     """
     if alive is None:
         return False
-    if alive is True and not expired:
+    if auth is RecoveryResult.RECOVERED:
         return False
-    if recovered:
+    if alive is True and auth is not RecoveryResult.FAILED:
         return False
     if not in_window:
         return False
@@ -162,3 +165,101 @@ def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
     if auto_launch:
         return False
     return now_time >= FULL_LOGIN_RECOVERY_FROM
+
+
+def auth_valid_now(refresh_token: Callable[[], object]) -> bool:
+    """KabuSを強制終了する前の最終確認。トークンが取れるなら認証は生きている。
+
+    判定ロジック（should_full_login_recover 等）とは独立した安全装置。判定が一度
+    誤っても、壊れていないKabuSを完全自動ログインで止めることはなくなる
+    （2026-10-13、判定の誤りでログイン済みのKabuSを2回強制再ログインした）。
+    """
+    try:
+        refresh_token()
+    except Exception:
+        return False
+    broker_auth.mark_valid()
+    return True
+
+
+def recovery_tick(*, refresh_token: Callable[[], object],
+                  on_recovered: Callable[[], None],
+                  probe_running: Callable[[], Optional[bool]],
+                  now: datetime, runtime: dict,
+                  launch_broker: Callable[[], Tuple[bool, str]],
+                  full_login: Callable[[], Tuple[bool, str]],
+                  notifier: "BrokerDownNotifier",
+                  alert: Callable[..., None], monotonic: float) -> None:
+    """5分ごとの認証復帰チェック1回分（main.py の auth_recovery_check の本体）。
+
+    main() のクロージャに直接書いていたため、1日の時系列で回すテストが書けず、
+    「ログイン済みで認証も有効」という普段の状態での誤作動を見逃した（2026-10-13）。
+    依存を引数で受け取り、tests/test_recovery_scenario.py で時系列のまま検証する。
+    """
+    auth = attempt_recovery(refresh_token, on_recovered=on_recovered)
+    recovered = auth is RecoveryResult.RECOVERED
+
+    # KabuS.exe の生存確認は**認証の状態に関わらず毎回**行う。ここが唯一の
+    # 生存確認であり、場中のクラッシュは接続エラーになるだけで 401 ではない
+    # （kabu_client は401のときだけ mark_expired する）。認証切れの判定の
+    # 後ろに置くと、本来の対象であるクラッシュ復帰に永久に到達しない。
+    # auto_launch の既定は False（起動元を人に一本化する運用）。キーが欠けた設定で
+    # 自動起動が黙って復活すると、Windowsの自動起動と競合して二重起動が再発する。
+    auto_launch = bool(runtime.get("auto_launch_broker", False))
+    alive = probe_running()
+    in_window = in_notify_window(now)
+
+    # 通知より先に起動を試す。通知文へ「実際にどうなったか」を載せるため
+    # （先に「試みます」と書くと、起動できなかった事実が隠れる）。
+    # 夜間・休場日に閉じるのは通常の操作なので、通知と同じ窓の中だけで起動する。
+    # 起動するのは、プロセスが見つからず**かつAPIにも到達できない**ときだけ。
+    # tasklist の判定だけを根拠にすると、プロセス名の変更などで誤って False に
+    # なった場合、APIが正常稼働しているのに5分ごとに追加起動してしまう。
+    launch_result = None
+    if alive is False and not recovered and auto_launch and in_window:
+        launch_result = launch_broker()
+        if launch_result[0]:
+            alert(
+                "kabuステーションを起動しました",
+                f"{launch_result[1]}\n認証アプリで承認してください。"
+                "承認後は自動で取引を再開します。",
+                level=LEVEL_INFO,
+            )
+        else:
+            logger.warning(f"kabuステーションの自動起動は行われませんでした: {launch_result[1]}")
+
+    # 日中に落ちた／認証が切れたときの完全自動ログイン復帰。auto_launch_broker は
+    # preflight の起動経路の排他性チェックにより broker_full_login_enabled と併用できない
+    # ため、auto_launch側が無効な運用（現行）では上のブロックが一度も起動を試みず、
+    # 🔴を出すだけで誰も起動しない穴があった（2026-09-28朝の実例）。
+    full_login_enabled = bool(runtime.get("broker_full_login_enabled", False))
+    if should_full_login_recover(
+        alive=alive, auth=auth, in_window=in_window,
+        full_login_enabled=full_login_enabled, auto_launch=auto_launch,
+        now_time=now.time(),
+    ):
+        if auth_valid_now(refresh_token):
+            logger.warning(
+                "完全自動ログインの条件を満たしましたが、トークンを取得できたため"
+                "実行しません（認証は有効。KabuSを止めない）"
+            )
+        else:
+            launch_result = full_login()
+            if launch_result[0]:
+                alert("kabuステーションを完全自動ログインで復帰しました",
+                      launch_result[1], level=LEVEL_INFO)
+            else:
+                logger.warning(
+                    f"kabuステーションの完全自動ログイン復帰に失敗しました: {launch_result[1]}"
+                )
+            # down_message() は auto_launch=True のときだけ launch_result の内容
+            # （成功文言 / 「自動起動できませんでした: …」）を使う分岐を持つ。
+            # この経路を使った回はそれに乗せるため、以降の判定では auto_launch=True 扱いにする。
+            auto_launch = True
+
+    notice = notifier.check(
+        alive=alive, now=monotonic, notify_window=in_window,
+        auto_launch=auto_launch, launch_result=launch_result,
+    )
+    if notice:
+        alert(*notice)

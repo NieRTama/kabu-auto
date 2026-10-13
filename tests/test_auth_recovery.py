@@ -15,6 +15,8 @@ import pytest
 
 from src.core import auth_recovery, broker_auth
 
+R = auth_recovery.RecoveryResult
+
 
 @pytest.fixture(autouse=True)
 def _reset():
@@ -27,22 +29,31 @@ class TestSkipWhenValid:
     def test_does_nothing_when_auth_is_valid(self):
         """認証が有効なときはAPIを叩かない（無駄なトークン再発行をしない）"""
         connect = MagicMock()
-        assert auth_recovery.attempt_recovery(connect) is False
+        assert auth_recovery.attempt_recovery(connect) is R.NOT_NEEDED
         connect.assert_not_called()
+
+    def test_not_needed_is_distinct_from_failed(self):
+        """「不要だった」と「試して失敗した」を同じ値にしない（2026-10-13実例）。
+
+        以前はどちらも False で、呼び出し側が「False＝未回復＝認証切れ」と読んで
+        ログイン済みのKabuSを強制再ログインさせた。
+        """
+        assert R.NOT_NEEDED is not R.FAILED
+        assert not isinstance(R.NOT_NEEDED, bool)
 
 
 class TestRecovery:
     def test_recovers_when_connect_succeeds(self):
         broker_auth.mark_expired("401")
         connect = MagicMock()
-        assert auth_recovery.attempt_recovery(connect) is True
+        assert auth_recovery.attempt_recovery(connect) is R.RECOVERED
         assert broker_auth.is_expired() is False
         connect.assert_called_once()
 
     def test_stays_expired_when_connect_fails(self):
         broker_auth.mark_expired("401")
         connect = MagicMock(side_effect=RuntimeError("401"))
-        assert auth_recovery.attempt_recovery(connect) is False
+        assert auth_recovery.attempt_recovery(connect) is R.FAILED
         assert broker_auth.is_expired() is True, "失敗しても認証切れのまま（誤って発注を許可しない）"
 
     def test_notifies_once_on_recovery(self):
@@ -65,7 +76,7 @@ class TestRecovery:
         def boom():
             raise RuntimeError("discord down")
 
-        assert auth_recovery.attempt_recovery(MagicMock(), on_recovered=boom) is True
+        assert auth_recovery.attempt_recovery(MagicMock(), on_recovered=boom) is R.RECOVERED
         assert broker_auth.is_expired() is False
 
 
@@ -80,11 +91,11 @@ class TestRetriesIndefinitely:
         failing = MagicMock(side_effect=RuntimeError("401"))
         # 朝の30分間に相当する回数だけ失敗させる（5分間隔なら6回）
         for _ in range(6):
-            assert auth_recovery.attempt_recovery(failing) is False
+            assert auth_recovery.attempt_recovery(failing) is R.FAILED
         assert broker_auth.is_expired() is True
 
         # 昼過ぎにログインした、というシナリオ
-        assert auth_recovery.attempt_recovery(MagicMock()) is True
+        assert auth_recovery.attempt_recovery(MagicMock()) is R.RECOVERED
         assert broker_auth.is_expired() is False
 
     def test_does_not_retry_after_recovered(self):

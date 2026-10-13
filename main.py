@@ -23,7 +23,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, auth_recovery, broker_launcher, broker_full_login, broker_watch, discord_queries,
+    discord_bot, broker_launcher, broker_full_login, broker_watch, code_version, discord_queries,
     discord_slash, gmail_token, gmail_remote_auth,
     market_calendar, clock, session_watch,
 )
@@ -51,6 +51,9 @@ def main() -> None:
     reference_capital_store.load("reference_capital.json")  # X日次レポートの%算出用基準資金
     halt_store.load("data/trading_halt.json")  # 取引停止スイッチの状態を復元（停止中なら起動後も維持）
     log_setup.setup()
+    # 稼働中のコードを記録（起動後にコード・設定が更新されたら定期報告で知らせる）
+    code_version.capture()
+    logger.info(f"稼働コード: {code_version.describe()}")
     db.init()
 
     trading_conf = cfg.get_section("trading")
@@ -285,6 +288,11 @@ def main() -> None:
                 f"完全自動ログイン省略: 本日は休場です（{market_calendar.holiday_name(clock.today())}）"
             )
             return
+        # KabuSを強制終了する前の最終確認。人が08:30より前にログイン済みなら
+        # トークンが取れるので、止めて再ログインする必要はない（2026-10-13の再発防止）。
+        if broker_watch.auth_valid_now(client.refresh_token):
+            logger.info("完全自動ログイン省略: 認証は有効です（トークンを取得できました）")
+            return
         ok, detail = _full_login_broker()
         if ok:
             alert(
@@ -414,77 +422,20 @@ def main() -> None:
             # （2026-08-31 は10:58復帰で朝の発注機会を失い当日の約定が0件だった）。
             services.catchup_execution()
 
-        recovered = auth_recovery.attempt_recovery(
-            client.refresh_token,
+        # 本体は broker_watch.recovery_tick（1日の時系列で回すテストを書けるよう
+        # 依存を引数で渡す。tests/test_recovery_scenario.py 参照）。
+        broker_watch.recovery_tick(
+            refresh_token=client.refresh_token,
             on_recovered=_on_recovered,
+            probe_running=broker_launcher.probe_running,
+            now=clock.now(),
+            runtime=cfg.get_section("runtime"),
+            launch_broker=_launch_broker,
+            full_login=_full_login_broker,
+            notifier=broker_down,
+            alert=alert,
+            monotonic=time.monotonic(),
         )
-
-        # KabuS.exe の生存確認は**認証の状態に関わらず毎回**行う。ここが唯一の
-        # 生存確認であり、場中のクラッシュは接続エラーになるだけで 401 ではない
-        # （kabu_client は401のときだけ mark_expired する）。認証切れの判定の
-        # 後ろに置くと、本来の対象であるクラッシュ復帰に永久に到達しない。
-        rt = cfg.get_section("runtime")
-        # 既定は False（起動元を人に一本化する運用）。キーが欠けた設定で
-        # 自動起動が黙って復活すると、Windowsの自動起動と競合して二重起動が再発する。
-        auto_launch = bool(rt.get("auto_launch_broker", False))
-        alive = broker_launcher.probe_running()
-        in_window = broker_watch.in_notify_window(clock.now())
-
-        # 通知より先に起動を試す。通知文へ「実際にどうなったか」を載せるため
-        # （先に「試みます」と書くと、起動できなかった事実が隠れる）。
-        # 夜間・休場日に閉じるのは通常の操作なので、通知と同じ窓の中だけで起動する。
-        # 起動するのは、プロセスが見つからず**かつAPIにも到達できない**ときだけ。
-        # tasklist の判定だけを根拠にすると、プロセス名の変更などで誤って False に
-        # なった場合、APIが正常稼働しているのに5分ごとに追加起動してしまう。
-        launch_result = None
-        if alive is False and not recovered and auto_launch and in_window:
-            launch_result = _launch_broker()
-            if launch_result[0]:
-                alert(
-                    "kabuステーションを起動しました",
-                    f"{launch_result[1]}\n認証アプリで承認してください。"
-                    "承認後は自動で取引を再開します。",
-                    level=alerts_mod.LEVEL_INFO,
-                )
-            else:
-                logger.warning(
-                    f"kabuステーションの自動起動は行われませんでした: {launch_result[1]}"
-                )
-
-        # 日中に落ちたときの完全自動ログイン復帰。auto_launch_broker は preflight の
-        # 起動経路の排他性チェックにより broker_full_login_enabled と併用できないため、
-        # auto_launch側が無効な運用（現行）では上のブロックが一度も起動を試みず、
-        # 🔴を出すだけで誰も起動しない穴があった（2026-09-28朝、KabuSが落ちて
-        # 08:30の定時ジョブもmissedで終日手動になりかけた実例）。
-        full_login_enabled = bool(rt.get("broker_full_login_enabled", False))
-        if broker_watch.should_full_login_recover(
-            alive=alive, recovered=recovered, expired=broker_auth.is_expired(),
-            in_window=in_window,
-            full_login_enabled=full_login_enabled, auto_launch=auto_launch,
-            now_time=clock.now().time(),
-        ):
-            launch_result = _full_login_broker()
-            if launch_result[0]:
-                alert(
-                    "kabuステーションを完全自動ログインで復帰しました",
-                    launch_result[1],
-                    level=alerts_mod.LEVEL_INFO,
-                )
-            else:
-                logger.warning(
-                    f"kabuステーションの完全自動ログイン復帰に失敗しました: {launch_result[1]}"
-                )
-            # down_message() は auto_launch=True のときだけ launch_result の内容
-            # （成功文言 / 「自動起動できませんでした: …」）を使う分岐を持つ。
-            # この経路を使った回はそれに乗せるため、以降の判定では auto_launch=True 扱いにする。
-            auto_launch = True
-
-        notice = broker_down.check(
-            alive=alive, now=time.monotonic(), notify_window=in_window,
-            auto_launch=auto_launch, launch_result=launch_result,
-        )
-        if notice:
-            alert(*notice)
 
     def db_backup():
         try:
@@ -503,11 +454,14 @@ def main() -> None:
         snap = order_mgr.status_snapshot()
         auth = "有効" if not broker_auth.is_expired() else "切れ（要ログイン）"
         order_state = "可" if snap["can_place_order"] else f"不可（{snap['block_reason']}）"
-        return (f"モード: {tm.description(mode)}\n"
-                f"発注: {order_state}\n"
-                f"kabuステーション認証: {auth}\n"
-                f"未解決注文: {snap['unresolved_orders']}件 / "
-                f"承認待ち: {snap['pending_approvals']}件")
+        msg = (f"モード: {tm.description(mode)}\n"
+               f"発注: {order_state}\n"
+               f"kabuステーション認証: {auth}\n"
+               f"未解決注文: {snap['unresolved_orders']}件 / "
+               f"承認待ち: {snap['pending_approvals']}件\n"
+               f"稼働コード: {code_version.describe()}")
+        stale = code_version.stale_notice()
+        return f"{msg}\n{stale}" if stale else msg
 
     def _reference_capital() -> float:
         """損益率の算出基準（日次レポートと同じ基準を使い、数字を食い違わせない）。"""

@@ -164,9 +164,13 @@ class TestWiring:
         is_running() は「起動してよいか」の判断用に不明を True へ倒しているため、
         通知や自動起動の判断には流用しない。
         """
+        # 本体は broker_watch.recovery_tick へ移した（2026-10-13）。main.py は
+        # 3値の probe_running を渡し、recovery_tick が auto_launch_broker を読む。
+        import inspect
+        from src.core import broker_watch
         src = self._main_src()
-        assert "auto_launch_broker" in src
-        assert "broker_launcher.probe_running()" in src
+        assert "probe_running=broker_launcher.probe_running" in src
+        assert "auto_launch_broker" in inspect.getsource(broker_watch.recovery_tick)
 
     def test_auth_is_not_automated(self):
         """認証（2段階認証）は自動化しない方針が守られていること"""
@@ -307,26 +311,37 @@ class TestBrokerDownIsReported:
     通知するかどうかの判断自体は tests/test_broker_watch.py が直接検証する。
     """
 
+    # 本体は broker_watch.recovery_tick へ移し、振る舞い（場中クラッシュでも
+    # 生存確認と復帰に到達すること等）は tests/test_recovery_scenario.py が
+    # 時系列で直接検証する。ここでは main.py からの結線だけを見る。
     def _recovery_body(self) -> str:
         src = _main_src()
         i = src.index("def auth_recovery_check")
         return src[i:src.index("def db_backup", i)]
 
+    def _tick_src(self) -> str:
+        import inspect
+        from src.core import broker_watch
+        return inspect.getsource(broker_watch.recovery_tick)
+
     def test_liveness_is_not_gated_by_auth_state(self):
-        body = self._recovery_body()
-        assert "not broker_auth.is_expired()" not in body, (
-            "認証切れゲートが残っており、場中クラッシュでは生存確認に到達しない"
-        )
+        for body in (self._recovery_body(), self._tick_src()):
+            assert "not broker_auth.is_expired()" not in body, (
+                "認証切れゲートが残っており、場中クラッシュでは生存確認に到達しない"
+            )
 
     def test_uses_the_tested_decision_module(self):
-        body = self._recovery_body()
-        assert "broker_watch.in_notify_window" in body
-        assert "broker_down.check(" in body
+        assert "broker_watch.recovery_tick(" in self._recovery_body()
+        assert "notifier=broker_down" in self._recovery_body()
+        tick = self._tick_src()
+        assert "in_notify_window(" in tick
+        assert "notifier.check(" in tick
 
     def test_uses_the_tri_state_probe(self):
         """起動判断用の is_running() を通知判断に流用しないこと。"""
         body = self._recovery_body()
-        assert "broker_launcher.probe_running()" in body
+        assert "probe_running=broker_launcher.probe_running" in body
+        assert "is_running" not in body
 
 
 class TestManualLaunchIsNotRateLimited:

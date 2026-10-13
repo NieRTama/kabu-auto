@@ -13,7 +13,7 @@
 """
 from loguru import logger
 
-from src.core import broker_auth
+from src.core import broker_auth, code_version
 from src.core import trading_mode as tm
 from src.core.alerts import LEVEL_ROUTINE, alert
 
@@ -24,13 +24,16 @@ def build_message(mode: str, snapshot: dict, position_count: int) -> str:
     block = snapshot.get("block_reason") or ""
     auth = "有効" if not broker_auth.is_expired() else "切れ（要ログイン）"
     order_state = "可" if can_order else f"不可（{block}）"
-    return (
+    msg = (
         f"モード: {tm.description(mode)}\n"
         f"発注: {order_state}\n"
         f"kabuステーション認証: {auth}\n"
         f"保有銘柄: {position_count}件 / "
-        f"未解決注文: {snapshot.get('unresolved_orders', 0)}件"
+        f"未解決注文: {snapshot.get('unresolved_orders', 0)}件\n"
+        f"稼働コード: {code_version.describe()}"
     )
+    stale = code_version.stale_notice()
+    return f"{msg}\n{stale}" if stale else msg
 
 
 def send(mode: str, snapshot: dict, position_count: int) -> None:
