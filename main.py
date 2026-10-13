@@ -458,7 +458,8 @@ def main() -> None:
         # 08:30の定時ジョブもmissedで終日手動になりかけた実例）。
         full_login_enabled = bool(rt.get("broker_full_login_enabled", False))
         if broker_watch.should_full_login_recover(
-            alive=alive, recovered=recovered, in_window=in_window,
+            alive=alive, recovered=recovered, expired=broker_auth.is_expired(),
+            in_window=in_window,
             full_login_enabled=full_login_enabled, auto_launch=auto_launch,
             now_time=clock.now().time(),
         ):

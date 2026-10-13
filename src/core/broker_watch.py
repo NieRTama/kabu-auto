@@ -120,7 +120,8 @@ def down_message(*, auto_launch: bool,
 
 
 def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
-                               in_window: bool, full_login_enabled: bool,
+                               expired: bool, in_window: bool,
+                               full_login_enabled: bool,
                                auto_launch: bool, now_time: dtime) -> bool:
     """kabuステーションの認証切れから完全自動ログインで復帰させてよいか。
 
@@ -140,8 +141,17 @@ def should_full_login_recover(*, alive: Optional[bool], recovered: bool,
     朝の起動〜ログインを担当するため、それより前は夜間に閉じた通常状態であり
     二重にログインさせない。休場日のガードは in_window（in_notify_window）が
     営業日判定を含んでいるため別途不要。
+
+    生存中は **認証が実際に切れているとき（expired）だけ** 対象にする（2026-10-13）。
+    attempt_recovery は認証が有効なときは何もせず recovered=False を返すため、
+    この条件が無いと、ログイン済みのKabuSを08:40以降5分ごとにkillして再ログインし、
+    トークンを無効化し続けた（日次上限3回で止まるまで発注不可）。プロセスが
+    落ちている場合（alive is False）は、場中のクラッシュが401ではなく接続エラーに
+    なり認証切れとして記録されないため、認証状態に関わらず対象のまま。
     """
     if alive is None:
+        return False
+    if alive is True and not expired:
         return False
     if recovered:
         return False

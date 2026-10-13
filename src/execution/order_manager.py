@@ -212,10 +212,20 @@ class OrderManager:
             for p in session.scalars(select(Position).where(Position.quantity > 0)).all():
                 symbol = p.symbol.upper()
                 db_qty[symbol] = db_qty.get(symbol, 0) + p.quantity
+            # 生きている注文がある銘柄はこの回の照合から外す。注文照合→建玉照合の間に
+            # ブローカーで約定すると、DBは未約定のまま建玉だけ増えて誤検知する
+            # （2026-10-13、3489で kill switch が誤作動し終日新規発注が止まった）。
+            # 注文が確定した次の回には照合されるので本当のズレは見逃さない。
+            # 人手確認が要る異常状態（UNRESOLVED_STATUSES）は外さない。
+            open_symbols = {
+                s.upper() for s in session.scalars(
+                    select(Trade.symbol).where(Trade.status.in_(st.OPEN_STATUSES))
+                ).all()
+            }
 
         drift = [
             {"symbol": sym, "db_qty": db_qty.get(sym, 0), "broker_qty": broker_qty.get(sym, 0)}
-            for sym in (set(db_qty) | set(broker_qty))
+            for sym in (set(db_qty) | set(broker_qty)) - open_symbols
             if db_qty.get(sym, 0) != broker_qty.get(sym, 0)
         ]
         if drift:

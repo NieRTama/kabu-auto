@@ -14,7 +14,8 @@ import src.core.config as cfg
 import src.core.halt as halt
 import src.data.database as db
 import src.execution.order_manager as mod
-from src.data.database import Position, get_session
+from src.data.database import Position, Trade, get_session
+from src.execution import order_status as st
 
 
 @pytest.fixture
@@ -56,7 +57,49 @@ def _add_position(symbol: str, qty: int) -> None:
         s.commit()
 
 
+def _add_trade(symbol: str, status: str, order_id: str = "ORD1") -> None:
+    with get_session() as s:
+        s.add(Trade(order_id=order_id, symbol=symbol, side="BUY", quantity=100,
+                    price=738.0, status=status))
+        s.commit()
+
+
 class TestReconcilePositionsWithBroker:
+    def test_symbol_with_open_order_is_skipped(self, isolated_db):
+        """約定直後〜DB反映までの隙を誤検知しない（2026-10-13実例）。
+
+        09:05:01に3489を発注→ブローカーで即約定。DBの約定反映(09:05:15)より前の
+        09:05:02に照合が走り「DB=0株 ブローカー=100株」で kill switch が作動し、
+        終日新規発注が止まった。未約定の注文がある銘柄はその回の照合から外す。
+        """
+        _add_trade("3489", st.PENDING)
+        with _make_om("live") as (om, client):
+            client.get_positions.return_value = [{"Symbol": "3489", "LeavesQty": 100}]
+            result = om.reconcile_positions_with_broker()
+        assert result["ok"] is True
+        assert halt.is_halted() is False
+
+    def test_drift_on_other_symbol_still_detected_with_open_order(self, isolated_db):
+        _add_trade("3489", st.PENDING)
+        _add_position("7203", 100)
+        with _make_om("live") as (om, client):
+            client.get_positions.return_value = [{"Symbol": "3489", "LeavesQty": 100}]
+            with patch.object(mod, "alert"):
+                result = om.reconcile_positions_with_broker()
+        assert result["ok"] is False
+        assert [d["symbol"] for d in result["drift"]] == ["7203"]
+        assert halt.is_halted() is True
+
+    def test_unresolved_order_symbol_is_not_skipped(self, isolated_db):
+        """人手確認が要る異常状態(CANCEL_FAILED等)の銘柄は外さない（本当のズレを隠さない）"""
+        _add_trade("3489", st.CANCEL_FAILED)
+        with _make_om("live") as (om, client):
+            client.get_positions.return_value = [{"Symbol": "3489", "LeavesQty": 100}]
+            with patch.object(mod, "alert"):
+                result = om.reconcile_positions_with_broker()
+        assert result["ok"] is False
+        assert halt.is_halted() is True
+
     def test_no_drift_when_matching(self, isolated_db):
         _add_position("7203", 100)
         with _make_om("live") as (om, client):

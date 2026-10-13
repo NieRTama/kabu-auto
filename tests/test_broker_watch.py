@@ -198,7 +198,7 @@ class TestShouldFullLoginRecover:
 
     def _ok(self, **overrides):
         kwargs = dict(
-            alive=False, recovered=False, in_window=True,
+            alive=False, recovered=False, expired=True, in_window=True,
             full_login_enabled=True, auto_launch=False,
             now_time=dtime(8, 40),
         )
@@ -216,6 +216,17 @@ class TestShouldFullLoginRecover:
         # 残したまま待つのではなく、完全自動ログイン側（WSL側スクリプトが
         # 既存プロセスをkillしてから再起動・再ログインする）で復帰させる。
         assert self._ok(alive=True) is True
+
+    def test_false_when_alive_and_auth_still_valid(self):
+        # 2026-10-13: 認証が有効なまま08:40以降にチェックが走ると recovered=False
+        # （attempt_recovery は有効時は何もせず False を返す）になり、生存中の
+        # KabuSをkillして再ログインし続け、トークンを無効化していた。
+        assert self._ok(alive=True, expired=False) is False
+
+    def test_true_when_process_down_even_if_auth_not_marked_expired(self):
+        # 場中のクラッシュは接続エラーになるだけで401ではないため、認証切れとは
+        # 記録されない。プロセスが落ちているなら認証状態に関わらず復帰させる。
+        assert self._ok(alive=False, expired=False) is True
 
     def test_false_when_alive_is_unknown(self):
         # tasklist が判定できていないだけの可能性があり、動いているものを

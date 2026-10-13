@@ -24,6 +24,11 @@ from src.core import market_calendar
 
 TZ = ZoneInfo("Asia/Tokyo")
 
+# 朝の発注時刻。認証復帰時のキャッチアップ(trading.catchup_execution)が
+# 「まだ朝の発注前か」を判定するのにも使う（同じ時刻を二重に持たない）。
+MORNING_EXECUTION_HOUR = 9
+MORNING_EXECUTION_MINUTE = 5
+
 
 class TradingScheduler:
     def __init__(self):
@@ -135,7 +140,8 @@ class TradingScheduler:
             self._scheduler.add_job(
                 cb["morning_execution"], "cron",
                 day_of_week="mon-fri",
-                hour=9, minute=5, id="morning_execution",
+                hour=MORNING_EXECUTION_HOUR, minute=MORNING_EXECUTION_MINUTE,
+                id="morning_execution",
             )
         if "heartbeat" in cb:
             # 平日8:45（場前・トークン更新8:35の後）に「稼働中です」を通知する。

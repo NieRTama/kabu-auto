@@ -22,7 +22,7 @@ from src.core import config as cfg
 from src.core import trading_mode as tm
 from src.core import watchlist as watchlist_store
 from src.core.alerts import LEVEL_INFO, LEVEL_WARNING, alert
-from src.core.scheduler import TradingScheduler
+from src.core.scheduler import MORNING_EXECUTION_HOUR, MORNING_EXECUTION_MINUTE, TradingScheduler
 from src.data import bar_status
 from src.data.bar_status import BarStatus
 from src.data.database import OrderIntent, Position, Signal, Trade, get_session
@@ -720,6 +720,11 @@ class TradingServices:
         """
         if not TradingScheduler.is_market_open():
             logger.info("認証復帰: 場外のため発注のキャッチアップは行いません")
+            return
+        # 朝の発注時刻より前は何も逃していない。ここで発注すると、続く定時の
+        # morning_execution でも発注され同じ朝に2回発注する（2026-10-13実例）。
+        if TradingScheduler.is_before(MORNING_EXECUTION_HOUR, MORNING_EXECUTION_MINUTE):
+            logger.info("認証復帰: 朝の発注時刻前のため、キャッチアップせず定時の発注に任せます")
             return
         deadline = self.trading_conf.get("catchup_deadline_hour", 14)
         if deadline and not TradingScheduler.is_before(int(deadline)):

@@ -52,6 +52,25 @@ class TestMarketClosed:
         exec_mock.assert_not_called()
 
 
+class TestBeforeMorningSlot:
+    def test_skips_before_morning_execution(self):
+        """朝の発注時刻(9:05)より前に復帰しても発注しない（2026-10-13実例）。
+
+        09:03に認証が戻ってキャッチアップが走り9434を買い、続く09:05の
+        morning_execution でも発注されて同じ朝に2回発注した。9:05前は何も
+        逃していないので、定時の朝の発注に任せる。
+        """
+        svc = _services()
+        exec_mock = _run(svc, market_open=True, now_hour=9, now_minute=3)
+        exec_mock.assert_not_called()
+
+    def test_executes_right_at_morning_execution_time(self):
+        """9:05ちょうどの復帰は取り返す（定時ジョブが401で失敗した直後の可能性がある）"""
+        svc = _services()
+        exec_mock = _run(svc, market_open=True, now_hour=9, now_minute=5)
+        exec_mock.assert_called_once()
+
+
 class TestDeadline:
     def test_executes_before_deadline(self):
         """締切前（10:58 に復帰）なら逃した分を取り返す＝2026-08-31 のケース"""
