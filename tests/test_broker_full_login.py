@@ -30,6 +30,13 @@ def _reset():
     bfl.reset()
 
 
+@pytest.fixture(autouse=True)
+def shutdown_wsl():
+    """テスト中に本物の wsl --shutdown を呼ばない"""
+    with patch.object(bfl, "_shutdown_wsl") as m:
+        yield m
+
+
 def _run(*, returncode=0, stdout="", stderr="", raise_timeout=False,
           raise_error=None, max_attempts=3, now=None, manual=False,
           timeout_seconds=180):
@@ -78,6 +85,37 @@ class TestSuccessfulRun:
         assert mock_run.call_args.kwargs["timeout"] == 42
 
 
+class TestShutdownWslAfterRun:
+    """WSLは毎朝の完全自動ログインの数分しか使わないので、終わったら止めて
+    メモリをWindowsへ返す（8GB増設不可で常時ページングしていた。2026-10-14）。
+    失敗時も止めるのは、次の試行を新しいWSLで始めるため（10/14朝、WSLの
+    ユーザーセッションが起動できずに失敗し、WSLの再起動で直った）。"""
+
+    def test_shuts_down_after_success(self, shutdown_wsl):
+        _run()
+        shutdown_wsl.assert_called_once()
+
+    def test_shuts_down_after_failure(self, shutdown_wsl):
+        _run(returncode=1, stderr="wsl: Failed to start the systemd user session")
+        shutdown_wsl.assert_called_once()
+
+    def test_shuts_down_after_timeout(self, shutdown_wsl):
+        _run(raise_timeout=True)
+        shutdown_wsl.assert_called_once()
+
+    def test_not_called_when_skipped_by_cooldown(self, shutdown_wsl):
+        """実行していない（クールダウン・上限で見送った）ときはWSLに触れない"""
+        _run(now=lambda: 1000.0)
+        shutdown_wsl.reset_mock()
+        _run(now=lambda: 1001.0)
+        shutdown_wsl.assert_not_called()
+
+    def test_shutdown_failure_does_not_change_result(self):
+        """停止の失敗は運用に影響させない（ログインの成否はそのまま返す）"""
+        with patch.object(bfl.subprocess, "run", side_effect=OSError("wsl not found")):
+            bfl._shutdown_wsl()  # 例外を外へ出さない
+
+
 class TestFailure:
     def test_nonzero_returncode_is_reported_not_raised(self):
         ok, detail, _ = _run(returncode=1, stderr="ログイン画面が見つかりません")
@@ -92,6 +130,30 @@ class TestFailure:
         )
         assert ok is False
         assert "docker compose up --build に失敗しました" in detail
+
+    def test_none_output_does_not_raise(self):
+        """出力が None でも落ちない（2026-10-14実例）。
+
+        WSL側の出力にUTF-8(bash)とCP932(PowerShell)の日本語が混ざり、text=True の
+        既定デコードに失敗して stdout/stderr が None になり、失敗処理で
+        AttributeError が出てジョブごと落ちた（通知も失敗理由も残らなかった）。
+        """
+        ok, detail, _ = _run(returncode=1, stdout=None, stderr=None)
+        assert ok is False
+        assert "rc=1" in detail
+
+    def test_mixed_utf8_and_cp932_bytes_are_both_decoded(self):
+        stderr = ("Error: 口座番号の入力欄が見つかりません\n".encode("cp932")
+                  + "run_login_only.sh が成功の印を出さずに終了しました\n".encode("utf-8"))
+        ok, detail, _ = _run(returncode=1, stderr=stderr)
+        assert ok is False
+        assert "口座番号の入力欄が見つかりません" in detail
+        assert "成功の印を出さずに終了" in detail
+
+    def test_captures_bytes_not_text(self):
+        """既定のロケール(CP932)でのデコードに任せない"""
+        _, _, mock_run = _run()
+        assert not mock_run.call_args.kwargs.get("text")
 
     def test_timeout_is_reported_not_raised(self):
         ok, detail, _ = _run(raise_timeout=True)

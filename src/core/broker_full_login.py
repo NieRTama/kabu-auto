@@ -69,6 +69,44 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _shutdown_wsl() -> None:
+    """完全自動ログインの後にWSLを止める（成否・タイムアウトに関わらず）。
+
+    WSLは毎朝の完全自動ログインの数分しか使わないので、止めて約1GBのメモリを
+    Windowsへ返す（物理8GB・増設不可のPCで常時ページングしていた。2026-10-14）。
+    失敗時も止めるのは、次の試行を新しいWSLで始めるため（10/14朝、WSLの
+    ユーザーセッションが起動できずに失敗し、WSLの再起動で直った）。
+    WSLを使う他の処理（完全自動ログイン・Gmail再認証）は必要時に自動で起動し直す。
+    停止の失敗は運用に影響させない。
+    """
+    try:
+        subprocess.run(["wsl", "--shutdown"], capture_output=True, timeout=60)
+        logger.info("完全自動ログイン後にWSLを停止しました（メモリ解放）")
+    except Exception as e:
+        logger.warning(f"WSLの停止に失敗しました（運用には影響なし）: {e}")
+
+
+def _decode_output(data) -> str:
+    """WSL側の出力を文字列にする。1行ずつ UTF-8 → CP932 の順で試す。
+
+    出力には bash の UTF-8 と、WSL経由で呼ぶ PowerShell の CP932 の日本語が
+    混ざる。text=True（既定のCP932で一括デコード）だと読み取りに失敗して
+    stdout/stderr が None になり、失敗処理が AttributeError で落ちて
+    通知も失敗理由も残らなかった（2026-10-14）。
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    lines = []
+    for raw in data.splitlines(keepends=True):
+        try:
+            lines.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            lines.append(raw.decode("cp932", errors="replace"))
+    return "".join(lines)
+
+
 def reset() -> None:
     """テスト用に試行回数とクールダウンを初期化する。"""
     global _attempts, _attempts_date
@@ -173,9 +211,13 @@ def run(*, manual: bool = False,
         f"cd {project_dir} && ./{script_path}",
     ]
     try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout_seconds,
-        )
+        # バイト列で受け取り _decode_output で読む（text=True の既定デコードに任せない）
+        try:
+            result = subprocess.run(
+                command, capture_output=True, timeout=timeout_seconds,
+            )
+        finally:
+            _shutdown_wsl()
     except subprocess.TimeoutExpired:
         with _lock:
             broker_process_lock.last_operation_at = _now()
@@ -201,7 +243,8 @@ def run(*, manual: bool = False,
         # WSL側スクリプトは set -e のため、docker compose up --build 等の
         # 診断出力の多くが stdout に出る。stderr が空だと失敗理由が丸ごと
         # 消えるので、空のときは stdout にフォールバックする。
-        detail_source = result.stderr.strip() or result.stdout.strip()
+        detail_source = (_decode_output(result.stderr).strip()
+                         or _decode_output(result.stdout).strip())
         if "auth_gmailapi" in detail_source:
             # OTP取得側がGmail認証失効（テスト中アプリの7日失効）を報告している。
             # 失敗理由は長い出力の末尾にあり [:300] では切れるため、ここで判定する。
