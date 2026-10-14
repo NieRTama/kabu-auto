@@ -47,9 +47,11 @@ def stale_notice() -> Optional[str]:
     repo: Path = _state["repo"]
     started_at: float = _state["started_at"]
     candidates = [repo / "main.py", repo / "config.yaml", *(repo / "src").rglob("*.py")]
+    # 2秒の余裕: ファイル時刻の丸めで、起動直前に書かれたファイルが起動時刻をわずかに
+    # 上回り「未反映」と誤報することがある（テストで実際に揺れた）
     changed = sorted(
         p.relative_to(repo).as_posix() for p in candidates
-        if p.exists() and p.stat().st_mtime > started_at
+        if p.exists() and p.stat().st_mtime > started_at + 2
     )
     if not changed:
         return None

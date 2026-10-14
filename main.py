@@ -143,6 +143,46 @@ def main() -> None:
 
     set_order_manager(order_mgr)
 
+    # 起動時のログイン待ちから呼ぶため、待機より前に定義する（後ろだと NameError）
+    def _full_login_broker(*, manual: bool = False) -> tuple[bool, str]:
+        """kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化する
+        （設定を読んで broker_full_login へ委譲）。
+
+        manual=True は人が明示的に頼んだ実行（Discord の full_login）。
+        broker_launcher.launch() の manual と同じ考え方で、日次上限では止めない。
+        """
+        rt = cfg.get_section("runtime")
+        return broker_full_login.run(
+            manual=manual,
+            max_attempts_per_day=int(
+                rt.get("broker_full_login_max_attempts_per_day",
+                       broker_full_login.DEFAULT_MAX_ATTEMPTS_PER_DAY)
+            ),
+            timeout_seconds=int(
+                rt.get("broker_full_login_timeout_seconds",
+                       broker_full_login.DEFAULT_TIMEOUT_SECONDS)
+            ),
+        )
+
+    def _startup_full_login() -> None:
+        """起動時のログイン待ちに入ったら、完全自動ログインを1回試す（2026-10-14）。
+
+        起動時はKabuSにつながるまで待ってからスケジューラを起動する一方、完全自動
+        ログインはスケジューラのジョブからしか呼ばれていなかった。そのため平日にPCを
+        再起動すると「つながるまでスケジューラが起動せず、スケジューラが無いので
+        ログインされない」行き詰まりで、人が手動でログインするまで止まっていた。
+        失敗しても従来どおり手動ログインを待ち続ける（今より悪くならない）。
+        """
+        if not bool(cfg.get_section("runtime").get("broker_full_login_enabled", False)):
+            return
+        ok, detail = _full_login_broker()
+        if ok:
+            alert("kabuステーションの完全自動ログインを実行しました（起動時）", detail,
+                  level=alerts_mod.LEVEL_INFO)
+        else:
+            alert("kabuステーションの完全自動ログインに失敗しました（起動時）",
+                  f"{detail}\n手動でログインしてください。")
+
     # ─── 初回トークン取得（kabuステーションのログイン待ちを含む）──────
     # OS起動時に自動実行すると kabuステーションがまだ起動・ログインされておらず
     # 必ず接続に失敗する。ログイン自体は2段階認証があり人手が要るため、
@@ -169,15 +209,20 @@ def main() -> None:
             connected = False
             logger.info(f"休場日: kabuステーションへ接続できませんが起動を続行します: {e}")
     else:
+        def _on_startup_wait() -> None:
+            alert(
+                "kabuステーションのログイン待ち",
+                f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
+                "完全自動ログインを試みます。失敗した場合は"
+                f"kabuステーションを起動してログインしてください（{limit_text}）。",
+            )
+            _startup_full_login()
+
         connected = broker_wait.wait_for_broker(
             client.refresh_token,
             timeout_seconds=wait_minutes * 60,
             unlimited=wait_unlimited,
-            on_wait_start=lambda: alert(
-                "kabuステーションのログイン待ち",
-                f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
-                f"kabuステーションを起動してログインしてください（{limit_text}）。",
-            ),
+            on_wait_start=_on_startup_wait,
             on_connected=lambda waited: alert(
                 "kabuステーションへ接続しました",
                 f"{waited / 60:.1f}分の待機後に接続し、{tm.description(mode)}で稼働を開始します。",
@@ -251,26 +296,6 @@ def main() -> None:
                        broker_launcher.DEFAULT_MAX_ATTEMPTS_PER_DAY)
             ),
             manual=manual,
-        )
-
-    def _full_login_broker(*, manual: bool = False) -> tuple[bool, str]:
-        """kabuステーションの起動〜ログイン〜2段階認証入力までを完全自動化する
-        （設定を読んで broker_full_login へ委譲）。
-
-        manual=True は人が明示的に頼んだ実行（Discord の full_login）。
-        broker_launcher.launch() の manual と同じ考え方で、日次上限では止めない。
-        """
-        rt = cfg.get_section("runtime")
-        return broker_full_login.run(
-            manual=manual,
-            max_attempts_per_day=int(
-                rt.get("broker_full_login_max_attempts_per_day",
-                       broker_full_login.DEFAULT_MAX_ATTEMPTS_PER_DAY)
-            ),
-            timeout_seconds=int(
-                rt.get("broker_full_login_timeout_seconds",
-                       broker_full_login.DEFAULT_TIMEOUT_SECONDS)
-            ),
         )
 
     def broker_full_login_job():

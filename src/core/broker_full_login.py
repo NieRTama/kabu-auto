@@ -243,8 +243,14 @@ def run(*, manual: bool = False,
         # WSL側スクリプトは set -e のため、docker compose up --build 等の
         # 診断出力の多くが stdout に出る。stderr が空だと失敗理由が丸ごと
         # 消えるので、空のときは stdout にフォールバックする。
-        detail_source = (_decode_output(result.stderr).strip()
-                         or _decode_output(result.stdout).strip())
+        # "wsl: " で始まる行はWSLランチャー自身の警告（コールドスタート時の
+        # systemd ユーザーセッション警告など）。これが stderr を占めると、stdout 側の
+        # 本当の失敗理由が隠れた（2026-10-14）。理由の選択からは除く。
+        stderr_text = "\n".join(
+            line for line in _decode_output(result.stderr).splitlines()
+            if not line.startswith("wsl: ")
+        )
+        detail_source = stderr_text.strip() or _decode_output(result.stdout).strip()
         if "auth_gmailapi" in detail_source:
             # OTP取得側がGmail認証失効（テスト中アプリの7日失効）を報告している。
             # 失敗理由は長い出力の末尾にあり [:300] では切れるため、ここで判定する。

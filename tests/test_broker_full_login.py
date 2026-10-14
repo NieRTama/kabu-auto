@@ -150,6 +150,18 @@ class TestFailure:
         assert "口座番号の入力欄が見つかりません" in detail
         assert "成功の印を出さずに終了" in detail
 
+    def test_wsl_launcher_warning_does_not_hide_the_real_reason(self):
+        """WSLのコールドスタート時の警告(wsl: ...)だけが stderr にあるとき、
+        stdout 側の本当の失敗理由を表示する（2026-10-14、警告が理由を隠した）。"""
+        ok, detail, _ = _run(
+            returncode=1,
+            stderr="wsl: Failed to start the systemd user session for 'garne'. See journalctl for more details.\n",
+            stdout="Error: Cannot connect to the Docker daemon\n",
+        )
+        assert ok is False
+        assert "Docker daemon" in detail
+        assert "systemd user session" not in detail
+
     def test_captures_bytes_not_text(self):
         """既定のロケール(CP932)でのデコードに任せない"""
         _, _, mock_run = _run()
@@ -456,3 +468,28 @@ class TestMainWiring:
         i = _main_src().index("def broker_full_login_job")
         body = _main_src()[i:i + 800]
         assert "broker_full_login_enabled" in body
+
+    def test_startup_wait_triggers_full_login(self):
+        """起動時のログイン待ちで完全自動ログインを試すこと（2026-10-14）。
+
+        起動時は wait_for_broker_minutes: 0（無制限）でKabuSにつながるまで待ち、
+        その後にスケジューラを起動する。完全自動ログインはスケジューラのジョブからしか
+        呼ばれていなかったため、平日にPCを再起動すると「つながるまでスケジューラが
+        起動せず、スケジューラが無いのでログインされない」行き詰まりで止まっていた。
+        """
+        src = _main_src()
+        i = src.index("connected = broker_wait.wait_for_broker(")
+        call = src[i:src.index("if connected:", i)]
+        assert "on_wait_start=_on_startup_wait" in call
+        j = src.index("def _on_startup_wait")
+        assert "_startup_full_login()" in src[j:j + 900]
+        # 待機より前に定義されていること（後ろだと呼んだ時点で NameError）
+        for name in ("def _full_login_broker", "def _startup_full_login", "def _on_startup_wait"):
+            assert src.index(name) < i, f"{name} が起動時の待機より後ろで定義されている"
+
+    def test_startup_full_login_respects_the_flag(self):
+        src = _main_src()
+        i = src.index("def _startup_full_login")
+        body = src[i:i + 900]
+        assert "broker_full_login_enabled" in body
+        assert "_full_login_broker()" in body
