@@ -8,13 +8,15 @@
 
 `risk_profiles`（[config.yaml](config.yaml)）で「ローリスク・ローリターン」「ハイリスク・ハイリターン」の2種類を定義しており、ダッシュボードの「⚖️ リスクプロファイル」パネルからいつでも切り替え可能（再起動不要、次回の signal_scan / stop_loss_check から反映）。アクティブなプロファイルは `risk_profile.json` に永続化される。
 
+2026-10-15 時点のアクティブは、`high_risk` を複製したカスタムプロファイル `20261009`（値は下表の `high_risk` と同一）。
+
 | 項目 | ローリスク (low_risk) | ハイリスク (high_risk) |
 |---|---|---|
 | 買い閾値 (combined_score ≥) | 0.14 | 0.08 |
 | 売り閾値 (combined_score ≤) | −0.14 | −0.08 |
-| 1銘柄あたり最大投資比率 | 余力の12% | 余力の35% |
-| 損切りライン | −4% | −10% |
-| 最大同時保有銘柄数 | 6銘柄 | 4銘柄 |
+| 1銘柄あたり最大投資比率 | 余力の12% | 余力の50% |
+| 損切りライン | −4% | −15% |
+| 最大同時保有銘柄数 | 6銘柄 | 8銘柄 |
 | セクター集中上限 | 30% | 55% |
 | 当日損失上限 | 15,000円 | 60,000円 |
 
@@ -56,7 +58,8 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 ### 発注タイミング
 
 - **ペーパーモード**：signal_scan内でその場（当日終値）で即時シミュレート購入。
-- **ライブモード**：signal_scanではシグナルをDBに保存するだけ。**翌営業日 9:05** の `morning_execution`（[main.py](main.py)）で、直近20時間以内に生成されたシグナルに基づき成行（現在値）で発注する。
+- **ライブモード**：signal_scanではシグナルをDBに保存するだけ。**翌営業日 9:05** の `morning_execution` で、直近の `signal_scan` バッチ（通常は前営業日16:20生成）のシグナルに基づき、板の現在値を指値として発注する（`order_timeout_seconds: 300` 秒で未約定ならキャンセル。[src/services/trading.py](src/services/trading.py) の `_select_latest_signals`）。
+- **ライブモード（後場）**：**12:35** の `afternoon_execution` で、朝に見送った未保有銘柄のBUYシグナルを再度発注判定する。
 
 ### 発注前の追加チェック（`validate_buy`、[src/risk/manager.py](src/risk/manager.py)）
 
@@ -81,7 +84,7 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 | プロファイル | max_position_ratio | 現在値2,000円の銘柄 | 現在値500円の銘柄 |
 |---|---|---|---|
 | ローリスク (12%) | 60,000円 | 0株（1単元20万円必要） | 100株 |
-| ハイリスク (35%) | 175,000円 | 0株（1単元20万円必要） | 300株 |
+| ハイリスク (50%) | 250,000円 | 100株 | 500株 |
 
 ライブ時の余力は注文ごとに毎回APIで取得し直すため、複数銘柄に買いが入るたびに残り余力は減っていく。
 
@@ -93,10 +96,14 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 
 ### ② 損切り（ストップロス）
 
-平日 **9:00〜15:30 の間5分おき**に独立してチェック（[src/core/scheduler.py](src/core/scheduler.py)）。保有銘柄の現在値が平均取得単価（avg_cost）から `stop_loss_pct` 以上下落していたら、シグナルと無関係に即座に成行で全株売却（[main.py](main.py) の `stop_loss_check`）。
+平日の取引時間中（9:00〜11:30 / 12:30〜15:30）に**5分おき**に独立してチェック（cron は `hour="9-15", minute="*/5"`、取引時間外は `is_market_open()` で何もしない）（[src/core/scheduler.py](src/core/scheduler.py)）。保有銘柄の現在値が平均取得単価（avg_cost）から `stop_loss_pct` 以上下落していたら、シグナルと無関係に即座に成行で全株売却（[main.py](main.py) の `stop_loss_check`）。
 
 - ペーパーモード：日足終値で判定
 - ライブモード：板の現在値で判定
+
+### ③ ブレークイーブン・トレーリングストップ
+
+`config.yaml` の `breakeven_trigger_pct: 0.02` / `trailing_stop_pct: 0.04`。保有開始後のピーク含み益率が +2% に達すると、損切りラインを取得単価まで引き上げ、以後はピーク価格から −4% 下落した時点でも売却する。判定は②と同じ5分間隔のジョブで行う。
 
 ## まとめ：ハイリスク・ハイリターン設定の場合（余力50万円の例）
 
@@ -104,8 +111,8 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 |---|---|
 | 買い閾値 | combined_score ≥ 0.08 |
 | 売り閾値 | combined_score ≤ −0.08 |
-| 1銘柄あたり最大投資額 | 175,000円（余力の35%） |
-| 損切りライン | −10% |
-| 最大同時保有銘柄数 | 4銘柄 |
+| 1銘柄あたり最大投資額 | 250,000円（余力の50%） |
+| 損切りライン | −15%（含み益+2%到達後は取得単価、ピークから−4%で利益確定） |
+| 最大同時保有銘柄数 | 8銘柄 |
 | セクター集中上限 | 55% |
 | 当日損失上限 | 60,000円（到達したら以降の新規注文を停止） |

@@ -23,7 +23,7 @@ from src.core import (
     config as cfg, logger as log_setup, watchlist as watchlist_store,
     risk_profile as risk_profile_store, halt as halt_store, trading_mode as tm,
     process_lock, reference_capital as reference_capital_store, broker_wait, broker_auth,
-    discord_bot, broker_launcher, broker_full_login, broker_watch, code_version, discord_queries,
+    discord_bot, broker_launcher, broker_full_login, broker_watch, code_version, discord_queries, ops_summary,
     discord_slash, gmail_token, gmail_remote_auth,
     market_calendar, clock, session_watch,
 )
@@ -566,6 +566,7 @@ def main() -> None:
         "status": (_cmd_status, "稼働状況（モード・発注可否・認証・未解決注文）"),
         "positions": (_cmd_positions, "保有建玉（取得単価・現在値・含み損益）"),
         "today": (_cmd_today, "本日の約定履歴と確定損益"),
+        "summary": (lambda _a: ops_summary.build(clock.today(), full=False), "本日の運用概要（損益・エラー件数・ALERT一覧）"),
         "pnl": (_cmd_pnl, "損益サマリ（当日/週次/月次/総合）"),
         "orders": (_cmd_orders, "未約定注文の一覧"),
         "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),
