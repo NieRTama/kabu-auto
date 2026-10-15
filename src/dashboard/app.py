@@ -297,20 +297,22 @@ def update_status(running: bool, ws_connected: bool, mode: str) -> None:
     })
 
 
-def _compute_max_drawdown(cumulative_values: list) -> float:
-    """累積損益リストから最大ドローダウン率を返す（負の値、例: -0.12 = -12%）"""
-    if len(cumulative_values) < 2:
-        return 0.0
-    peak = cumulative_values[0]
-    max_dd = 0.0
+def _compute_max_drawdown(cumulative_values: list, capital: float) -> tuple:
+    """累積損益リストから (最大ドローダウン率, 最大ドローダウン額) を返す（いずれも負の値）。
+
+    資産 = capital（基準資金）+ 累積損益 の山からの下落で測る。起点は取引開始前の資産（累積0）。
+    2026-10-15 まで「累積損益の山」を分母にしており、利益の山が2,405円しか無い状態で
+    -600.6% と表示していた（利益の山が0以下なら常に0%）。capital が0（未設定）なら率は None。
+    """
+    peak = 0.0
+    max_dd_yen = 0.0
+    max_dd_pct = 0.0
     for v in cumulative_values:
-        if v > peak:
-            peak = v
-        if peak > 0:
-            dd = (v - peak) / peak
-            if dd < max_dd:
-                max_dd = dd
-    return round(max_dd, 4)
+        peak = max(peak, v)
+        max_dd_yen = min(max_dd_yen, v - peak)
+        if capital > 0:
+            max_dd_pct = min(max_dd_pct, (v - peak) / (capital + peak))
+    return (round(max_dd_pct, 4) if capital > 0 else None), round(max_dd_yen, 0)
 
 
 def _compute_sharpe(daily_pnl: list) -> float:
@@ -674,6 +676,123 @@ async def get_positions():
     return result
 
 
+# 口座余力のキャッシュ（時刻, 値）。ダッシュボードは10秒ごとに全APIを叩くため、
+# 毎回 /wallet/cash を呼ぶと証券会社APIの実行回数制限（429）に近づく（2026-09-11 の事例）。
+_wallet_cache: Optional[tuple] = None
+WALLET_CACHE_SECONDS = 30
+
+# 総資産の日次記録 {"YYYY-MM-DD": 総資産}。前日比の算出に使う（その日の最後の計算値が残る）。
+_TOTAL_HISTORY_PATH = Path("data/total_assets_history.json")
+TOTAL_HISTORY_KEEP_DAYS = 90
+
+
+def _record_total_and_previous(today: date, total: Optional[float]) -> tuple:
+    """今日の総資産を記録し、(比較対象の日付, その日の総資産) を返す。記録が無ければ (None, None)。"""
+    try:
+        hist = json.loads(_TOTAL_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        hist = {}
+    key = today.isoformat()
+    past = sorted(k for k in hist if k < key)
+    prev = (date.fromisoformat(past[-1]), hist[past[-1]]) if past else (None, None)
+    if total is not None and hist.get(key) != total:
+        hist[key] = total
+        for k in sorted(hist)[:-TOTAL_HISTORY_KEEP_DAYS]:
+            del hist[k]
+        try:
+            _TOTAL_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _TOTAL_HISTORY_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(hist, ensure_ascii=False, indent=0), encoding="utf-8")
+            os.replace(tmp, _TOTAL_HISTORY_PATH)
+        except OSError as e:
+            logger.warning(f"総資産の日次記録に失敗しました: {e}")
+    return prev
+
+
+def _previous_business_day(d: date) -> date:
+    from src.core import market_calendar
+    d -= timedelta(days=1)
+    while market_calendar.is_holiday(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _broker_cash() -> float:
+    global _wallet_cache
+    now = time.monotonic()
+    if _wallet_cache and now - _wallet_cache[0] < WALLET_CACHE_SECONDS:
+        return _wallet_cache[1]
+    if _kabu_client is None:
+        raise RuntimeError("kabuステーションAPIクライアント未接続")
+    cash = float(_kabu_client.get_wallet().get("StockAccountWallet", 0))
+    _wallet_cache = (now, cash)
+    return cash
+
+
+@app.get("/api/total_assets")
+async def get_total_assets():
+    """総資産 = 現金（live等は口座余力、paperは仮想残高）＋ 保有の評価額。
+
+    価格を取得できない銘柄は評価額に含めず `unpriced` に載せる（取得単価で代用すると
+    含み損益が0に見え、価格欠落を隠すため。pnl_report.build_holdings と同じ方針）。
+    余力を取得できない場合は total を null にする（評価額だけを総資産として表示しない）。
+    """
+    from src.services.trading import _paper_available_cash
+    trading_conf = cfg.get_section("trading")
+    mode = _system_status.get("mode", trading_conf.get("mode", "paper"))
+    paper_base = float(trading_conf.get("paper_initial_capital", 500_000))
+
+    with get_session() as session:
+        positions = session.scalars(select(Position).where(Position.quantity > 0)).all()
+    prices = _resolve_current_prices([p.symbol for p in positions])
+    market_value = cost = 0.0
+    unpriced = []
+    for p in positions:
+        price = prices.get(p.symbol)
+        if not price:
+            unpriced.append(p.symbol)
+            continue
+        market_value += price * p.quantity
+        cost += p.avg_cost * p.quantity
+
+    cash, cash_error = None, None
+    if tm.reads_broker_api(mode):
+        cash_source = "broker"
+        try:
+            cash = _broker_cash()
+        except Exception as e:
+            cash_error = str(e)[:200]
+    else:
+        cash_source = "paper"
+        cash = _paper_available_cash(paper_base)
+
+    total = round(cash + market_value, 0) if cash is not None else None
+    basis = reference_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
+    today = clock.today()
+    prev_date, prev_total = _record_total_and_previous(today, total)
+    if prev_date is None:
+        prev_label = None
+    elif prev_date == _previous_business_day(today):
+        prev_label = "前日比"
+    else:
+        prev_label = f"{prev_date.month}/{prev_date.day}比"
+    return {
+        "prev_total": prev_total,
+        "prev_label": prev_label,
+        "day_change": round(total - prev_total, 0) if total is not None and prev_total is not None else None,
+        "total": total,
+        "cash": round(cash, 0) if cash is not None else None,
+        "market_value": round(market_value, 0),
+        "unrealized": round(market_value - cost, 0),
+        "positions": len(positions),
+        "unpriced": unpriced,
+        "cash_source": cash_source,
+        "cash_error": cash_error,
+        "basis": basis or None,
+        "basis_change": round(total - basis, 0) if total is not None and basis else None,
+    }
+
+
 @app.get("/api/trades")
 async def get_trades(limit: int = 50):
     with get_session() as session:
@@ -958,6 +1077,12 @@ async def get_pnl_enhanced_summary():
         cumulative_values.append(cum)
         daily_pnl_list.append(pnl)
 
+    trading_conf = cfg.get_section("trading")
+    mode = _system_status.get("mode", trading_conf.get("mode", "paper"))
+    basis = reference_capital_store.percent_basis(
+        mode, paper_initial_capital=float(trading_conf.get("paper_initial_capital", 500_000)))
+    dd_pct, dd_yen = _compute_max_drawdown(cumulative_values, basis)
+
     return {
         "total_pnl": round(total_pnl, 0),
         "today_pnl": round(today_pnl, 0),
@@ -967,7 +1092,8 @@ async def get_pnl_enhanced_summary():
         "win_count": win_count,
         "loss_count": loss_count,
         "win_rate": round(win_count / total, 3) if total > 0 else 0.0,
-        "max_drawdown": _compute_max_drawdown(cumulative_values),
+        "max_drawdown": dd_pct,
+        "max_drawdown_yen": dd_yen,
         "sharpe_ratio": _compute_sharpe(daily_pnl_list),
     }
 

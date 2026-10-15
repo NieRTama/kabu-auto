@@ -77,3 +77,7 @@ watchlist.json
 graphify-out/
 .claude/
 data/gmail_token_issued_at.txt
+
+# 総資産の日次記録（ダッシュボードの前日比用）。実際の資産額を含むため追跡しない
+data/total_assets_history.json
+data/total_assets_history.tmp

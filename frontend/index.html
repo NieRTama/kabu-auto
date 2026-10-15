@@ -35,6 +35,7 @@
     .card .value.green { color: #4ade80; }
     .card .value.red { color: #f87171; }
     .card .value.neutral { color: #e2e8f0; }
+    #total-assets { font-size: 2.6rem; letter-spacing: 0.01em; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
     @media (max-width: 768px) { .row { grid-template-columns: 1fr; } }
     @media (max-width: 600px) {
@@ -44,6 +45,7 @@
       .card { padding: 14px; }
       .card .value { font-size: 1.4rem; }
       .card.compact .value { font-size: 1.1rem; }
+      #total-assets { font-size: 1.9rem; }
       .grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
       .pnl-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
       .perf-grid { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
@@ -92,6 +94,14 @@
       <code>config.yaml</code> の <code>trading.mode</code> を <code>paper</code> に戻して再起動してください。
     </div>
     <button id="live-ack-btn" onclick="ackLiveBanner()">内容を理解しました</button>
+  </div>
+
+  <!-- ─── 総資産（現金＋保有評価額） ─────────────────────────────── -->
+  <div class="card" id="total-assets-card" style="margin-bottom:16px;border-color:#38bdf8;">
+    <div class="label">総資産（現金＋保有評価額）</div>
+    <div style="display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 12px;"><div id="total-assets" class="value neutral">—</div><span id="total-assets-change" style="font-size:0.95rem;"></span></div>
+    <div id="total-assets-breakdown" style="margin-top:8px;color:#94a3b8;font-size:0.9rem;line-height:1.7;"></div>
+    <div id="total-assets-warn" style="margin-top:6px;color:#fbbf24;font-size:0.8rem;display:none;"></div>
   </div>
 
   <!-- ─── 損益サマリー（Row 1: 損益額） ──────────────────────────── -->
@@ -554,7 +564,7 @@
 
   async function loadAll() {
     await Promise.all([
-      loadStatus(), loadPnlEnhancedSummary(), loadPositions(),
+      loadStatus(), loadTotalAssets(), loadPnlEnhancedSummary(), loadPositions(),
       loadSignals(), loadTrades(), loadPnlChart(),
       loadJournal(), loadDailyReport(), loadHealth(), loadPerformance(),
     ]);
@@ -1497,6 +1507,37 @@
     location.href = '/login';
   }
 
+  async function loadTotalAssets() {
+    const d = await fetchJson('/api/total_assets');
+    const yen = v => (v == null ? '—' : '¥' + Math.round(v).toLocaleString());
+    const signed = v => (v > 0 ? '+' : v < 0 ? '−' : '') + '¥' + Math.abs(Math.round(v)).toLocaleString();
+    const color = v => (v > 0 ? '#4ade80' : v < 0 ? '#f87171' : '#e2e8f0');
+    // 前日比で色分け（プラス=赤、マイナス=水色。日本の株価表示の慣習）
+    const dayColor = v => (v > 0 ? '#f87171' : v < 0 ? '#67e8f9' : '#e2e8f0');
+    const totalEl = document.getElementById('total-assets');
+    totalEl.textContent = yen(d.total);
+    totalEl.style.color = d.day_change != null ? dayColor(d.day_change) : '';
+    const chEl = document.getElementById('total-assets-change');
+    chEl.textContent = d.day_change != null ? `(${d.prev_label}: ${signed(d.day_change)})` : '(前日比: 記録なし)';
+    chEl.style.color = d.day_change != null ? dayColor(d.day_change) : '#64748b';
+    const parts = [
+      `現金 ${yen(d.cash)}${d.cash_source === 'paper' ? '（仮想）' : ''}`,
+      `保有評価額 ${yen(d.market_value)}（${d.positions}銘柄）`,
+      `含み損益 <span style="color:${color(d.unrealized)}">${signed(d.unrealized)}</span>`,
+    ];
+    if (d.basis_change != null) {
+      parts.push(`基準資金 ${yen(d.basis)} 比 <span style="color:${color(d.basis_change)}">${signed(d.basis_change)}`
+        + ` (${(d.basis_change / d.basis * 100).toFixed(1)}%)</span>`);
+    }
+    document.getElementById('total-assets-breakdown').innerHTML = parts.join('　／　');
+    const warns = [];
+    if (d.cash_error) warns.push('口座余力を取得できないため総資産を表示できません: ' + escapeHtml(d.cash_error));
+    if (d.unpriced && d.unpriced.length) warns.push('価格取得不可のため評価額に未算入: ' + d.unpriced.map(escapeHtml).join(', '));
+    const w = document.getElementById('total-assets-warn');
+    w.innerHTML = warns.join('<br>');
+    w.style.display = warns.length ? 'block' : 'none';
+  }
+
   async function loadPnlEnhancedSummary() {
     const d = await fetchJson('/api/pnl/enhanced_summary');
 
@@ -1515,8 +1556,11 @@
     document.getElementById('win-loss').textContent = d.win_count + ' / ' + d.loss_count;
 
     const mddEl = document.getElementById('max-drawdown');
-    mddEl.textContent = (d.max_drawdown * 100).toFixed(1) + '%';
-    mddEl.className = 'value ' + (d.max_drawdown < -0.1 ? 'red' : 'neutral');
+    // 基準資金（資産の起点）に対する最大下落率。基準資金が未設定なら下落額のみ
+    const ddYen = '¥' + Math.round(d.max_drawdown_yen).toLocaleString();
+    mddEl.innerHTML = d.max_drawdown == null ? ddYen
+      : (d.max_drawdown * 100).toFixed(1) + '%<span style="font-size:0.75rem;color:#94a3b8;margin-left:6px;">' + ddYen + '</span>';
+    mddEl.className = 'value ' + (d.max_drawdown != null && d.max_drawdown < -0.1 ? 'red' : 'neutral');
 
     const sharpeEl = document.getElementById('sharpe-ratio');
     sharpeEl.textContent = d.sharpe_ratio.toFixed(2);
