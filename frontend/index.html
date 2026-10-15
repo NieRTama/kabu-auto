@@ -1512,11 +1512,12 @@
     const yen = v => (v == null ? '—' : '¥' + Math.round(v).toLocaleString());
     const signed = v => (v > 0 ? '+' : v < 0 ? '−' : '') + '¥' + Math.abs(Math.round(v)).toLocaleString();
     const color = v => (v > 0 ? '#4ade80' : v < 0 ? '#f87171' : '#e2e8f0');
-    // 前日比で色分け（プラス=赤、マイナス=水色。日本の株価表示の慣習）
-    const dayColor = v => (v > 0 ? '#f87171' : v < 0 ? '#67e8f9' : '#e2e8f0');
+    // プラス=緑、マイナス=赤（他の損益カードと同じ配色）
+    const dayColor = v => (v > 0 ? '#4ade80' : v < 0 ? '#f87171' : '#e2e8f0');
     const totalEl = document.getElementById('total-assets');
     totalEl.textContent = yen(d.total);
-    totalEl.style.color = d.day_change != null ? dayColor(d.day_change) : '';
+    // 総資産の色は基準資金（live は reference_capital.json の 50万円）との比較で決める
+    totalEl.style.color = d.basis_change != null ? dayColor(d.basis_change) : '';
     const chEl = document.getElementById('total-assets-change');
     chEl.textContent = d.day_change != null ? `(${d.prev_label}: ${signed(d.day_change)})` : '(前日比: 記録なし)';
     chEl.style.color = d.day_change != null ? dayColor(d.day_change) : '#64748b';
