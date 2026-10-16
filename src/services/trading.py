@@ -454,6 +454,17 @@ class TradingServices:
             logger.error(f"X日次レポート投稿エラー: {e}")
 
     # ─── 日次レポートのDiscord投稿 ───────────────────────
+    def _assets_line(self, mode: str, paper_base: float, basis: float) -> Optional[str]:
+        """Discordの日次・週次レポートに入れる総資産の行（ダッシュボードと同じ計算。当日分を記録する）。"""
+        try:
+            from src.core import total_assets
+            d = total_assets.compute(mode, client=self.client, price_fn=self.risk.get_current_prices,
+                                     paper_base=paper_base, basis=basis)
+            return total_assets.format_line(d)
+        except Exception as e:
+            logger.warning(f"総資産の算出に失敗しました（レポートは総資産なしで送ります）: {e}")
+            return None
+
     def post_daily_summary_to_discord(self) -> None:
         """当日/週次/月次/総合の損益サマリ・勝率をDiscordへ投稿する
         （discord_report.enabled=trueのときのみ）。基準資金の扱いはpost_daily_summary_to_xと同じ。
@@ -467,7 +478,7 @@ class TradingServices:
             mode = self.trading_conf.get("mode", "paper")
             paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
             basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
-            discord_report.post_daily_report(mode, basis)
+            discord_report.post_daily_report(mode, basis, self._assets_line(mode, paper_base, basis))
         except Exception as e:
             logger.error(f"Discord日次レポート投稿エラー: {e}")
 
@@ -483,7 +494,7 @@ class TradingServices:
             mode = self.trading_conf.get("mode", "paper")
             paper_base = float(self.trading_conf.get("paper_initial_capital", 500_000))
             basis = ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
-            discord_report.post_weekly_report(mode, basis)
+            discord_report.post_weekly_report(mode, basis, self._assets_line(mode, paper_base, basis))
         except Exception as e:
             logger.error(f"Discord週次サマリ投稿エラー: {e}")
 

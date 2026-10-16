@@ -494,6 +494,19 @@ def main() -> None:
         paper_base = float(trading_conf.get("paper_initial_capital", 500_000))
         return ref_capital_store.percent_basis(mode, paper_initial_capital=paper_base)
 
+    def _cmd_summary(_args: str) -> str:
+        """本日の運用概要。総資産は本体プロセス内で計算する（口座余力を取れるのは本体だけ）。"""
+        from src.core import total_assets
+        try:
+            assets = total_assets.compute(
+                mode, client=client, price_fn=risk.get_current_prices,
+                paper_base=float(trading_conf.get("paper_initial_capital", 500_000)),
+                basis=_reference_capital())
+        except Exception as e:
+            logger.warning(f"summary: 総資産の算出に失敗しました: {e}")
+            assets = {"total": None, "cash_error": str(e)[:200]}
+        return ops_summary.build(clock.today(), full=False, assets=assets)
+
     def _cmd_positions(_args: str) -> str:
         return discord_queries.format_positions(_reference_capital())
 
@@ -566,7 +579,7 @@ def main() -> None:
         "status": (_cmd_status, "稼働状況（モード・発注可否・認証・未解決注文）"),
         "positions": (_cmd_positions, "保有建玉（取得単価・現在値・含み損益）"),
         "today": (_cmd_today, "本日の約定履歴と確定損益"),
-        "summary": (lambda _a: ops_summary.build(clock.today(), full=False), "本日の運用概要（損益・エラー件数・ALERT一覧）"),
+        "summary": (_cmd_summary, "本日の運用概要（総資産・損益・エラー件数・ALERT一覧）"),
         "pnl": (_cmd_pnl, "損益サマリ（当日/週次/月次/総合）"),
         "orders": (_cmd_orders, "未約定注文の一覧"),
         "reconnect": (_cmd_reconnect, "認証切れのとき即座に再接続を試みる"),

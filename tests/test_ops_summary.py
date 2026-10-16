@@ -16,3 +16,27 @@ def test_auth_downtime_pairs_and_open_span():
 
 def test_error_kinds_groups_by_masked_message():
     assert o._error_kinds(WARN) == {"trading: 損切りチェックエラー: # #": 2}
+
+
+# ─── 総資産の行 ───────────────────────────────────────────────────
+
+def test_assets_line_from_live_value():
+    assert o._assets_line(None, {"total": 1000.0, "day_change": None, "basis_change": None,
+                                 "unpriced": []}) == "総資産: 1,000円"
+
+
+def test_assets_line_from_record_in_separate_process(tmp_path, monkeypatch):
+    from datetime import date
+    from src.core import total_assets
+    p = tmp_path / "h.json"
+    p.write_text('{"2026-10-15": 492380.0, "2026-10-16": 495000.0}', encoding="utf-8")
+    monkeypatch.setattr(total_assets, "HISTORY_PATH", p)
+    line = o._assets_line(date(2026, 10, 16), None)
+    assert line == "総資産: 495,000円（本日の記録値 ／ 前日比 +2,620円）"
+
+
+def test_assets_line_without_record(tmp_path, monkeypatch):
+    from datetime import date
+    from src.core import total_assets
+    monkeypatch.setattr(total_assets, "HISTORY_PATH", tmp_path / "none.json")
+    assert o._assets_line(date(2026, 10, 16), None) == "総資産: 本日の記録なし（17:30の日次レポートで記録）"

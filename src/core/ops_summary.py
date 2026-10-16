@@ -114,7 +114,25 @@ def _db_sections(today: date, full: bool) -> list[str]:
     return out
 
 
-def build(today: date, full: bool = True) -> str:
+def _assets_line(today: date, assets: dict | None) -> str:
+    """総資産の行。本体プロセス内（summary コマンド）は計算済みの値、
+    別プロセス（scripts/daily_ops_report.py）は記録値を使う（別プロセスが証券会社APIの
+    トークンを発行すると本体側のトークンが無効になるため、口座余力を取りに行かない）。"""
+    from src.core import total_assets
+    if assets is not None:
+        return total_assets.format_line(assets)
+    rec = total_assets.recorded(today)
+    if rec is None:
+        return "総資産: 本日の記録なし（17:30の日次レポートで記録）"
+    prev_date, prev = total_assets.previous_record(today)
+    tail = "本日の記録値"
+    if prev is not None:
+        d = rec - prev
+        tail += f" ／ {total_assets.change_label(today, prev_date)} {'+' if d > 0 else '-' if d < 0 else '±'}{abs(d):,.0f}円"
+    return f"総資産: {rec:,.0f}円（{tail}）"
+
+
+def build(today: date, full: bool = True, assets: dict | None = None) -> str:
     from src.core import code_version
     from src.core import config as cfg
     from src.core import reference_capital as rc
@@ -133,7 +151,7 @@ def build(today: date, full: bool = True) -> str:
     halted = '"halted": true' in (REPO / "data" / "trading_halt.json").read_text(encoding="utf-8")
     down = _auth_downtime(alerts)
 
-    out = [f"【kabu-auto 運用概要 {today}】", f"モード: {tm.description(mode)}",
+    out = [f"【kabu-auto 運用概要 {today}】", f"モード: {tm.description(mode)}", _assets_line(today, assets),
            f"コード: {code_version.describe() if code_version._state else (code_version._head_commit(REPO) or '不明') + '（HEAD）'}", "",
            _format_period(r["daily"]), _format_period(r["weekly"]), _format_period(r["monthly"]), "",
            f"本体起動: {len(starts)}回 {' '.join(starts)}",

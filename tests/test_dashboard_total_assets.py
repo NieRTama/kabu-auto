@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import src.dashboard.app as dash
+from src.core import total_assets
 from src.data.database import Position, Trade, get_session
 from src.data.market_data import upsert_ohlcv
 
@@ -14,10 +15,10 @@ from src.data.market_data import upsert_ohlcv
 def client(isolated_db, tmp_path, monkeypatch):
     dash._auth_required = False
     # 履歴ファイルは本番の data/ へ書かせない
-    monkeypatch.setattr(dash, "_TOTAL_HISTORY_PATH", tmp_path / "hist.json")
+    monkeypatch.setattr(total_assets, "HISTORY_PATH", tmp_path / "hist.json")
     monkeypatch.setattr(dash, "_order_manager", None)
     monkeypatch.setattr(dash, "_kabu_client", None)
-    monkeypatch.setattr(dash, "_wallet_cache", None)
+    monkeypatch.setattr(total_assets, "_wallet_cache", None)
     monkeypatch.setitem(dash._system_status, "mode", "paper")
     return TestClient(dash.app)
 
@@ -89,7 +90,7 @@ def test_unpriced_position_is_excluded_and_listed(client):
 
 @pytest.fixture
 def history(client):
-    return dash._TOTAL_HISTORY_PATH
+    return total_assets.HISTORY_PATH
 
 
 def test_first_day_has_no_previous_and_records_today(client, history, monkeypatch):

@@ -249,7 +249,7 @@ Windows のタスクスケジューラに `scripts\run_autostart.bat` を登録�
 | 機能 | 必要な設定（`.env`） | 内容 |
 |---|---|---|
 | 異常時アラート | `DISCORD_WEBHOOK_URL` | 大きな損失・API切断・認証切れなどを通知する |
-| 日次/週次レポート | `DISCORD_REPORT_WEBHOOK_URL`（`config.yaml` の `discord_report.enabled: true` も必要） | 平日 17:30 に日次、土曜 9:00 に週次の損益を投稿する |
+| 日次/週次レポート | `DISCORD_REPORT_WEBHOOK_URL`（`config.yaml` の `discord_report.enabled: true` も必要） | 平日 17:30 に日次、土曜 9:00 に週次の損益と総資産（前日比・基準資金比）を投稿する |
 | リモコン | `DISCORD_BOT_TOKEN` / `DISCORD_BOT_CHANNEL_ID` / `DISCORD_ALLOWED_USER_ID` | 下記のコマンドを受け付ける |
 
 ### リモコンのコマンド

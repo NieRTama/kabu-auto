@@ -38,19 +38,29 @@ def post_text(text: str) -> bool:
     return False
 
 
-def format_for_discord(mode: str, report: dict, holdings: Optional[dict] = None) -> str:
+def _insert_assets(text: str, assets_line: Optional[str]) -> str:
+    """見出し・モード行の直後に総資産の行を入れる（src/core/total_assets.format_line の出力）。"""
+    if not assets_line:
+        return text
+    lines = text.split("\n")
+    return "\n".join(lines[:2] + [assets_line] + lines[2:])
+
+
+def format_for_discord(mode: str, report: dict, holdings: Optional[dict] = None,
+                       assets_line: Optional[str] = None) -> str:
     """Discord投稿用に整形する（上限2000文字。X(280字)より余裕があるため通常は切り詰め不要）。
 
     holdings を渡すと保有建玉の評価額・含み損益も併記する。Discordは文字数に
     余裕があるため既定で付ける（Xは280字制限のため実現損益のみに留める）。
     """
-    text = format_report_text(mode, report, holdings)
+    text = _insert_assets(format_report_text(mode, report, holdings), assets_line)
     if len(text) > DISCORD_MAX_CONTENT_LENGTH:
         text = text[: DISCORD_MAX_CONTENT_LENGTH - 1] + "…"
     return text
 
 
-def format_weekly_summary(mode: str, report: dict, holdings: Optional[dict] = None) -> str:
+def format_weekly_summary(mode: str, report: dict, holdings: Optional[dict] = None,
+                          assets_line: Optional[str] = None) -> str:
     """週次サマリの投稿文を組み立てる。
 
     日次レポートは「その日」しか分からないため、週単位の成績（取引回数・勝率・損益）と
@@ -72,10 +82,11 @@ def format_weekly_summary(mode: str, report: dict, holdings: Optional[dict] = No
     if holdings is not None:
         lines.append("")
         lines.extend(_format_holdings(holdings))
-    return "\n".join(lines)
+    return _insert_assets("\n".join(lines), assets_line)
 
 
-def post_weekly_report(mode: str, reference_capital: float) -> Optional[str]:
+def post_weekly_report(mode: str, reference_capital: float,
+                       assets_line: Optional[str] = None) -> Optional[str]:
     """週次サマリを集計・整形してDiscordへ投稿する。投稿したテキストを返す。"""
     from src.core.pnl_report import build_holdings, build_report
     report = build_report(reference_capital)
@@ -84,14 +95,15 @@ def post_weekly_report(mode: str, reference_capital: float) -> Optional[str]:
     except Exception as e:
         logger.warning(f"保有状況の集計に失敗しました（損益のみ投稿します）: {e}")
         holdings = None
-    text = format_weekly_summary(mode, report, holdings)
+    text = format_weekly_summary(mode, report, holdings, assets_line)
     if len(text) > DISCORD_MAX_CONTENT_LENGTH:
         text = text[: DISCORD_MAX_CONTENT_LENGTH - 1] + "…"
     post_text(text)
     return text
 
 
-def post_daily_report(mode: str, reference_capital: float) -> Optional[str]:
+def post_daily_report(mode: str, reference_capital: float,
+                      assets_line: Optional[str] = None) -> Optional[str]:
     """日次レポートを集計・整形してDiscordへ投稿する。投稿したテキストを返す（失敗時も返す）。
 
     確定した実現損益（当日/週次/月次/総合）に加え、現在の保有建玉の評価額と
@@ -105,6 +117,6 @@ def post_daily_report(mode: str, reference_capital: float) -> Optional[str]:
         # 保有状況の取得に失敗しても、確定損益のレポートは送る（部分的な失敗で全部を落とさない）
         logger.warning(f"保有状況の集計に失敗しました（実現損益のみ投稿します）: {e}")
         holdings = None
-    text = format_for_discord(mode, report, holdings)
+    text = format_for_discord(mode, report, holdings, assets_line)
     post_text(text)
     return text

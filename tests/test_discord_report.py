@@ -76,3 +76,32 @@ class TestPostDailyReport:
         assert text is not None
         assert "ペーパー" in text
         mock_post.assert_called_once()
+
+
+# ─── 総資産の行 ───────────────────────────────────────────────────
+
+ASSETS = {"total": 492380.0, "day_change": 3160.0, "prev_label": "前日比",
+          "basis_change": -7620.0, "unpriced": [], "cash_error": None}
+
+
+class TestTotalAssetsLine:
+    def test_format_line(self):
+        from src.core.total_assets import format_line
+        assert format_line(ASSETS) == "総資産: 492,380円（前日比 +3,160円 ／ 基準資金比 -7,620円）"
+
+    def test_format_line_unavailable_says_why(self):
+        from src.core.total_assets import format_line
+        line = format_line({"total": None, "cash_error": "401 Unauthorized"})
+        assert line == "総資産: 取得不可（401 Unauthorized）"
+
+    def test_daily_report_puts_assets_after_mode(self):
+        text = discord_report.format_for_discord("paper", _report(), assets_line="総資産: 1円")
+        lines = text.split("\n")
+        assert lines[1].startswith("モード:") and lines[2] == "総資産: 1円"
+
+    def test_weekly_summary_includes_assets(self):
+        text = discord_report.format_weekly_summary("paper", _report(), assets_line="総資産: 1円")
+        assert text.split("\n")[2] == "総資産: 1円"
+
+    def test_without_assets_line_unchanged(self):
+        assert "総資産" not in discord_report.format_for_discord("paper", _report())
