@@ -132,6 +132,26 @@ def _assets_line(today: date, assets: dict | None) -> str:
     return f"総資産: {rec:,.0f}円（{tail}）"
 
 
+def _orders_brief(today: date) -> str:
+    """当日の発注を1行で（Discord の短い版用）。"""
+    from src.data.database import OrderIntent, Trade, get_session
+    day0, day1 = datetime.combine(today, time.min), datetime.combine(today, time.max)
+    with get_session() as s:
+        intents = s.scalars(select(OrderIntent).where(OrderIntent.created_at.between(day0, day1))
+                            .order_by(OrderIntent.id)).all()
+        trades = {t.intent_id: t for t in s.scalars(select(Trade).where(
+            Trade.intent_id.in_([i.id for i in intents]))).all()} if intents else {}
+    if not intents:
+        return "発注: なし"
+    items = []
+    for i in intents:
+        t = trades.get(i.id)
+        state = (f"約定@{t.filled_price:,.0f}" if t and t.filled_price else (t.status if t else i.status))
+        pnl = f" 損益{t.pnl:+,.0f}" if t and t.pnl is not None else ""
+        items.append(f"{i.side} {i.symbol} {i.target_quantity}株 {state}{pnl}")
+    return f"発注: {len(intents)}件（{'、'.join(items)}）"
+
+
 def build(today: date, full: bool = True, assets: dict | None = None) -> str:
     from src.core import code_version
     from src.core import config as cfg
@@ -150,6 +170,22 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
     starts = [l[11:16] for l in _log_lines(f"kabu_auto_{today}.log") if "kabu-auto 起動完了" in l]
     halted = '"halted": true' in (REPO / "data" / "trading_halt.json").read_text(encoding="utf-8")
     down = _auth_downtime(alerts)
+
+    if not full:
+        # Discord 向けの短い版。詳細は同日のファイル（scripts/daily_ops_report.py が作成）に残る
+        try:
+            orders = _orders_brief(today)
+        except Exception as e:
+            orders = f"発注: 集計失敗（{e}）"
+        return "\n".join([
+            f"【kabu-auto 運用概要 {today}】",
+            _assets_line(today, assets),
+            f"{_format_period(r['daily'])} ／ {_format_period(r['monthly'])}",
+            orders,
+            f"認証切れ: {' / '.join(down) or 'なし'} ／ 取引停止: {'はい' if halted else 'いいえ'}",
+            f"ERROR {sum(errors.values())}件 ／ ALERT {len(alerts)}件",
+            f"詳細: log/ops_daily/ops_daily_{today}.md",
+        ])
 
     out = [f"【kabu-auto 運用概要 {today}】", f"モード: {tm.description(mode)}", _assets_line(today, assets),
            f"コード: {code_version.describe() if code_version._state else (code_version._head_commit(REPO) or '不明') + '（HEAD）'}", "",

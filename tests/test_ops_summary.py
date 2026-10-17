@@ -40,3 +40,20 @@ def test_assets_line_without_record(tmp_path, monkeypatch):
     from src.core import total_assets
     monkeypatch.setattr(total_assets, "HISTORY_PATH", tmp_path / "none.json")
     assert o._assets_line(date(2026, 10, 16), None) == "総資産: 本日の記録なし（17:30の日次レポートで記録）"
+
+
+# ─── Discord 向けの短い版 ───────────────────────────────────────────
+
+def test_short_version_is_brief_and_points_to_file(isolated_db, tmp_path, monkeypatch):
+    from datetime import date
+    from src.core import total_assets
+    monkeypatch.setattr(total_assets, "HISTORY_PATH", tmp_path / "h.json")
+    text = o.build(date(2026, 10, 16), full=False,
+                   assets={"total": 1000.0, "day_change": None, "basis_change": None, "unpriced": []})
+    lines = text.split("\n")
+    assert len(lines) <= 8
+    assert lines[0] == "【kabu-auto 運用概要 2026-10-16】"
+    assert lines[1] == "総資産: 1,000円"
+    assert "発注: なし" in text and "取引停止:" in text and "ERROR" in text
+    assert lines[-1] == "詳細: log/ops_daily/ops_daily_2026-10-16.md"
+    assert "▼" not in text  # 詳細版の節（ALERT全文など）は含めない

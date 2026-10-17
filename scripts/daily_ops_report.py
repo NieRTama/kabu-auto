@@ -29,6 +29,6 @@ if __name__ == "__main__":
     print(text)
     try:
         from src.core.discord_report import post_text
-        post_text(text[:1990])
+        post_text(build(today, full=False))  # Discord には短い版（詳細はファイル）
     except Exception as e:  # 通知失敗でもファイルは残す
         print(f"(Discord投稿失敗: {e})")
