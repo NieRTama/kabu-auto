@@ -48,6 +48,8 @@ def test_short_version_is_brief_and_points_to_file(isolated_db, tmp_path, monkey
     from datetime import date
     from src.core import total_assets
     monkeypatch.setattr(total_assets, "HISTORY_PATH", tmp_path / "h.json")
+    # 本番のログ・状態ファイル（git管理外）が無い環境（CI）と同じ条件にする
+    monkeypatch.setattr(o, "REPO", tmp_path)
     text = o.build(date(2026, 10, 16), full=False,
                    assets={"total": 1000.0, "day_change": None, "basis_change": None, "unpriced": []})
     lines = text.split("\n")

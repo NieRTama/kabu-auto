@@ -168,7 +168,11 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
     alerts = _alerts(warn)
     errors = _error_kinds(warn)
     starts = [l[11:16] for l in _log_lines(f"kabu_auto_{today}.log") if "kabu-auto 起動完了" in l]
-    halted = '"halted": true' in (REPO / "data" / "trading_halt.json").read_text(encoding="utf-8")
+    # 停止状態は halt モジュール経由で読む（本体プロセス内は本体の状態、別プロセスはファイル。
+    # ファイルが無い環境では非停止）。2026-10-17 まで data/trading_halt.json を直接読んでおり、
+    # ファイルの無い CI で FileNotFoundError になっていた
+    from src.core import halt
+    halted = halt.is_halted()
     down = _auth_downtime(alerts)
 
     if not full:
