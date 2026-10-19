@@ -53,9 +53,14 @@ def is_console_disconnected() -> Optional[str]:
         logger.warning(f"セッション状態の確認に失敗しました: {e}")
         return None
 
-    if result.returncode != 0:
+    # 終了コードでは判定しない。実機の query session は正常な一覧を出しても rc=1 を返す
+    # （2026-10-19 実測。セッションが切断中の状態で発生）。rc で結果を捨てていたため
+    # 切断を検知できず、8:30 の完全自動ログインが「前面: Idle」で失敗した。
+    # 一覧（ユーザー名の行）が読めれば判定し、出力が空のときだけ判定不能とする。
+    if not (result.stdout or "").strip():
         logger.warning(
-            f"query session が異常終了しました（判定不能扱い）: rc={result.returncode}"
+            f"query session の出力が空です（判定不能扱い）: rc={result.returncode} "
+            f"stderr={(result.stderr or '').strip()[:200]}"
         )
         return None
 

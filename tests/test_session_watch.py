@@ -50,7 +50,21 @@ class TestIsConsoleDisconnected:
              patch.object(sw.subprocess, "run", return_value=_run_result(QUERY_SESSION_NO_MATCH)):
             assert sw.is_console_disconnected() is None
 
-    def test_returns_none_on_nonzero_exit(self):
+    def test_detects_disconnect_even_when_exit_code_is_1(self):
+        """実機の query session は正常な一覧を出しても終了コード1を返す（2026-10-19 実測）。
+        終了コードで判定して結果を捨てていたため、切断を検知できず自動ログインが失敗した。"""
+        real_output = "\n".join([
+            " セッション名      ユーザー名               ID  状態    種類        デバイス ",
+            " services                                    0  Disc                        ",
+            ">                  garnet                    1  Disc                        ",
+            " console                                     2  Conn                        ",
+            " rdp-tcp                                 65537  Listen                      ",
+        ]) + "\n"
+        with patch.object(sw.os, "environ", {"USERNAME": "garnet"}), \
+             patch.object(sw.subprocess, "run", return_value=_run_result(real_output, returncode=1)):
+            assert sw.is_console_disconnected() == "1"
+
+    def test_returns_none_on_nonzero_exit_without_output(self):
         with patch.object(sw.os, "environ", {"USERNAME": "garnet"}), \
              patch.object(sw.subprocess, "run", return_value=_run_result("", returncode=1)):
             assert sw.is_console_disconnected() is None
