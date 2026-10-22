@@ -228,6 +228,14 @@ def _save_signal(sig: TradeSignal, data_as_of: Optional[date] = None) -> None:
         session.commit()
 
 
+# 退出理由ごとの通知タイトル（RiskManager.evaluate_exit の reason）
+_EXIT_LABELS = {
+    "stop_loss": "損切り",
+    "trailing_stop": "利益確定（トレーリングストップ）",
+    "time_stop": "保有期限による入れ替え",
+}
+
+
 class TradingServices:
     """スケジューラに登録される取引ジョブ群。依存と可変modelを保持する。"""
 
@@ -531,49 +539,68 @@ class TradingServices:
                 if not price:
                     continue
                 should_exit, exit_reason = self.risk.evaluate_exit(sym, price)
-                if should_exit:
-                    logger.warning(f"退出発動: {sym} ({exit_reason})")
-                    label = "利益確定（トレーリングストップ）" if exit_reason == "trailing_stop" else "損切り"
-                    if is_paper and self._paper_uses_v2_execution():
-                        # v2: 日足の終値/始値で判断した直後に同じ価格帯で約定させない。
-                        # signal_scan のSELL経路と同じ合流先（Signal保存）に載せ、
-                        # 翌営業日の morning_execution が実際の退出発注（sell）を行う。
-                        # ここでは sell_market を呼ばない（判断と執行のセッションを分ける）。
-                        _save_signal(TradeSignal(
-                            symbol=sym,
-                            action="SELL",
-                            rule_score=0.0,
-                            ml_score=0.0,
-                            combined_score=0.0,
-                        ))
-                        logger.warning(
-                            f"退出シグナル保存（翌営業日執行予定）: {sym} reason={exit_reason}"
-                        )
-                        alert(
-                            f"{label}判定（翌営業日寄りで執行予定）",
-                            f"{sym} @{price:.0f}円 が退出条件（{exit_reason}）に達しました。"
-                            "翌営業日の寄りで退出注文を出します。",
-                            level=LEVEL_INFO,
-                        )
-                        continue
-                    # 損切り・トレーリングストップとも確実な約定を優先し成行で発注する
-                    # （指値だと急変時に約定しない）。reason経由で日次上限・損失上限等の
-                    # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
-                    order_id = self.order_mgr.sell_market(sym, qty, reason=exit_reason)
-                    if order_id:
-                        alert(f"{label}実行", f"{sym} @{price:.0f}円", level=LEVEL_INFO)
-                    else:
-                        # 発注が拒否されても「実行」と通知していた（2026-09-08 に発生）。
-                        # 9432 の利確が Code 100378 で失敗したのに🟢が飛び、
-                        # **売れたと誤認したまま無防備な建玉を持ち続ける**状態になった。
-                        # 退出できないのは損失に直結するので critical で知らせる。
-                        alert(
-                            f"{label}に失敗しました（建玉は残っています）",
-                            f"{sym} {qty}株 @{price:.0f}円 の退出注文が拒否されました。"
-                            "ログを確認し、必要なら証券会社の画面から手動で決済してください。",
-                        )
+                if not should_exit:
+                    self._maybe_partial_take(sym, price, is_paper)
+                    continue
+                logger.warning(f"退出発動: {sym} ({exit_reason})")
+                label = _EXIT_LABELS.get(exit_reason, "損切り")
+                if is_paper and self._paper_uses_v2_execution():
+                    # v2: 日足の終値/始値で判断した直後に同じ価格帯で約定させない。
+                    # signal_scan のSELL経路と同じ合流先（Signal保存）に載せ、
+                    # 翌営業日の morning_execution が実際の退出発注（sell）を行う。
+                    # ここでは sell_market を呼ばない（判断と執行のセッションを分ける）。
+                    _save_signal(TradeSignal(
+                        symbol=sym,
+                        action="SELL",
+                        rule_score=0.0,
+                        ml_score=0.0,
+                        combined_score=0.0,
+                    ))
+                    logger.warning(
+                        f"退出シグナル保存（翌営業日執行予定）: {sym} reason={exit_reason}"
+                    )
+                    alert(
+                        f"{label}判定（翌営業日寄りで執行予定）",
+                        f"{sym} @{price:.0f}円 が退出条件（{exit_reason}）に達しました。"
+                        "翌営業日の寄りで退出注文を出します。",
+                        level=LEVEL_INFO,
+                    )
+                    continue
+                # 損切り・トレーリングストップとも確実な約定を優先し成行で発注する
+                # （指値だと急変時に約定しない）。reason経由で日次上限・損失上限等の
+                # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
+                order_id = self.order_mgr.sell_market(sym, qty, reason=exit_reason)
+                if order_id:
+                    alert(f"{label}実行", f"{sym} @{price:.0f}円", level=LEVEL_INFO)
+                else:
+                    # 発注が拒否されても「実行」と通知していた（2026-09-08 に発生）。
+                    # 9432 の利確が Code 100378 で失敗したのに🟢が飛び、
+                    # **売れたと誤認したまま無防備な建玉を持ち続ける**状態になった。
+                    # 退出できないのは損失に直結するので critical で知らせる。
+                    alert(
+                        f"{label}に失敗しました（建玉は残っています）",
+                        f"{sym} {qty}株 @{price:.0f}円 の退出注文が拒否されました。"
+                        "ログを確認し、必要なら証券会社の画面から手動で決済してください。",
+                    )
             except Exception as e:
                 logger.error(f"損切りチェックエラー: {sym} {e}")
+
+    def _maybe_partial_take(self, sym: str, price: float, is_paper: bool) -> None:
+        """含み益が一定以上なら保有の一部を売って現金を作る（残りはトレーリングで伸ばす）。"""
+        if is_paper and self._paper_uses_v2_execution():
+            # ponytail: v2ペーパーはSELLシグナル経由で全量退出しかできないため一部利確は未対応
+            return
+        qty = self.risk.partial_take_qty(sym, price)
+        if qty <= 0:
+            return
+        order_id = self.order_mgr.sell_market(sym, qty, reason="partial_take_profit")
+        if order_id:
+            self.risk.mark_partial_taken(sym)
+            alert("一部利確実行", f"{sym} {qty}株 @{price:.0f}円", level=LEVEL_INFO)
+        else:
+            alert("一部利確に失敗しました（建玉は残っています）",
+                  f"{sym} {qty}株 @{price:.0f}円 の売り注文が拒否されました。ログを確認してください。",
+                  level=LEVEL_WARNING)
 
     # ─── シグナルスキャン ───────────────────────────────
     def signal_scan(self) -> None:

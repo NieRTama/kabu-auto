@@ -100,8 +100,13 @@ def rebuild_position(session, symbol: str, sector: Optional[str] = None) -> Opti
         # トレーリングストップ用のピーク値（src/risk/manager.py の evaluate_exit が使う）。
         # 完全決済でNoneに戻し、再エントリー時はその時点のavg_costで再初期化する
         # （前サイクルの古いピークを引き継いで誤判定しないようにする）。
+        # 一部利確フラグも同じく保有サイクル単位。保有開始日は再エントリーで更新する
+        # （従来は行を作った最初の日のまま残り、9434が9/08建てと表示されていた）。
         if total_qty <= 0:
             pos.peak_price = None
+            pos.partial_taken = False
         elif was_closed:
             pos.peak_price = avg_cost
+            pos.partial_taken = False
+            pos.opened_at = clock.now()
     return pos

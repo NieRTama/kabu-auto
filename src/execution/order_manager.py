@@ -29,6 +29,10 @@ from src.execution.broker_gateway import BrokerGateway
 from src.risk.manager import RiskManager
 
 
+# 既存リスクを減らす退出操作の reason（sell_market で新規発注ゲートをバイパスする）
+EXIT_REASONS = ("stop_loss", "trailing_stop", "time_stop", "partial_take_profit", "emergency")
+
+
 class OrderManager:
     def __init__(self, client: KabuClient, risk: RiskManager):
         # ブローカーAPIとの境界（発注ペイロード構築・送信・取消・照会）はここに集約する（C3）。
@@ -511,7 +515,8 @@ class OrderManager:
         reason:
           - "normal":    通常の売却。新規発注と同じリスクゲート（日次上限・損失上限・
                          未解決注文ガード・同銘柄pending重複）を適用する。
-          - "stop_loss" / "trailing_stop" / "emergency": 既存リスクを減らす退出操作なので、
+          - "stop_loss" / "trailing_stop" / "time_stop" / "partial_take_profit" / "emergency":
+                         既存リスクを減らす退出操作なので、
                          新規発注用のゲートは適用しない（日次上限/損失上限到達中でも・
                          未解決注文が残っていても、退出だけは止めない）。trailing_stopは
                          ピーク値からの下落・ブレークイーブン到達による利益確定/保全の退出
@@ -520,7 +525,7 @@ class OrderManager:
         """
         if quantity <= 0:
             return None
-        is_exit = reason in ("stop_loss", "trailing_stop", "emergency")
+        is_exit = reason in EXIT_REASONS
         # OrderIntent.source へ記録する発注のきっかけ（4.2）。reasonを直接転記する。
         source = reason if is_exit else "manual"
         # 退出系は理由が明確な根拠なので、明示指定が無ければ reason を根拠として記録する（7.6）。
@@ -531,6 +536,8 @@ class OrderManager:
             rationale = {
                 "stop_loss": "損切り（stop_loss）",
                 "trailing_stop": "利益確定（トレーリングストップ/ブレークイーブン）",
+                "time_stop": "保有期限（動かない銘柄の入れ替え）",
+                "partial_take_profit": "一部利確（partial_take_profit）",
                 "emergency": "緊急決済（emergency）",
             }.get(reason, f"退出（{reason}）")
 

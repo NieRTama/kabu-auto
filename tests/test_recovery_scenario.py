@@ -143,3 +143,32 @@ class TestAuthValidNow:
         def fail():
             raise RuntimeError("401")
         assert bw.auth_valid_now(fail) is False
+
+
+class TestDownNoticeBeforeMorningLogin:
+    """2026-10-22 の再現: KabuS が夜のうちに終了していると、08:24 に🔴「起動していません」が
+    出ていた。完全自動ログインが有効なら 08:30 の定時ジョブが起動からやり直すため、
+    08:40（日中の自動復帰を始める時刻）より前のプロセス断は通知しない。"""
+
+    def _alerts(self, broker, times, notifier):
+        sent = []
+        for hh, mm in times:
+            bw.recovery_tick(
+                refresh_token=broker.refresh_token, on_recovered=lambda: None,
+                probe_running=lambda: broker.alive, now=datetime(2026, 10, 13, hh, mm),
+                runtime=RUNTIME, launch_broker=lambda: (False, "auto_launch無効"),
+                full_login=lambda: (False, "失敗"), notifier=notifier,
+                alert=lambda *a, **k: sent.append((hh, mm, a[0])), monotonic=float(hh * 3600 + mm * 60),
+            )
+        return sent
+
+    def test_no_down_notice_before_0840_when_full_login_enabled(self):
+        broker = FakeBroker(alive=False)
+        sent = self._alerts(broker, [(8, 4), (8, 9), (8, 14), (8, 19), (8, 24), (8, 29), (8, 34)],
+                            bw.BrokerDownNotifier())
+        assert sent == []
+
+    def test_still_notifies_if_down_after_0840(self):
+        broker = FakeBroker(alive=False)
+        sent = self._alerts(broker, [(8, 44)], bw.BrokerDownNotifier())
+        assert any(t == "kabuステーションが起動していません" for _, _, t in sent)

@@ -17,7 +17,7 @@ from src.core import broker_auth
 from src.core import clock
 from src.core import config as cfg
 from src.core import halt
-from src.data.database import Position, Trade, get_session
+from src.data.database import Fill, Position, Trade, get_session
 from src.data.market_data import latest_closes
 from src.execution import order_status as st
 
@@ -574,7 +574,58 @@ class RiskManager:
             label = "トレーリングストップ/ブレークイーブン到達" if armed else "損切りライン到達"
             logger.warning(f"{label}: {symbol} 損益率={pnl_pct:.2%} ピーク以降の最高値={peak:.0f}")
             return True, reason
+        if self._is_stale(symbol, avg_cost, current_price):
+            return True, "time_stop"
         return False, ""
+
+    def _is_stale(self, symbol: str, avg_cost: float, current_price: float) -> bool:
+        """保有期限（time_stop）: time_stop_days 以上保有して含み益率が
+        time_stop_min_gain_pct 未満なら、動かない銘柄として退出対象にする。
+
+        損失側も含める（「戻るまで待つ」で資金を寝かせない）。保有開始は残ロットのうち
+        最古のBUY約定日。Position.opened_at は旧実装で再エントリー時に更新されず
+        古いまま残っている行があるため使わない。time_stop_days が0なら無効。
+        """
+        days = self._conf.get("time_stop_days", 0)
+        if days <= 0:
+            return False
+        gain = (current_price - avg_cost) / avg_cost
+        if gain >= self._conf.get("time_stop_min_gain_pct", 0.0):
+            return False
+        with get_session() as session:
+            start = session.scalar(select(func.min(Fill.filled_at)).where(
+                Fill.symbol == symbol, Fill.side == "BUY", Fill.remaining_qty > 0))
+        if start is None or (clock.now() - start).days < days:
+            return False
+        logger.warning(f"保有期限到達: {symbol} 保有開始={start:%Y-%m-%d} 損益率={gain:.2%}")
+        return True
+
+    def partial_take_qty(self, symbol: str, current_price: float) -> int:
+        """一部利確で売る株数（0なら売らない）。
+
+        含み益率が partial_take_profit_pct 以上で、今の保有サイクルでまだ一部利確して
+        いなければ、保有の partial_take_profit_ratio を単元単位で切り捨てた株数。
+        100株しか持っていない銘柄は分割できないので0（トレーリングストップに任せる）。
+        """
+        pct = self._conf.get("partial_take_profit_pct", 0.0)
+        if pct <= 0:
+            return 0
+        with get_session() as session:
+            pos = session.scalar(select(Position).where(Position.symbol == symbol))
+            if pos is None or pos.avg_cost <= 0 or pos.quantity <= 0 or pos.partial_taken:
+                return 0
+            if (current_price - pos.avg_cost) / pos.avg_cost < pct:
+                return 0
+            ratio = self._conf.get("partial_take_profit_ratio", 0.5)
+            return int(pos.quantity * ratio) // LOT_SIZE * LOT_SIZE
+
+    def mark_partial_taken(self, symbol: str) -> None:
+        """一部利確の注文が通ったことを記録する（同じサイクルで繰り返さない）。"""
+        with get_session() as session:
+            pos = session.scalar(select(Position).where(Position.symbol == symbol))
+            if pos is not None:
+                pos.partial_taken = True
+                session.commit()
 
     def validate_buy(self, symbol: str, price: float,
                      cash_balance: float, sector: Optional[str] = None) -> tuple[bool, str]:

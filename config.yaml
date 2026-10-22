@@ -23,6 +23,15 @@ trading:
   # 保有ポジションの回転を速め、同時保有枠（max_positions）の空きを早く作る狙い。
   breakeven_trigger_pct: 0.02  # 含み益+2%でブレークイーブン発動
   trailing_stop_pct: 0.04      # 発動後はピークから-4%で利益確定
+  # 2026-10-21: 利確を早めずに現金を作るための2機能（0で無効）。
+  # 保有期限: 保有から time_stop_days 日（暦日）たっても含み益が time_stop_min_gain_pct 未満
+  # （損失側も含む）なら、動かない銘柄として全量売って次のシグナルに資金を回す。
+  time_stop_days: 14
+  time_stop_min_gain_pct: 0.02
+  # 一部利確: 含み益が partial_take_profit_pct に達したら保有の partial_take_profit_ratio を
+  # 単元単位で売り、残りはトレーリングストップで伸ばす（1保有サイクル1回。100株保有は対象外）。
+  partial_take_profit_pct: 0.05
+  partial_take_profit_ratio: 0.5
   max_sector_ratio: 0.40  # 同一セクター最大集中率
   order_timeout_seconds: 300  # 未約定注文のキャンセルまでの秒数
   daily_order_limit: 100  # 1日の最大注文数

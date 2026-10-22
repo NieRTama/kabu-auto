@@ -88,7 +88,7 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 
 ライブ時の余力は注文ごとに毎回APIで取得し直すため、複数銘柄に買いが入るたびに残り余力は減っていく。
 
-## 3. 売り条件（2種類が独立して動く）
+## 3. 売り条件（5種類が独立して動く）
 
 ### ① シグナルベースの売り
 
@@ -104,6 +104,14 @@ combined_score = rule_score × rule_weight + ml_score × ml_weight
 ### ③ ブレークイーブン・トレーリングストップ
 
 `config.yaml` の `breakeven_trigger_pct: 0.02` / `trailing_stop_pct: 0.04`。保有開始後のピーク含み益率が +2% に達すると、損切りラインを取得単価まで引き上げ、以後はピーク価格から −4% 下落した時点でも売却する。判定は②と同じ5分間隔のジョブで行う。
+
+### ④ 保有期限（time_stop）
+
+`config.yaml` の `time_stop_days: 14` / `time_stop_min_gain_pct: 0.02`。保有開始（残っている買い約定の最も古い日）から14日以上たって含み益率が +2% 未満（損失側を含む）なら、成行で全量売却して資金を次のシグナルに回す。判定は②と同じ5分間隔のジョブで行う。
+
+### ⑤ 一部利確（partial_take_profit）
+
+`config.yaml` の `partial_take_profit_pct: 0.05` / `partial_take_profit_ratio: 0.5`。含み益率が +5% に達したら、保有の半分（100株単位で切り捨て）を成行で売る。1回の保有につき1回だけで、残りは③のトレーリングストップに任せる。100株しか保有していない銘柄は分割できないため対象外。
 
 ## まとめ：ハイリスク・ハイリターン設定の場合（余力50万円の例）
 

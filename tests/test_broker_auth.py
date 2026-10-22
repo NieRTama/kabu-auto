@@ -163,7 +163,8 @@ class TestExitNotBlocked:
         import inspect
         import src.execution.order_manager as mod
         src = inspect.getsource(mod.OrderManager.sell_market)
-        assert 'is_exit = reason in ("stop_loss", "trailing_stop", "emergency")' in src
+        assert "is_exit = reason in EXIT_REASONS" in src
+        assert {"stop_loss", "trailing_stop", "emergency"} <= set(mod.EXIT_REASONS)
         assert "if not is_exit:" in src, (
             "退出系が can_place_order() ゲートをバイパスする構造が壊れている"
         )

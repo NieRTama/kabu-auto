@@ -339,6 +339,10 @@ LAN の他の端末から開く設定（`host: "0.0.0.0"`、既定）では、�
 trading:
   breakeven_trigger_pct: 0.02  # 含み益が+2%に届いたら、損切りラインを建値へ引き上げる（0で無効）
   trailing_stop_pct: 0.04      # その後、ピークから-4%下がったら利益を確定する（0で無効）
+  time_stop_days: 14           # 保有から14日（暦日）たっても含み益が下の値未満なら全量売って資金を回す（0で無効）
+  time_stop_min_gain_pct: 0.02 # 保有期限の判定に使う含み益率（損失側も含む）
+  partial_take_profit_pct: 0.05   # 含み益+5%で保有の一部を売る（1保有につき1回。100株保有は対象外。0で無効）
+  partial_take_profit_ratio: 0.5  # 一部利確で売る割合（100株単位で切り捨て。残りはトレーリングストップで伸ばす）
   order_timeout_seconds: 300   # 約定しない注文を取り消すまでの秒数
   daily_order_limit: 100       # 1日の最大注文数
   paper_initial_capital: 500000  # paper の初期資金

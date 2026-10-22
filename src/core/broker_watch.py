@@ -257,8 +257,13 @@ def recovery_tick(*, refresh_token: Callable[[], object],
             # この経路を使った回はそれに乗せるため、以降の判定では auto_launch=True 扱いにする。
             auto_launch = True
 
+    # 完全自動ログインが有効なら、08:40 より前のプロセス断は通知しない。08:30 の定時ジョブが
+    # 起動からやり直すため、夜のうちに KabuS が終了していても対応は不要
+    # （2026-10-22 に 08:24 の🔴が出ていた）。08:40 以降も落ちていれば通常どおり通知する。
+    notify_window = in_window and not (
+        full_login_enabled and now.time() < FULL_LOGIN_RECOVERY_FROM)
     notice = notifier.check(
-        alive=alive, now=monotonic, notify_window=in_window,
+        alive=alive, now=monotonic, notify_window=notify_window,
         auto_launch=auto_launch, launch_result=launch_result,
     )
     if notice:
