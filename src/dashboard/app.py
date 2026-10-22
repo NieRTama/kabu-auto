@@ -44,6 +44,7 @@ app = FastAPI(title="kabu-auto Dashboard")
 _order_manager = None
 _ml_retrain_fn = None
 _data_update_fn = None
+_signal_scan_fn = None
 _kabu_client = None
 _emergency_token: Optional[str] = None
 _dashboard_token: Optional[str] = None
@@ -249,6 +250,11 @@ def set_ml_retrain_fn(fn) -> None:
 def set_data_update_fn(fn) -> None:
     global _data_update_fn
     _data_update_fn = fn
+
+
+def set_signal_scan_fn(fn) -> None:
+    global _signal_scan_fn
+    _signal_scan_fn = fn
 
 
 def set_kabu_client(client) -> None:
@@ -1179,6 +1185,23 @@ async def retrain_model():
         logger.error(f"手動再学習失敗: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     return {"status": "ok", "message": "再学習が完了しました"}
+
+
+@app.post("/api/signal_scan")
+async def run_signal_scan():
+    """シグナルスキャン（通常は平日16:20）を手動で実行する。
+
+    16:20 の定時実行が空振りしたとき（2026-10-22: 再起動で鮮度の記録が消え全銘柄が除外）に、
+    翌朝の発注対象を作り直すためのもの。live は Signal を保存するだけで発注しない。
+    """
+    if _signal_scan_fn is None:
+        raise HTTPException(status_code=503, detail="シグナルスキャン関数が設定されていません")
+    try:
+        await asyncio.to_thread(_signal_scan_fn)
+    except Exception as e:
+        logger.error(f"シグナルスキャン失敗: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", "message": "シグナルスキャンが完了しました"}
 
 
 @app.post("/api/data/update")

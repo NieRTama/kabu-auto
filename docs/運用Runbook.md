@@ -146,6 +146,21 @@ curl -X POST http://localhost:8080/api/emergency_close -H "X-Emergency-Token: <T
 
 照合ジョブ（15秒毎の `reconcile_orders`）は API障害時に例外を捕捉して次回再試行する。未約定注文は OPEN のまま残り、復旧後の照合で収束する。
 
+### 5.1 16:20 のシグナルスキャンが空振りした（🟡「新規シグナル0件」）
+
+症状: 🟡「新規シグナル0件 — 全N銘柄が鮮度不足で新規候補から除外されました（batch=…）」。翌朝 9:05 の発注対象（BUY・SELL シグナル）が作られていない。
+
+1. `log/kabu_auto_YYYY-MM-DD.log` の 16:00 前後で「データ更新: … 状態=fresh」「データ更新完了」を確認する。データ更新自体が失敗していれば、先に `POST /api/data/update` で取り直す。
+2. シグナルスキャンを手動で実行する（ダッシュボードの認証が必要。live は Signal を保存するだけで発注しない）:
+
+```bash
+curl -X POST http://localhost:8080/api/signal_scan -H "X-API-Token: <TOKEN>"
+```
+
+3. ログの「シグナルスキャン開始… batch=…」以降で候補が保存されたことを確認する。
+
+再起動直後でも 1.15.11.a 以降は DB の最終足から鮮度を復元するため、16:00〜16:20 の間の再起動では起きない。
+
 ---
 
 ## 6. 約定不明・部分約定・残注文（UNKNOWN / CANCEL_FAILED）
@@ -273,6 +288,7 @@ powershell -File scripts\backup_state.ps1 -NoSecrets   # .env / auth.json を含
 | 起動以来一度も取得できていません | 認証切れのまま起動したか接続先の誤り。§4 → §5 |
 | 建玉ドリフト検知 | §7 |
 | 未解決注文が残っています | §6 |
+| 🟡 新規シグナル0件（鮮度不足） | §5.1 |
 
 Discord コマンドの一覧は `@kabu-auto help`。当日の運用概要は `@kabu-auto summary`。
 

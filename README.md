@@ -455,6 +455,7 @@ powershell -File scripts\backup_state.ps1 -Dest "G:\backup" -Keep 14
 | GET | `/api/model/metrics` / `/api/model/latest` | MLモデルの精度履歴 / 最新の学習結果 |
 | POST | `/api/model/retrain` | MLモデルを再学習 |
 | POST | `/api/data/update` | 過去データを取得 |
+| POST | `/api/signal_scan` | シグナルスキャンを手動実行（16:20 の定時実行が空振りしたとき） |
 | GET / POST | `/api/watchlist` | アクティブなリストの銘柄一覧 / 追加 |
 | DELETE | `/api/watchlist/{code}` | 銘柄を削除 |
 | GET / POST | `/api/watchlists` | リスト一覧 / 新規作成 |

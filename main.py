@@ -38,7 +38,7 @@ from src.risk.manager import RiskManager
 from src.strategy import ml_model
 from src.services.trading import TradingServices, _select_latest_signals  # noqa: F401  (テスト互換のため再エクスポート)
 from src.dashboard.app import (
-    app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn,
+    app as dashboard_app, set_order_manager, set_ml_retrain_fn, set_data_update_fn, set_signal_scan_fn,
     set_kabu_client, update_status, _get_lan_ip, get_emergency_token,
 )
 
@@ -470,6 +470,7 @@ def main() -> None:
 
     set_ml_retrain_fn(services.ml_retrain)
     set_data_update_fn(services.data_update)
+    set_signal_scan_fn(services.signal_scan)
 
     # ─── Discordリモコン（任意。未設定なら無効）──────────────
     # 外出先からの状態確認・緊急停止用。秘密情報は運ばせない方針のため、

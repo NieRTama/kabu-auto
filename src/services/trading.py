@@ -284,6 +284,25 @@ class TradingServices:
         )
         return states
 
+    def _restore_bar_states_from_db(self, codes: list[str]) -> None:
+        """鮮度の記録が無いとき（再起動直後など）、DBに保存済みの最終足から判定し直す。
+
+        _bar_states は data_update を実行したプロセスのメモリにしか無い。2026-10-22 は
+        16:00 のデータ更新（旧プロセス）の後に 16:08 で再起動したため、16:20 の
+        signal_scan で全59銘柄が鮮度不足として除外された。判定基準は data_update と同じ
+        bar_status.classify（DBの最終足の営業日を、今確定しているべき営業日と突き合わせる）。
+        """
+        from src.data.market_data import _last_stored_session
+        now = clock.now()
+        states = {sym: bar_status.classify(sym, _last_stored_session(sym), now) for sym in codes}
+        self._bar_states = states
+        self._data_batch_id = f"restored-{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:8]}"
+        fresh = sum(1 for st in states.values() if st.state == "fresh")
+        logger.warning(
+            f"鮮度の記録が無いため（再起動直後など）DBの最終足から復元しました: "
+            f"batch={self._data_batch_id} 対象={len(states)}銘柄 確定={fresh}"
+        )
+
     def _is_fresh_for_new_candidate(self, symbol: str) -> bool:
         """この銘柄を新規候補として扱ってよいか。
 
@@ -615,6 +634,8 @@ class TradingServices:
                 f"シグナルスキャン省略: 本日は休場です（{market_calendar.holiday_name(clock.today())}）"
             )
             return
+        if not self._bar_states:
+            self._restore_bar_states_from_db(watchlist_store.get_all_codes())
         logger.info(f"シグナルスキャン開始... batch={self._data_batch_id}")
         is_paper = self.trading_conf.get("mode", "paper") == "paper"
         sectors = watchlist_store.get_sectors()
