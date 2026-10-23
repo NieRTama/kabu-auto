@@ -150,6 +150,12 @@ def _get_position_qty(symbol: str) -> int:
     return qty
 
 
+def _position_avg_cost(symbol: str) -> Optional[float]:
+    with get_session() as session:
+        pos = session.scalar(select(Position).where(Position.symbol == symbol))
+        return pos.avg_cost if pos and pos.avg_cost else None
+
+
 def _held_symbols() -> list[str]:
     """現在保有している全銘柄コード（ウォッチリストの所属・アクティブ切替に関わらず）。
 
@@ -234,6 +240,15 @@ _EXIT_LABELS = {
     "trailing_stop": "利益確定（トレーリングストップ）",
     "time_stop": "保有期限による入れ替え",
 }
+
+
+def _exit_label(reason: str, price: float, avg_cost: Optional[float]) -> str:
+    """退出通知の見出し。trailing_stop はブレークイーブン（建値ストップ）も含むため、
+    売値が取得単価以下なら「建値で撤退」と表示する（2026-10-23、9434 が -60円で
+    「利益確定」と通知された）。表示だけで、売買ルールは変えない。"""
+    if reason == "trailing_stop" and avg_cost and price <= avg_cost:
+        return "建値で撤退（ブレークイーブン）"
+    return _EXIT_LABELS.get(reason, "損切り")
 
 
 class TradingServices:
@@ -562,7 +577,8 @@ class TradingServices:
                     self._maybe_partial_take(sym, price, is_paper)
                     continue
                 logger.warning(f"退出発動: {sym} ({exit_reason})")
-                label = _EXIT_LABELS.get(exit_reason, "損切り")
+                avg_cost = _position_avg_cost(sym)
+                label = _exit_label(exit_reason, price, avg_cost)
                 if is_paper and self._paper_uses_v2_execution():
                     # v2: 日足の終値/始値で判断した直後に同じ価格帯で約定させない。
                     # signal_scan のSELL経路と同じ合流先（Signal保存）に載せ、
@@ -590,7 +606,8 @@ class TradingServices:
                 # 新規発注ゲートをバイパスする（既存リスクを減らす退出操作のため止めない）
                 order_id = self.order_mgr.sell_market(sym, qty, reason=exit_reason)
                 if order_id:
-                    alert(f"{label}実行", f"{sym} @{price:.0f}円", level=LEVEL_INFO)
+                    cost = f"（取得 {avg_cost:,.1f}円）" if avg_cost else ""
+                    alert(f"{label}実行", f"{sym} @{price:.0f}円{cost}", level=LEVEL_INFO)
                 else:
                     # 発注が拒否されても「実行」と通知していた（2026-09-08 に発生）。
                     # 9432 の利確が Code 100378 で失敗したのに🟢が飛び、
