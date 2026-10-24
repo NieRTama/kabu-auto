@@ -291,6 +291,8 @@ powershell -File scripts\backup_state.ps1 -NoSecrets   # .env / auth.json を含
 | 未解決注文が残っています | §6 |
 | 🟡 新規シグナル0件（鮮度不足） | §5.1 |
 
+退出の🟢通知の見出し: 「損切り実行」「利益確定（トレーリングストップ）実行」「建値で撤退（ブレークイーブン）実行」（売値が取得単価以下）「保有期限による入れ替え実行」「一部利確実行」。いずれも対応不要。
+
 Discord コマンドの一覧は `@kabu-auto help`。当日の運用概要は `@kabu-auto summary`。
 
 ---
