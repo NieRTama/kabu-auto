@@ -48,6 +48,14 @@ class TradingScheduler:
     def start(self) -> None:
         cb = self._registered_callbacks
 
+        if "broker_daily_restart" in cb:
+            # KabuS は起動したまま認証だけが日次で切れ、起動し直さないとログインできない
+            # （2026-10-27）。毎朝ここで起動し直し、人はパスキーでログインするだけにする。
+            # 08:00 は認証切れが毎朝確認できている時刻（10/22・10/23・10/27 の 08:00 に401）。
+            self._scheduler.add_job(
+                cb["broker_daily_restart"], "cron",
+                day_of_week="mon-fri", hour=8, minute=0, id="broker_daily_restart",
+            )
         if "session_check" in cb:
             # RDP接続後の切断で画面セッションがDisc（切断）状態のまま残ると、
             # GUI自動化（SendKeys）がウィンドウを見つけられず静かに失敗する

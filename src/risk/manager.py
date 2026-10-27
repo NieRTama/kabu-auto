@@ -54,6 +54,17 @@ class RiskManager:
     # TTLはダッシュボードのポーリング間隔（10秒）より十分短くし、次のポーリングサイクルでは
     # 必ず新しい値を取ることでリアルタイム性を大きく損なわない範囲に留める。
     _PRICE_CACHE_TTL_SEC = 5.0
+    # 場外（昼休み・大引け後・休場日）のTTL。2026-10-27: 場外は値が動かないのに、
+    # health_check（平日8-23時15分毎）・ダッシュボード（10秒毎）・レポートが板を叩き続けていた。
+    # 無期限にしないのは、大引け直後に取った値が終値確定前のまま翌朝まで残らないようにするため。
+    _PRICE_CACHE_TTL_CLOSED_SEC = 1800.0
+
+    @staticmethod
+    def _price_cache_ttl() -> float:
+        from src.core.scheduler import TradingScheduler  # 循環importを避けて遅延import
+        if TradingScheduler.is_market_open():
+            return RiskManager._PRICE_CACHE_TTL_SEC
+        return RiskManager._PRICE_CACHE_TTL_CLOSED_SEC
 
     def __init__(self, price_fn: Optional[Callable[[list[str]], dict[str, float]]] = None):
         """
@@ -130,10 +141,11 @@ class RiskManager:
         prices: dict[str, float] = {}
         if self._price_fn is not None:
             now = time.monotonic()
+            ttl = self._price_cache_ttl()
             to_fetch = []
             for s in symbols:
                 cached = self._price_cache.get(s)
-                if cached is not None and now - cached[1] < self._PRICE_CACHE_TTL_SEC:
+                if cached is not None and now - cached[1] < ttl:
                     prices[s] = cached[0]
                 else:
                     to_fetch.append(s)

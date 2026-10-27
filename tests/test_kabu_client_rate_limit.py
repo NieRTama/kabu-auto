@@ -85,3 +85,18 @@ class TestRateLimitRetry:
                 with pytest.raises(requests.HTTPError):
                     c.get_board("9432")
         assert broker_auth.is_expired() is False
+
+
+class TestRequestThrottle:
+    def test_back_to_back_requests_are_spaced(self):
+        """同じ秒に起動したジョブの連打（2026-10-27 09:00/12:35 の429）を、
+        呼び出し側に依らず共通経路で間隔を空けて防ぐ"""
+        client = _client()
+        sleeps = []
+        with patch.object(mod.requests, "request", return_value=_response(200, {})), \
+             patch.object(mod.time, "monotonic", return_value=1000.0), \
+             patch.object(mod.time, "sleep", side_effect=sleeps.append):
+            client.get_board("9432")
+            client.get_board("9434")
+        assert sleeps == [pytest.approx(mod.KabuClient._MIN_REQUEST_INTERVAL_SEC)], \
+            "2回目は最小間隔だけ待ってから送ること（1回目は待たない）"

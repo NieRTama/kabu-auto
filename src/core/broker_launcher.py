@@ -144,72 +144,140 @@ def launch(exe_path: str = "", *,
     （2026-09-13、再現テストで確認）。
     """
     path = exe_path or DEFAULT_EXE_PATH
+    with _lock:
+        return _launch_locked(path, max_attempts_per_day, manual)
 
+
+def _launch_locked(path: str, max_attempts_per_day: int, manual: bool) -> tuple[bool, str]:
+    """launch() の本体。呼び出し側で _lock を保持している前提（restart() と共用）。"""
     global _attempts
     # 二重起動を実際に止めているのは下の**クールダウン**（起動直後は tasklist に
     # 現れず probe_running() が False を返し続けるため、これが無いと近接した2回目が
     # 必ず通る）。生存確認をロック内に入れているのは多重防御で、
     # 「確認してから起動するまで」の隙（tasklist の実行に数百ミリ秒かかる）を詰める。
-    with _lock:
-        # 生存確認を実行ファイルの有無より**先**に行う。逆にすると、既定以外の
-        # 場所にインストールされた環境で、正常稼働中でも「実行ファイルが
-        # 見つかりません」と返り、利用者を手動起動＝二重起動へ誘導してしまう。
-        alive = probe_running()
-        if alive is True:
-            return False, "kabuステーションは既に起動しています"
-        if alive is None and not manual:
-            # 自動起動は安全側（多重起動を避ける）。人が頼んだときは通す——
-            # 自動起動を無効にした構成では手動が唯一の経路であり、tasklist が
-            # 失敗し続ける間ずっと起動できないと終日発注できなくなる。
-            # 人は画面を見て起動済みかどうか判断できる。
-            return False, "kabuステーションが起動しているか確認できませんでした"
-        if not os.path.isfile(path):
-            return False, f"実行ファイルが見つかりません: {path}"
+    # 生存確認を実行ファイルの有無より**先**に行う。逆にすると、既定以外の
+    # 場所にインストールされた環境で、正常稼働中でも「実行ファイルが
+    # 見つかりません」と返り、利用者を手動起動＝二重起動へ誘導してしまう。
+    alive = probe_running()
+    if alive is True:
+        return False, "kabuステーションは既に起動しています"
+    if alive is None and not manual:
+        # 自動起動は安全側（多重起動を避ける）。人が頼んだときは通す——
+        # 自動起動を無効にした構成では手動が唯一の経路であり、tasklist が
+        # 失敗し続ける間ずっと起動できないと終日発注できなくなる。
+        # 人は画面を見て起動済みかどうか判断できる。
+        return False, "kabuステーションが起動しているか確認できませんでした"
+    if not os.path.isfile(path):
+        return False, f"実行ファイルが見つかりません: {path}"
 
-        if broker_process_lock.in_progress:
-            # broker_full_login.run() の完全自動ログインが今まさに実行中
-            # （KabuS.exeをkillして再起動している最中）。経過時間に関係なく
-            # 無条件で拒否する（クールダウンだけでは、full_login のタイムアウト
-            # 上限がクールダウン秒数を超えるため隙間ができる）。
+    if broker_process_lock.in_progress:
+        # broker_full_login.run() の完全自動ログインが今まさに実行中
+        # （KabuS.exeをkillして再起動している最中）。経過時間に関係なく
+        # 無条件で拒否する（クールダウンだけでは、full_login のタイムアウト
+        # 上限がクールダウン秒数を超えるため隙間ができる）。
+        return False, (
+            "完全自動ログイン等、別の起動/再起動操作が進行中です。"
+            "完了までお待ちください"
+        )
+
+    elapsed = _now() - broker_process_lock.last_operation_at
+    if elapsed < RELAUNCH_COOLDOWN_SECONDS:
+        return False, (
+            f"起動直後です（{int(elapsed)}秒前に起動/再起動）。プロセス一覧に現れるまで"
+            f"{RELAUNCH_COOLDOWN_SECONDS}秒は再起動しません"
+        )
+
+    # 日次上限は「自動起動の暴走」を止めるためのもの。人が明示的に頼んだ
+    # 起動は上限で止めず、自動起動の残枠も消費しない（消費すると、自動起動が
+    # 一度も走っていないのに手動3回でその日の自動起動が止まる）。
+    _roll_over_if_new_day()
+    if manual:
+        attempt_no = None
+    else:
+        if max_attempts_per_day > 0 and _attempts >= max_attempts_per_day:
             return False, (
-                "完全自動ログイン等、別の起動/再起動操作が進行中です。"
-                "完了までお待ちください"
+                f"本日の起動試行が上限({max_attempts_per_day}回)に達しています。"
+                "証券会社側の障害の可能性があるため、手動で確認してください"
             )
+        _attempts += 1
+        attempt_no = _attempts
 
-        elapsed = _now() - broker_process_lock.last_operation_at
-        if elapsed < RELAUNCH_COOLDOWN_SECONDS:
-            return False, (
-                f"起動直後です（{int(elapsed)}秒前に起動/再起動）。プロセス一覧に現れるまで"
-                f"{RELAUNCH_COOLDOWN_SECONDS}秒は再起動しません"
-            )
-
-        # 日次上限は「自動起動の暴走」を止めるためのもの。人が明示的に頼んだ
-        # 起動は上限で止めず、自動起動の残枠も消費しない（消費すると、自動起動が
-        # 一度も走っていないのに手動3回でその日の自動起動が止まる）。
-        _roll_over_if_new_day()
-        if manual:
-            attempt_no = None
-        else:
-            if max_attempts_per_day > 0 and _attempts >= max_attempts_per_day:
-                return False, (
-                    f"本日の起動試行が上限({max_attempts_per_day}回)に達しています。"
-                    "証券会社側の障害の可能性があるため、手動で確認してください"
-                )
-            _attempts += 1
-            attempt_no = _attempts
-
-        broker_process_lock.in_progress = True
-        try:
-            # 同じデスクトップセッションで起動する（GUIを人が操作できるように）。
-            # 親プロセス終了に巻き込まれないよう切り離す。
-            subprocess.Popen([path], close_fds=True)
-        except Exception as e:
-            broker_process_lock.in_progress = False
-            logger.error(f"kabuステーションの起動に失敗しました: {e}")
-            return False, f"起動に失敗しました: {e}"
-        broker_process_lock.last_operation_at = _now()
+    broker_process_lock.in_progress = True
+    try:
+        # 同じデスクトップセッションで起動する（GUIを人が操作できるように）。
+        # 親プロセス終了に巻き込まれないよう切り離す。
+        subprocess.Popen([path], close_fds=True)
+    except Exception as e:
         broker_process_lock.in_progress = False
+        logger.error(f"kabuステーションの起動に失敗しました: {e}")
+        return False, f"起動に失敗しました: {e}"
+    broker_process_lock.last_operation_at = _now()
+    broker_process_lock.in_progress = False
 
     how = "手動" if attempt_no is None else f"本日{attempt_no}回目"
     logger.warning(f"kabuステーションを起動しました（{how}）: {path}")
     return True, f"kabuステーションを起動しました（{how}）"
+
+
+#: 強制終了後、プロセス一覧から消えるまで待つ上限（秒）。
+KILL_WAIT_SECONDS = 30
+
+
+def _sleep(seconds: float) -> None:
+    """待機（テストで差し替える）。"""
+    time.sleep(seconds)
+
+
+def restart(exe_path: str = "", *,
+            max_attempts_per_day: int = DEFAULT_MAX_ATTEMPTS_PER_DAY,
+            process_name: str = "KabuS") -> tuple[bool, str]:
+    """起動中の kabuステーションを強制終了して起動し直す（毎朝の定時再起動用）。
+
+    2026-10-27: パスキー必須化で毎朝人がログインする運用になったが、KabuS は
+    起動したまま認証だけが日次で切れ、アプリを起動し直さないとログインできない。
+    launch() は「起動していなければ起動する」だけなので、前日から起動しっぱなしの日は
+    人が再起動していた。終了から起動までを共有ロック内で行い、その間に
+    broker_watch.recovery_tick 等が割り込んで二重起動しないようにする。
+
+    認証が生きているかの確認は呼び出し側（auth_valid_now）が行う。
+    クールダウン中・別操作の実行中・日次上限到達のときは、**止める前に**断る
+    （止めたあと起動できず、落としたままになるのを防ぐ）。
+    """
+    path = exe_path or DEFAULT_EXE_PATH
+    with _lock:
+        alive = probe_running(process_name)
+        if alive is None:
+            return False, "kabuステーションが起動しているか確認できませんでした（再起動しません）"
+        if broker_process_lock.in_progress:
+            return False, "別の起動/再起動操作が進行中です（再起動しません）"
+        elapsed = _now() - broker_process_lock.last_operation_at
+        if elapsed < RELAUNCH_COOLDOWN_SECONDS:
+            return False, f"起動直後です（{int(elapsed)}秒前に起動/再起動）。再起動しません"
+        _roll_over_if_new_day()
+        if max_attempts_per_day > 0 and _attempts >= max_attempts_per_day:
+            return False, f"本日の起動試行が上限({max_attempts_per_day}回)に達しています（再起動しません）"
+        if not os.path.isfile(path):
+            return False, f"実行ファイルが見つかりません: {path}"
+
+        if alive:
+            try:
+                r = subprocess.run(
+                    ["taskkill", "/IM", f"{process_name}.exe", "/F"],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except Exception as e:
+                logger.error(f"kabuステーションの終了に失敗しました: {e}")
+                return False, f"終了に失敗しました: {e}"
+            if r.returncode != 0:
+                detail = (r.stderr or r.stdout).strip()[:120]
+                logger.error(f"kabuステーションの終了に失敗しました: rc={r.returncode} {detail}")
+                return False, f"終了に失敗しました（rc={r.returncode}）: {detail}"
+            for _ in range(KILL_WAIT_SECONDS):
+                if probe_running(process_name) is False:
+                    break
+                _sleep(1)
+            else:
+                return False, f"終了後も{KILL_WAIT_SECONDS}秒以内にプロセスが消えませんでした"
+            logger.warning("kabuステーションを強制終了しました（定時再起動）")
+
+        return _launch_locked(path, max_attempts_per_day, manual=False)

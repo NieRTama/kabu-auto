@@ -37,12 +37,30 @@ class TestGetCurrentPricesCache:
         calls = []
         risk = RiskManager(price_fn=lambda syms: calls.append(list(syms)) or {"9432": 172.7})
 
-        with patch("src.risk.manager.time.monotonic", return_value=1000.0):
-            risk.get_current_prices(["9432"])
-        with patch("src.risk.manager.time.monotonic", return_value=1000.0 + RiskManager._PRICE_CACHE_TTL_SEC + 1):
-            risk.get_current_prices(["9432"])
+        with patch("src.core.scheduler.TradingScheduler.is_market_open", return_value=True):
+            with patch("src.risk.manager.time.monotonic", return_value=1000.0):
+                risk.get_current_prices(["9432"])
+            with patch("src.risk.manager.time.monotonic", return_value=1000.0 + RiskManager._PRICE_CACHE_TTL_SEC + 1):
+                risk.get_current_prices(["9432"])
 
         assert len(calls) == 2, "TTL経過後はキャッシュを使わず再取得すること"
+
+    def test_closed_market_reuses_cache_beyond_intraday_ttl(self, isolated_db):
+        """場外は値が動かないので、場中TTL(5秒)を過ぎても再取得しない。
+        2026-10-27: 場外でも health_check・ダッシュボードが板を叩き続けていた"""
+        calls = []
+        risk = RiskManager(price_fn=lambda syms: calls.append(list(syms)) or {"9432": 172.7})
+
+        with patch("src.core.scheduler.TradingScheduler.is_market_open", return_value=False):
+            with patch("src.risk.manager.time.monotonic", return_value=1000.0):
+                risk.get_current_prices(["9432"])
+            with patch("src.risk.manager.time.monotonic", return_value=1000.0 + 600):
+                risk.get_current_prices(["9432"])
+            assert len(calls) == 1, "場外は10分後でもキャッシュを使うこと"
+            with patch("src.risk.manager.time.monotonic",
+                       return_value=1000.0 + RiskManager._PRICE_CACHE_TTL_CLOSED_SEC + 1):
+                risk.get_current_prices(["9432"])
+        assert len(calls) == 2, "場外TTLを過ぎたら取り直すこと（終値確定前の値を固定しない）"
 
     def test_uncached_symbol_is_fetched_while_cached_one_is_reused(self, isolated_db):
         """一部銘柄だけキャッシュ済みの場合、未キャッシュの銘柄だけを問い合わせる"""

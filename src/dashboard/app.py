@@ -706,7 +706,8 @@ async def get_trades(limit: int = 50):
             "symbol": t.symbol,
             "side": t.side,
             "quantity": t.quantity,
-            "price": t.price,
+            # 成行（退出の売り）は price=0 で、実単価は filled_price にある（2026-10-27: 履歴に¥0と表示されていた）
+            "price": t.filled_price or t.price,
             "filled_at": t.filled_at.isoformat() if t.filled_at else None,
             "status": t.status,
             "pnl": t.pnl,

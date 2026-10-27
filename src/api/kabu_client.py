@@ -29,6 +29,11 @@ class KabuClient:
     # 数回だけリトライする（401/500など429以外は原因が別なのでリトライしない）。
     _RATE_LIMIT_MAX_RETRIES = 3
     _RATE_LIMIT_BACKOFF_BASE_SEC = 0.5
+    # 呼び出しの最小間隔（秒）。kabuステーションAPIの情報系の上限は秒間10件。
+    # 2026-10-27: 09:00（stop_loss_check と health_check）と 12:35（afternoon_execution と
+    # stop_loss_check）のように同じ秒に起動するジョブが板を同時に叩き、429が出ていた。
+    # 全REST呼び出しが通るここで間隔を空ければ、ジョブの時刻や銘柄数に依らず防げる。
+    _MIN_REQUEST_INTERVAL_SEC = 0.11
 
     def __init__(self):
         conf = cfg.get_section("kabu_station")
@@ -43,6 +48,8 @@ class KabuClient:
         self._ws_reconnect_delay = 2
         # 再接続ループのログ間引き用。kind → (連続回数, 最後に出力した時刻)（_ws_log 参照）
         self._ws_log_state: dict = {}
+        self._throttle_lock = threading.Lock()
+        self._last_request_at = 0.0
 
     # ─── 認証 ───────────────────────────────────────────
 
@@ -73,6 +80,7 @@ class KabuClient:
         """
         attempt = 0
         while True:
+            self._throttle()
             resp = requests.request(
                 method, f"{self._base_url}{path}", headers=self._headers, timeout=10, **kwargs
             )
@@ -102,6 +110,14 @@ class KabuClient:
             )
         resp.raise_for_status()
         return resp
+
+    def _throttle(self) -> None:
+        """前回の呼び出しから _MIN_REQUEST_INTERVAL_SEC 空くまで待つ（スレッド間で共有）。"""
+        with self._throttle_lock:
+            wait = self._last_request_at + self._MIN_REQUEST_INTERVAL_SEC - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.monotonic()
 
     @staticmethod
     def _error_detail(resp: requests.Response) -> str:

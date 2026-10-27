@@ -449,3 +449,54 @@ class TestManualLaunchEscapeHatch:
         for _ in range(3):
             self._launch_with_probe(False, manual=True)
         assert bl.attempts_today() == 0
+
+
+class TestRestart:
+    """毎朝の定時再起動（2026-10-27: 起動しっぱなしの KabuS は認証だけ切れ、起動し直さないとログインできない）"""
+
+    def _run(self, *, probes, kill_rc=0, max_attempts=3, now=None):
+        probe = MagicMock(side_effect=list(probes))
+        kill = MagicMock(return_value=MagicMock(returncode=kill_rc, stdout="", stderr="err"))
+        popen = MagicMock()
+        clock = now or (lambda: float(next(_SHARED_CLOCK)))
+        with patch.object(bl, "probe_running", probe), \
+             patch.object(bl, "_now", clock), \
+             patch.object(bl, "_sleep", lambda s: None), \
+             patch.object(bl.os.path, "isfile", return_value=True), \
+             patch.object(bl.subprocess, "run", kill), \
+             patch.object(bl.subprocess, "Popen", popen):
+            ok, detail = bl.restart("C:/dummy/KabuS.exe", max_attempts_per_day=max_attempts)
+        return ok, detail, kill, popen
+
+    def test_running_app_is_killed_then_launched(self):
+        # 生存確認: 起動中 → (kill後) 消えた → launch内の確認でも未起動
+        ok, detail, kill, popen = self._run(probes=[True, False, False])
+        assert ok, detail
+        assert kill.call_args[0][0] == ["taskkill", "/IM", "KabuS.exe", "/F"]
+        popen.assert_called_once()
+
+    def test_not_running_is_just_launched(self):
+        ok, _, kill, popen = self._run(probes=[False, False])
+        assert ok
+        kill.assert_not_called()
+        popen.assert_called_once()
+
+    def test_kill_failure_is_reported_and_not_launched(self):
+        ok, detail, _, popen = self._run(probes=[True], kill_rc=1)
+        assert not ok and "rc=1" in detail
+        popen.assert_not_called()
+
+    def test_daily_limit_refuses_before_killing(self):
+        """上限に達していたら止める前に断る（止めたまま起動できない事故を防ぐ）"""
+        # 上限1回を使い切った状態を作る
+        self._run(probes=[False, False], max_attempts=1)
+        ok, detail, kill, popen = self._run(probes=[True], max_attempts=1)
+        assert not ok and "上限" in detail
+        kill.assert_not_called()
+        popen.assert_not_called()
+
+    def test_unknown_state_does_not_kill(self):
+        ok, _, kill, popen = self._run(probes=[None])
+        assert not ok
+        kill.assert_not_called()
+        popen.assert_not_called()
