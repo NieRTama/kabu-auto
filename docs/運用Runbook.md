@@ -80,7 +80,9 @@ curl -X POST http://localhost:8080/api/emergency_close -H "X-Emergency-Token: <T
 
 - `RunLevel: Highest` で起動したプロセスの停止とタスク設定の変更には管理者権限が要る。
   通常権限の `Stop-Process` は `Access is denied` になる。
-- 停止: `Start-Process taskkill -Verb RunAs -ArgumentList '/PID','<pid>','/T','/F' -Wait`（UACの承認が必要）。
+- 停止: `Start-Process taskkill -Verb RunAs -ArgumentList '/PID','<pid>','/F' -Wait`（UACの承認が必要）。
+  **`/T` を付けない**。2026-10-27 以降は kabu-auto が kabuステーションを起動する（毎朝の定時再起動・`auto_launch_broker`）ため、
+  KabuS.exe が kabu-auto の子プロセスになっており、`/T` だと一緒に落ちる（2026-10-29 12:21 実例: 再接続に約3分）。
   PID は `data/kabu_auto.lock` の値、または `(Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess`。
 - 再起動: 停止後に `Start-ScheduledTask -TaskPath '\kabu\' -TaskName kabu-auto`。
   タスクは `MultipleInstances: IgnoreNew` のため、旧プロセスが生きている間の起動要求は無視される
