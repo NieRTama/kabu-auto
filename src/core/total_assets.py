@@ -18,7 +18,7 @@ from typing import Callable, Optional
 from loguru import logger
 from sqlalchemy import select
 
-from src.core import clock
+from src.core import buying_power, clock
 from src.core import trading_mode as tm
 
 # 口座余力のキャッシュ（時刻, 値）。ダッシュボードは10秒ごとに全APIを叩くため、
@@ -35,12 +35,12 @@ def _broker_cash(client) -> float:
     global _wallet_cache
     now = time.monotonic()
     if _wallet_cache and now - _wallet_cache[0] < WALLET_CACHE_SECONDS:
-        return _wallet_cache[1]
+        return buying_power.adjust(_wallet_cache[1])
     if client is None:
         raise RuntimeError("kabuステーションAPIクライアント未接続")
     cash = float(client.get_wallet().get("StockAccountWallet", 0))
     _wallet_cache = (now, cash)
-    return cash
+    return buying_power.adjust(cash)
 
 
 def _load_history() -> dict:

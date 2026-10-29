@@ -16,6 +16,7 @@ from loguru import logger
 from sqlalchemy import func, select
 
 from src.api.kabu_client import KabuClient
+from src.core import buying_power
 from src.core import clock
 from src.core import config as cfg
 from src.core import halt
@@ -337,6 +338,8 @@ class OrderManager:
                 trade.order_id, cur_symbol, cur_side, delta_qty, eff_price,
                 clock.now(), source="reconcile",
             )
+            if cur_side == "BUY" and eff_price:
+                buying_power.note_buy_fill(delta_qty * eff_price)
         # 終了状態ではタイムアウトキャンセルタイマーを解除
         # （未約定のPARTIALLY_FILLEDは残数を待つので解除しないが、PARTIALLY_FILLED_DONEは
         # ブローカー側で確定終了済みなので解除する。P0-2）

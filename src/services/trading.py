@@ -16,6 +16,7 @@ import uuid
 from loguru import logger
 from sqlalchemy import func, select
 
+from src.core import buying_power
 from src.core import clock
 from src.core import market_calendar
 from src.core import config as cfg
@@ -893,7 +894,7 @@ class TradingServices:
         else:
             try:
                 wallet = self.client.get_wallet()
-                cash = float(wallet.get("StockAccountWallet", 0))
+                cash = buying_power.adjust(float(wallet.get("StockAccountWallet", 0)))
             except Exception as e:
                 logger.error(f"余力取得失敗: {e}")
                 return
