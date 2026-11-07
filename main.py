@@ -299,7 +299,7 @@ def main() -> None:
         )
 
     def broker_daily_restart_job():
-        """平日08:00: 前日から起動したままの KabuS を起動し直し、人はログインだけにする。
+        """平日08:25: 前日から起動したままの KabuS を起動し直し、人はログインだけにする。
 
         2026-10-27: KabuS は起動したまま認証だけが日次で切れ、起動し直さないとログインできない。
         auto_launch_broker（「起動していなければ起動」）は起動しっぱなしの日に何もしないため、
@@ -314,7 +314,7 @@ def main() -> None:
         if market_calendar.is_holiday(clock.today()):
             logger.info("kabuステーション定時再起動を省略: 本日は休場です")
             return
-        # ponytail: 人がちょうどログイン操作中（認証未完了）だと防げない。08:00固定の1回だけなので起こりにくい前提
+        # ponytail: 人がちょうどログイン操作中（認証未完了）だと防げない。08:25固定の1回だけなので起こりにくい前提
         if broker_watch.auth_valid_now(client.refresh_token):
             logger.info("kabuステーション定時再起動を省略: 認証は有効です（トークンを取得できました）")
             return

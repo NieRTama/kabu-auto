@@ -51,10 +51,12 @@ class TradingScheduler:
         if "broker_daily_restart" in cb:
             # KabuS は起動したまま認証だけが日次で切れ、起動し直さないとログインできない
             # （2026-10-27）。毎朝ここで起動し直し、人はパスキーでログインするだけにする。
-            # 08:00 は認証切れが毎朝確認できている時刻（10/22・10/23・10/27 の 08:00 に401）。
+            # 08:25 にする（2026-10-30、08:00 から変更）。KabuS はログイン画面を約30分放置すると
+            # ログインが「内部エラー」（結果コード -1）で失敗する（10/28 は起動30分11秒後・10/30 は
+            # 約40分後に失敗、10/29 は29分42秒後に成功）。人がログインする 08:29〜08:45 に間に合わせる。
             self._scheduler.add_job(
                 cb["broker_daily_restart"], "cron",
-                day_of_week="mon-fri", hour=8, minute=0, id="broker_daily_restart",
+                day_of_week="mon-fri", hour=8, minute=25, id="broker_daily_restart",
             )
         if "session_check" in cb:
             # RDP接続後の切断で画面セッションがDisc（切断）状態のまま残ると、
