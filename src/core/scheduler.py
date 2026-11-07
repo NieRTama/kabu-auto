@@ -58,6 +58,12 @@ class TradingScheduler:
                 cb["broker_daily_restart"], "cron",
                 day_of_week="mon-fri", hour=8, minute=25, id="broker_daily_restart",
             )
+        if "login_reminder" in cb:
+            # 認証が切れている間だけ通知する。時間帯の判定は broker_watch.login_reminder_tick
+            self._scheduler.add_job(
+                cb["login_reminder"], "cron",
+                day_of_week="mon-fri", hour="8-15", minute="5,20,35,50", id="login_reminder",
+            )
         if "session_check" in cb:
             # RDP接続後の切断で画面セッションがDisc（切断）状態のまま残ると、
             # GUI自動化（SendKeys）がウィンドウを見つけられず静かに失敗する

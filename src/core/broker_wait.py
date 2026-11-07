@@ -27,6 +27,7 @@ def wait_for_broker(
     max_interval: float = 60.0,
     on_wait_start: Optional[Callable[[], None]] = None,
     on_connected: Optional[Callable[[float], None]] = None,
+    on_tick: Optional[Callable[[], None]] = None,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> bool:
@@ -40,6 +41,7 @@ def wait_for_broker(
         （2026-08-29 に稼働中の復帰で同じ穴を踏んだ）。
     on_wait_start: 1回目の失敗直後に一度だけ呼ぶ（Discord通知などの副作用用）。
     on_connected: 待機の末に接続できたとき、待機秒数を引数に呼ぶ。
+    on_tick: 接続に失敗するたびに呼ぶ（待機中はスケジューラが動かないため、朝の起動や再通知はここで行う）。
 
     待機中のログは冗長にならないよう、最初の失敗時と以後5分ごとのみ出力する
     （毎回出すと自動起動から人がログインするまでの間ログが埋まる）。
@@ -90,6 +92,11 @@ def wait_for_broker(
                 logger.info(
                     f"kabuステーションのログイン待ち（経過 {(now - started) / 60:.0f}分）: {e}"
                 )
+            if on_tick is not None:
+                try:
+                    on_tick()
+                except Exception as tick_error:  # 通知や起動の失敗で待機を止めない
+                    logger.warning(f"待機中の処理に失敗しました（待機は継続）: {tick_error}")
             continue
 
         waited = monotonic() - started

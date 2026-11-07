@@ -268,3 +268,94 @@ def recovery_tick(*, refresh_token: Callable[[], object],
     )
     if notice:
         alert(*notice)
+
+
+#: 待機中の強制再起動を許す時間帯。定時再起動（8:25）と同じ朝だけにする。それ以降は人が
+#: ログイン画面をパスキーで操作中かもしれないので強制終了しない。
+WAIT_RESTART_FROM = dtime(8, 25)
+WAIT_RESTART_TO = dtime(8, 40)
+
+#: 未ログインの再通知を出す時間帯（前場の直前〜大引け）。
+LOGIN_REMINDER_FROM = dtime(8, 50)
+LOGIN_REMINDER_TO = dtime(15, 30)
+
+LOGIN_NEEDED_TITLE = "kabuステーションにまだログインされていません"
+
+
+def run_daily_restart(*, runtime: dict, refresh_token: Callable[[], object],
+                      restart: Callable[[], Tuple[bool, str]], alert: Callable[..., None],
+                      closed_today: bool, pause_exists: Callable[[], bool]) -> None:
+    """定時再起動1回分。条件を満たすときだけ KabuS を起動し直し、人にログインを促す。
+
+    2026-10-27: KabuS は起動したまま認証だけが日次で切れ、起動し直さないとログインできない。
+    data/broker_restart.pause があれば本体を再起動せずに止められる。
+    """
+    if not bool(runtime.get("auto_launch_broker", False)):
+        return
+    if pause_exists():
+        logger.info("kabuステーション定時再起動を省略: data/broker_restart.pause があります")
+        return
+    if closed_today:
+        logger.info("kabuステーション定時再起動を省略: 本日は休場です")
+        return
+    # ponytail: 人がちょうどログイン操作中（認証未完了）だと防げない。08:25固定の1回だけなので起こりにくい前提
+    if auth_valid_now(refresh_token):
+        logger.info("kabuステーション定時再起動を省略: 認証は有効です（トークンを取得できました）")
+        return
+    ok, detail = restart()
+    if ok:
+        alert("kabuステーションを再起動しました",
+              f"{detail}\nパスキー（認証アプリ）でログインしてください。"
+              "ログイン後は自動で取引を再開します。",
+              level=LEVEL_INFO)
+    else:
+        alert("kabuステーションを再起動できませんでした",
+              f"{detail}\nアプリを起動し直してログインしてください。")
+
+
+class StartupWaitWatcher:
+    """起動時の接続待ちの間に、スケジューラの代わりに朝の起動と再通知を行う。
+
+    2026-11-02: 金曜夜の起動で接続待ちに入り、スケジューラが動かないまま月曜 12:00 まで放置された。
+    接続待ちは order sync と preflight の前提なので、待機そのものは残す。休場日と夜間は何もしない。
+    """
+
+    def __init__(self, *, monotonic: float, repeat_seconds: int = DOWN_REPEAT_SECONDS):
+        self._last_alert = monotonic
+        self._repeat = repeat_seconds
+        self._restarted_on = None
+
+    def tick(self, *, now: datetime, monotonic: float, runtime: dict,
+             refresh_token: Callable[[], object], restart: Callable[[], Tuple[bool, str]],
+             launch: Callable[[], Tuple[bool, str]], alert: Callable[..., None],
+             pause_exists: Callable[[], bool]) -> None:
+        if not in_notify_window(now):
+            return
+        if monotonic - self._last_alert >= self._repeat:
+            self._last_alert = monotonic
+            alert(LOGIN_NEEDED_TITLE,
+                  "kabuステーションへ接続できないため、監視も発注も止まっています。"
+                  "パスキーでログインしてください。接続できれば自動で稼働を始めます。")
+        if now.time() < WAIT_RESTART_FROM or not bool(runtime.get("auto_launch_broker", False)):
+            return
+        if now.time() <= WAIT_RESTART_TO:
+            # ponytail: 1日1回の印はメモリだけ。この15分の間に本体を再起動すると、もう一度起動し直す
+            if self._restarted_on != now.date():
+                self._restarted_on = now.date()
+                run_daily_restart(runtime=runtime, refresh_token=refresh_token, restart=restart,
+                                  alert=alert, closed_today=False, pause_exists=pause_exists)
+            return
+        launched, detail = launch()  # 起動済みなら何もしない
+        if launched:
+            alert("kabuステーションを起動しました",
+                  f"{detail}\nパスキー（認証アプリ）でログインしてください。", level=LEVEL_INFO)
+
+
+def login_reminder_tick(*, now: datetime, expired: bool, alert: Callable[..., None]) -> None:
+    """ログインされないまま場が開く朝のための再通知（2026-11-06: 8:35 の次は 09:15 の異常検知だった）。"""
+    if not expired or not market_calendar.is_business_day(now.date()):
+        return
+    if LOGIN_REMINDER_FROM <= now.time() <= LOGIN_REMINDER_TO:
+        alert(LOGIN_NEEDED_TITLE,
+              "認証が切れたままです。新規発注も損切りの判定も止まっています。"
+              "パスキーでログインしてください。")

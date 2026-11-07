@@ -252,6 +252,10 @@ def _exit_label(reason: str, price: float, avg_cost: Optional[float]) -> str:
     return _EXIT_LABELS.get(reason, "損切り")
 
 
+def _by_score_desc(signals: list) -> list:
+    return sorted(signals, key=lambda s: s.combined_score or 0, reverse=True)
+
+
 class TradingServices:
     """スケジューラに登録される取引ジョブ群。依存と可変modelを保持する。"""
 
@@ -899,6 +903,9 @@ class TradingServices:
                 logger.error(f"余力取得失敗: {e}")
                 return
         sectors = watchlist_store.get_sectors()
+        # 余力が限られるのでスコアの高い順に枠を使う（2026-10-26: 生成時刻順だったため 0.127 が 0.177 より先に買われた）
+        buy_signals = _by_score_desc(buy_signals)
+        committed = self.risk.reserved_buy_total()
         for sig in buy_signals:
             try:
                 if is_paper:
@@ -911,7 +918,8 @@ class TradingServices:
                 if not price:
                     continue
                 sector = sectors.get(sig.symbol, "")
-                ok, reason = self.risk.validate_buy(sig.symbol, float(price), cash, sector)
+                sizing_cash = self.risk.cash_for_sizing(cash, committed)
+                ok, reason = self.risk.validate_buy(sig.symbol, float(price), sizing_cash, sector)
                 if not ok:
                     logger.info(f"{label}買い見送り: {sig.symbol} - {reason}")
                     continue
@@ -931,7 +939,7 @@ class TradingServices:
                 if not ok_sp:
                     logger.info(f"{label}買い見送り: {sig.symbol} - {sp_reason}")
                     continue
-                qty = self.risk.calc_position_size(sig.symbol, float(price), cash)
+                qty = self.risk.calc_position_size(sig.symbol, float(price), sizing_cash)
                 if qty <= 0:
                     continue
                 order_id = self.order_mgr.buy(sig.symbol, float(price), qty, sector=sector,
@@ -941,7 +949,7 @@ class TradingServices:
                     # 同一スキャン内の以降の銘柄が同じ余力を前提に判定しないよう、
                     # 発注成功分をその場で減算する（複数銘柄の資金二重計上を防ぐ。
                     # RiskManager の未約定引当と二重で守る）
-                    cash -= float(price) * qty
+                    committed += float(price) * qty
                     logger.info(f"{label}買い発注: {sig.symbol} {qty}株 @{price:.0f}円")
                     # 実弾が動いたことは即座に知らせる（退出だけ通知して
                     # エントリーを通知しないのは非対称で、口座で今いくら使われたかが

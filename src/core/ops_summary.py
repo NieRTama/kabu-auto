@@ -60,6 +60,25 @@ def _auth_downtime(alerts: list[tuple[str, str]]) -> list[str]:
     return spans
 
 
+def _unrealized_line() -> str:
+    """含み損益の合計（終値基準）。確定損益の勝率だけでは含み損が見えないため並べて出す。"""
+    from src.data import market_data
+    from src.data.database import Position, get_session
+    with get_session() as s:
+        pos = s.scalars(select(Position).where(Position.quantity > 0)).all()
+        closes = market_data.latest_closes([p.symbol for p in pos]) if pos else {}
+        total = sum((closes[p.symbol] - p.avg_cost) * p.quantity for p in pos if closes.get(p.symbol))
+        priced = sum(1 for p in pos if closes.get(p.symbol))
+    return f"含み損益: {total:+,.0f}円（{priced}銘柄）"
+
+
+def _unrealized_safe() -> str:
+    try:
+        return _unrealized_line()
+    except Exception as e:  # 集計に失敗しても運用概要は出す
+        return f"含み損益: 集計失敗（{e}）"
+
+
 def _db_sections(today: date, full: bool) -> list[str]:
     from src.data.database import OrderIntent, Position, Signal, Trade, get_session
     from src.data.market_data import latest_closes
@@ -185,6 +204,7 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
             f"【kabu-auto 運用概要 {today}】",
             _assets_line(today, assets),
             f"{_format_period(r['daily'])} ／ {_format_period(r['monthly'])}",
+            _unrealized_safe(),
             orders,
             f"認証切れ: {' / '.join(down) or 'なし'} ／ 取引停止: {'はい' if halted else 'いいえ'}",
             f"ERROR {sum(errors.values())}件 ／ ALERT {len(alerts)}件",
@@ -193,7 +213,7 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
 
     out = [f"【kabu-auto 運用概要 {today}】", f"モード: {tm.description(mode)}", _assets_line(today, assets),
            f"コード: {code_version.describe() if code_version._state else (code_version._head_commit(REPO) or '不明') + '（HEAD）'}", "",
-           _format_period(r["daily"]), _format_period(r["weekly"]), _format_period(r["monthly"]), "",
+           _format_period(r["daily"]), _format_period(r["weekly"]), _format_period(r["monthly"]), _unrealized_safe(), "",
            f"本体起動: {len(starts)}回 {' '.join(starts)}",
            f"認証切れ: {' / '.join(down) or 'なし'}",
            f"取引停止中: {'はい' if halted else 'いいえ'}",

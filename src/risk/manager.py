@@ -382,6 +382,22 @@ class RiskManager:
             f"（株価{price:,.0f}円・上限比率{ratio:.0%}・実効余力{cash_balance:,.0f}円）"
         )
 
+    def reserved_buy_total(self) -> float:
+        """未約定BUYの引当総額。"""
+        return self._reserved_buy_by_sector()[0]
+
+    def cash_for_sizing(self, wallet_cash: float, committed: float) -> float:
+        """position_budget へ渡す余力。同じ回の発注を二重に引かないために使う。
+
+        2026-10-26 実例: 余力188,060円で 93,400円を発注すると、発注ループの減算と未約定引当の
+        両方で引かれ、次の候補の上限が 630円になった（本来は47,330円）。position_budget は
+        未約定引当 R を必ず引くので、使える額が wallet_cash - max(committed, R) になるよう R を足し戻す。
+        committed は「開始時の未約定 + この回の発注額」。ループ中に約定して R が減っても、
+        余力の値はループ開始時のままなので committed は引いたままにする。
+        """
+        reserved = self.reserved_buy_total()
+        return wallet_cash - max(committed, reserved) + reserved
+
     def position_budget(self, cash_balance: float,
                         snapshot: Optional[RiskSnapshot] = None) -> float:
         """1銘柄に投じられる上限額（実効余力 × max_position_ratio）。

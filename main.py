@@ -197,6 +197,21 @@ def main() -> None:
     # さらに「ログイン待ち」の🔴が届き、対応不要な通知で🔴の価値が下がる
     # （2026-09-05 土曜に実際に発生。取引が無い日に接続を必須にする理由が無い）。
     is_closed_today = market_calendar.is_holiday(clock.today())
+
+    def _launch_limit() -> int:
+        return int(cfg.get_section("runtime").get(
+            "max_launch_attempts_per_day", broker_launcher.DEFAULT_MAX_ATTEMPTS_PER_DAY))
+
+    def _restart_broker() -> tuple[bool, str]:
+        return broker_launcher.restart(
+            cfg.get_section("runtime").get("broker_exe_path", "") or "",
+            max_attempts_per_day=_launch_limit(),
+        )
+
+    def _restart_paused() -> bool:
+        return os.path.exists(os.path.join("data", "broker_restart.pause"))
+
+    wait_watcher = broker_watch.StartupWaitWatcher(monotonic=time.monotonic())
     if is_closed_today:
         logger.info(
             "休場日のためkabuステーションのログイン待ちを省略します"
@@ -213,7 +228,6 @@ def main() -> None:
             alert(
                 "kabuステーションのログイン待ち",
                 f"{tm.description(mode)}で起動しましたが、kabuステーションへ接続できません。"
-                "完全自動ログインを試みます。失敗した場合は"
                 f"kabuステーションを起動してログインしてください（{limit_text}）。",
             )
             _startup_full_login()
@@ -223,6 +237,14 @@ def main() -> None:
             timeout_seconds=wait_minutes * 60,
             unlimited=wait_unlimited,
             on_wait_start=_on_startup_wait,
+            on_tick=lambda: wait_watcher.tick(
+                now=clock.now(), monotonic=time.monotonic(), runtime=cfg.get_section("runtime"),
+                refresh_token=client.refresh_token, restart=_restart_broker,
+                launch=lambda: broker_launcher.launch(
+                    cfg.get_section("runtime").get("broker_exe_path", "") or "",
+                    max_attempts_per_day=_launch_limit()),
+                alert=alert, pause_exists=_restart_paused,
+            ),
             on_connected=lambda waited: alert(
                 "kabuステーションへ接続しました",
                 f"{waited / 60:.1f}分の待機後に接続し、{tm.description(mode)}で稼働を開始します。",
@@ -299,40 +321,16 @@ def main() -> None:
         )
 
     def broker_daily_restart_job():
-        """平日08:25: 前日から起動したままの KabuS を起動し直し、人はログインだけにする。
-
-        2026-10-27: KabuS は起動したまま認証だけが日次で切れ、起動し直さないとログインできない。
-        auto_launch_broker（「起動していなければ起動」）は起動しっぱなしの日に何もしないため、
-        毎朝人が再起動していた。data/broker_restart.pause があれば再起動なしで即座に止められる。
-        """
-        rt = cfg.get_section("runtime")
-        if not bool(rt.get("auto_launch_broker", False)):
-            return
-        if os.path.exists(os.path.join("data", "broker_restart.pause")):
-            logger.info("kabuステーション定時再起動を省略: data/broker_restart.pause があります")
-            return
-        if market_calendar.is_holiday(clock.today()):
-            logger.info("kabuステーション定時再起動を省略: 本日は休場です")
-            return
-        # ponytail: 人がちょうどログイン操作中（認証未完了）だと防げない。08:25固定の1回だけなので起こりにくい前提
-        if broker_watch.auth_valid_now(client.refresh_token):
-            logger.info("kabuステーション定時再起動を省略: 認証は有効です（トークンを取得できました）")
-            return
-        ok, detail = broker_launcher.restart(
-            rt.get("broker_exe_path", "") or "",
-            max_attempts_per_day=int(
-                rt.get("max_launch_attempts_per_day",
-                       broker_launcher.DEFAULT_MAX_ATTEMPTS_PER_DAY)
-            ),
+        """平日08:25: 前日から起動したままの KabuS を起動し直し、人はログインだけにする。"""
+        broker_watch.run_daily_restart(
+            runtime=cfg.get_section("runtime"), refresh_token=client.refresh_token,
+            restart=_restart_broker, alert=alert,
+            closed_today=market_calendar.is_holiday(clock.today()),
+            pause_exists=_restart_paused,
         )
-        if ok:
-            alert("kabuステーションを再起動しました",
-                  f"{detail}\nパスキー（認証アプリ）でログインしてください。"
-                  "ログイン後は自動で取引を再開します。",
-                  level=alerts_mod.LEVEL_INFO)
-        else:
-            alert("kabuステーションを再起動できませんでした",
-                  f"{detail}\nアプリを起動し直してログインしてください。")
+
+    def login_reminder_job():
+        broker_watch.login_reminder_tick(now=clock.now(), expired=broker_auth.is_expired(), alert=alert)
 
     def broker_full_login_job():
         """スケジューラから呼ばれる完全自動ログインジョブ（平日08:30）。
@@ -679,6 +677,7 @@ def main() -> None:
     # ─── スケジューラのコールバック登録 ──────────────────────
     scheduler.register("broker_full_login", broker_full_login_job)
     scheduler.register("broker_daily_restart", broker_daily_restart_job)
+    scheduler.register("login_reminder", login_reminder_job)
     scheduler.register("session_check", session_check_job)
     scheduler.register("gmail_token_check", gmail_token_check_job)
     scheduler.register("risk_reset", risk.reset_daily_counters)

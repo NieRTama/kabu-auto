@@ -121,7 +121,7 @@ def compute(mode: str, *, client, price_fn: Callable[[list], dict],
     if tm.reads_broker_api(mode):
         cash_source = "broker"
         try:
-            cash = _broker_cash(client)
+            cash = _broker_cash(client) + buying_power.unreflected_sell_amount()
         except Exception as e:
             cash_error = str(e)[:200]
     else:

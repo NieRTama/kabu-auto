@@ -178,3 +178,18 @@ class TestUnlimitedWait:
         ok = wait_for_broker(_connect_failing_n_times(10_000), timeout_seconds=300,
                              unlimited=False, sleep=clock.sleep, monotonic=clock.monotonic)
         assert ok is False
+
+
+class TestOnTick:
+    def test_tick_runs_each_failed_attempt_and_its_failure_does_not_stop_waiting(self):
+        """待機中も呼ばれ、例外が出ても待機は続く（2026-11-02: 待機中は何も動かず 12:00 まで放置された）"""
+        clock = _Clock()
+        ticks = []
+
+        def tick():
+            ticks.append(1)
+            raise RuntimeError("通知失敗")
+
+        assert wait_for_broker(_connect_failing_n_times(3), timeout_seconds=0, unlimited=True,
+                               on_tick=tick, sleep=clock.sleep, monotonic=clock.monotonic)
+        assert len(ticks) == 2

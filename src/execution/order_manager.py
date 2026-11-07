@@ -340,6 +340,8 @@ class OrderManager:
             )
             if cur_side == "BUY" and eff_price:
                 buying_power.note_buy_fill(delta_qty * eff_price)
+            if cur_side == "SELL" and eff_price:
+                buying_power.note_sell_fill(delta_qty * eff_price)
         # 終了状態ではタイムアウトキャンセルタイマーを解除
         # （未約定のPARTIALLY_FILLEDは残数を待つので解除しないが、PARTIALLY_FILLED_DONEは
         # ブローカー側で確定終了済みなので解除する。P0-2）

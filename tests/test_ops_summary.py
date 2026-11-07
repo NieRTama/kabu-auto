@@ -59,3 +59,15 @@ def test_short_version_is_brief_and_points_to_file(isolated_db, tmp_path, monkey
     assert "発注: なし" in text and "取引停止:" in text and "ERROR" in text
     assert lines[-1] == "詳細: log/ops_daily/ops_daily_2026-10-16.md"
     assert "▼" not in text  # 詳細版の節（ALERT全文など）は含めない
+
+
+def test_unrealized_line_sums_holdings(isolated_db, monkeypatch):
+    """確定損益の「勝率100%」だけでは含み損が見えない（2026-11-06: 確定+2,980円・含み-29,870円）"""
+    from src.data import market_data as md
+    from src.data.database import Position, get_session
+    with get_session() as s:
+        s.add(Position(symbol="8053", quantity=100, avg_cost=1764.3))
+        s.add(Position(symbol="3660", quantity=200, avg_cost=466.8))
+        s.commit()
+    monkeypatch.setattr(md, "latest_closes", lambda syms: {"8053": 1597.0, "3660": 425.0})
+    assert o._unrealized_line() == "含み損益: -25,090円（2銘柄）"
