@@ -1519,7 +1519,8 @@
     // 総資産の色は基準資金（live は reference_capital.json の 50万円）との比較で決める
     totalEl.style.color = d.basis_change != null ? dayColor(d.basis_change) : '';
     const chEl = document.getElementById('total-assets-change');
-    chEl.textContent = d.day_change != null ? `(${d.prev_label}: ${signed(d.day_change)})` : '(前日比: 記録なし)';
+    chEl.textContent = d.stale_date ? `(${d.stale_date} 時点の記録値)`
+      : d.day_change != null ? `(${d.prev_label}: ${signed(d.day_change)})` : '(前日比: 記録なし)';
     chEl.style.color = d.day_change != null ? dayColor(d.day_change) : '#64748b';
     const parts = [
       `現金 ${yen(d.cash)}${d.cash_source === 'paper' ? '（仮想）' : ''}`,
@@ -1532,7 +1533,8 @@
     }
     document.getElementById('total-assets-breakdown').innerHTML = parts.join('　／　');
     const warns = [];
-    if (d.cash_error) warns.push('口座余力を取得できないため総資産を表示できません: ' + escapeHtml(d.cash_error));
+    if (d.cash_error && d.stale_date) warns.push('閉場日のため口座余力を取得せず、直近の記録値を表示しています');
+    else if (d.cash_error) warns.push('口座余力を取得できないため総資産を表示できません: ' + escapeHtml(d.cash_error));
     if (d.unpriced && d.unpriced.length) warns.push('価格取得不可のため評価額に未算入: ' + d.unpriced.map(escapeHtml).join(', '));
     const w = document.getElementById('total-assets-warn');
     w.innerHTML = warns.join('<br>');

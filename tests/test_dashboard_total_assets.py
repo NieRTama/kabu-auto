@@ -79,6 +79,29 @@ def test_live_wallet_failure_gives_null_total_not_wrong_number(client, monkeypat
     assert "401" in d["cash_error"]
 
 
+def test_closed_day_wallet_failure_shows_last_record(client, monkeypatch):
+    # 閉場日はログインしないので余力が取れない → 直近の記録値で代用し、記録はしない
+    monkeypatch.setitem(dash._system_status, "mode", "live")
+    monkeypatch.setattr(dash, "_kabu_client", FakeClient(fail=True))
+    monkeypatch.setattr(dash.clock, "today", lambda: date(2026, 11, 8))  # 日曜
+    total_assets.HISTORY_PATH.write_text('{"2026-11-06": 470760.0}')
+    d = client.get("/api/total_assets").json()
+    assert d["total"] == 470760 and d["stale_date"] == "2026-11-06"
+    assert d["day_change"] is None and d["cash"] is None
+    assert "2026-11-08" not in total_assets.HISTORY_PATH.read_text()
+    assert total_assets.format_line(d).startswith("総資産: 470,760円（11/6時点の記録値")
+
+
+def test_weekday_wallet_failure_stays_null(client, monkeypatch):
+    # 平日（場中もありうる）のログイン切れは古い値を見せない
+    monkeypatch.setitem(dash._system_status, "mode", "live")
+    monkeypatch.setattr(dash, "_kabu_client", FakeClient(fail=True))
+    monkeypatch.setattr(dash.clock, "today", lambda: date(2026, 11, 9))  # 月曜
+    total_assets.HISTORY_PATH.write_text('{"2026-11-06": 470760.0}')
+    d = client.get("/api/total_assets").json()
+    assert d["total"] is None and d["stale_date"] is None
+
+
 def test_unpriced_position_is_excluded_and_listed(client):
     _pos("9999", 100, 1000.0)  # 価格データなし
     d = client.get("/api/total_assets").json()

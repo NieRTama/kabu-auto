@@ -134,6 +134,12 @@ def compute(mode: str, *, client, price_fn: Callable[[list], dict],
     prev_date, prev_total = previous_record(today)
     if record and total is not None:
         _record(today, total)
+    # 閉場日はログインしないため口座余力を取れない。値動きも約定も無いので直近の記録値で代用する
+    # （記録はしない。平日のログイン切れは null のまま＝場中に古い値を見せない）
+    from src.core import market_calendar
+    stale_date = None
+    if total is None and prev_total is not None and market_calendar.is_holiday(today):
+        total, stale_date = prev_total, prev_date.isoformat()
     return {
         "total": total,
         "cash": round(cash, 0) if cash is not None else None,
@@ -147,7 +153,9 @@ def compute(mode: str, *, client, price_fn: Callable[[list], dict],
         "basis_change": round(total - basis, 0) if total is not None and basis else None,
         "prev_total": prev_total,
         "prev_label": change_label(today, prev_date),
-        "day_change": round(total - prev_total, 0) if total is not None and prev_total is not None else None,
+        "day_change": (round(total - prev_total, 0)
+                       if total is not None and prev_total is not None and not stale_date else None),
+        "stale_date": stale_date,
     }
 
 
@@ -161,6 +169,9 @@ def format_line(d: dict) -> str:
         reason = d.get("cash_error") or "口座余力を取得できません"
         return f"総資産: 取得不可（{reason}）"
     parts = []
+    if d.get("stale_date"):
+        sd = date.fromisoformat(d["stale_date"])
+        parts.append(f"{sd.month}/{sd.day}時点の記録値")
     if d.get("day_change") is not None:
         parts.append(f"{d['prev_label']} {_signed(d['day_change'])}")
     if d.get("basis_change") is not None:
