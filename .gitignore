@@ -52,6 +52,7 @@ data/trading_halt.json
 data/watchdog_state.json
 # watchdogを意図的に止めるためのフラグファイル（保守作業時に手で作成）
 data/watchdog.pause
+data/*.pause
 
 # 緊急決済トークンのDiscord投稿状態（前日分削除用のmessage_idのみ。運用状態のため追跡しない）
 data/emergency_token_post_state.json

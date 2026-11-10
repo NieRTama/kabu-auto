@@ -192,6 +192,8 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
     # ファイルの無い CI で FileNotFoundError になっていた
     from src.core import halt
     halted = halt.is_halted()
+    from src.risk.manager import STOP_LOSS_PAUSE
+    sl_paused = "はい（data/stop_loss.pause）" if STOP_LOSS_PAUSE.exists() else "いいえ"
     down = _auth_downtime(alerts)
 
     if not full:
@@ -206,7 +208,7 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
             f"{_format_period(r['daily'])} ／ {_format_period(r['monthly'])}",
             _unrealized_safe(),
             orders,
-            f"認証切れ: {' / '.join(down) or 'なし'} ／ 取引停止: {'はい' if halted else 'いいえ'}",
+            f"認証切れ: {' / '.join(down) or 'なし'} ／ 取引停止: {'はい' if halted else 'いいえ'} ／ 損切り停止: {sl_paused}",
             f"ERROR {sum(errors.values())}件 ／ ALERT {len(alerts)}件",
             f"詳細: log/ops_daily/ops_daily_{today}.md",
         ])
@@ -217,6 +219,7 @@ def build(today: date, full: bool = True, assets: dict | None = None) -> str:
            f"本体起動: {len(starts)}回 {' '.join(starts)}",
            f"認証切れ: {' / '.join(down) or 'なし'}",
            f"取引停止中: {'はい' if halted else 'いいえ'}",
+           f"損切り・保有期限の停止中: {sl_paused}",
            f"ERROR/CRITICAL: {sum(errors.values())}件 / ALERT: {len(alerts)}件", ""]
     try:
         out += _db_sections(today, full)

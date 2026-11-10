@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from pathlib import Path
+
 from loguru import logger
 from sqlalchemy import func, select
 
@@ -24,6 +26,9 @@ from src.execution import order_status as st
 # 東証の売買単位。単元未満は発注できないため、1銘柄あたりの投資上限が
 # 「株価 × 100」に満たない銘柄は買えない（買える株数が0になる）。
 LOT_SIZE = 100
+
+# 置くと損切り・保有期限の売りを止める（本体の再起動不要。消せば再開）
+STOP_LOSS_PAUSE = Path(__file__).resolve().parents[2] / "data" / "stop_loss.pause"
 
 
 @dataclass
@@ -596,13 +601,16 @@ class RiskManager:
             if trailing_pct > 0:
                 effective_stop_price = max(effective_stop_price, peak * (1 - trailing_pct))
 
-        if current_price <= effective_stop_price:
+        # data/stop_loss.pause がある間は損切りと保有期限の売りをしない（2026-11-10 ユーザー指示）。
+        # 建値ストップ・トレーリング（armed）は利益を守る売りなので止めない
+        paused = STOP_LOSS_PAUSE.exists()
+        if current_price <= effective_stop_price and (armed or not paused):
             pnl_pct = (current_price - avg_cost) / avg_cost
             reason = "trailing_stop" if armed else "stop_loss"
             label = "トレーリングストップ/ブレークイーブン到達" if armed else "損切りライン到達"
             logger.warning(f"{label}: {symbol} 損益率={pnl_pct:.2%} ピーク以降の最高値={peak:.0f}")
             return True, reason
-        if self._is_stale(symbol, avg_cost, current_price):
+        if not paused and self._is_stale(symbol, avg_cost, current_price):
             return True, "time_stop"
         return False, ""
 

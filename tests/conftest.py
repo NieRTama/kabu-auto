@@ -46,6 +46,13 @@ def _fast_password_hashing():
     auth._ITERATIONS = 1
 
 
+@pytest.fixture(autouse=True)
+def _no_stop_loss_pause(tmp_path, monkeypatch):
+    """本番の data/stop_loss.pause が置かれていても、テストの損切り判定に影響させない。"""
+    import src.risk.manager as risk_mod
+    monkeypatch.setattr(risk_mod, "STOP_LOSS_PAUSE", tmp_path / "stop_loss.pause")
+
+
 @pytest.fixture
 def isolated_db(tmp_path):
     cfg.load("config.yaml")
