@@ -847,7 +847,8 @@ class TradingServices:
         is_paper = mode == "paper"
         buy_signals = [s for s in pending if s.action == "BUY"]
         sell_signals = [s for s in pending if s.action == "SELL"]
-        label = "後場" if skip_existing else "朝"
+        # skip_existing で決めると、場中のキャッチアップ（09:53 等）まで「後場」と表示される（2026-11-11 実例）
+        label = {"morning_execution": "朝", "catchup_execution": "復帰後"}.get(source, "後場")
 
         # ── SELL シグナル: 保有ポジションがあれば売る ─────────────
         for sig in sell_signals:
