@@ -33,6 +33,23 @@ def _guarded_db_init() -> None:
 
 db.init = _guarded_db_init
 
+# 2026-11-18: テスト収集中に scripts/ のモジュールが import 時に load_dotenv() しており、
+# 本物の DISCORD_WEBHOOK_URL が環境変数に入って、テストの「朝買い発注 7203 @1,000円」等が
+# 本番の Discord へ投稿された。どのモジュールが .env を読んでも外へ出ないよう、
+# 各テストの開始時に .env 由来の秘密・通知先を環境変数から外す（テスト側の setenv はこの後なので有効）。
+_SECRET_ENV = (
+    "KABU_API_PASSWORD", "KABU_API_PASSWORD_LIVE", "KABU_API_PASSWORD_VERIFY",
+    "KABU_DASHBOARD_TOKEN", "DISCORD_WEBHOOK_URL", "DISCORD_REPORT_WEBHOOK_URL",
+    "DISCORD_BOT_TOKEN", "DISCORD_BOT_CHANNEL_ID", "DISCORD_ALLOWED_USER_ID",
+    "X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET", "JQUANTS_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_secrets(monkeypatch):
+    for name in _SECRET_ENV:
+        monkeypatch.delenv(name, raising=False)
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _fast_password_hashing():
