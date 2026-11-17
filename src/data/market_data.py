@@ -4,11 +4,13 @@
 kabuステーションAPIは板情報のリアルタイム取得に使用し、
 過去データはyfinanceで補完する（権利修正済み）。
 """
+import os
 import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 import pandas as pd
+import requests
 import yfinance as yf
 from loguru import logger
 from sqlalchemy import func, select
@@ -256,8 +258,34 @@ def latest_closes(symbols: list[str]) -> dict[str, float]:
     return {r.symbol: r.close for r in rows if r.close is not None}
 
 
+JQUANTS_MASTER_URL = "https://api.jquants.com/v2/equities/master"
+
+
+def jquants_master(symbol: str) -> dict:
+    """J-Quants の上場銘柄一覧から1銘柄の情報を返す（キー未設定・未収録・失敗時は {}）。
+
+    Free プランは直近12週を除くため、上場12週以内の銘柄は収録されず {} になる。
+    キー（JQUANTS_API_KEY）の値はログへ出さない。
+    """
+    key = os.environ.get("JQUANTS_API_KEY")
+    if not key:
+        return {}
+    try:
+        r = requests.get(JQUANTS_MASTER_URL, params={"code": symbol},
+                         headers={"x-api-key": key}, timeout=10)
+        r.raise_for_status()
+        rows = r.json().get("data") or []
+    except Exception as e:
+        logger.warning(f"J-Quants 銘柄情報の取得失敗: {symbol} {type(e).__name__}")
+        return {}
+    return rows[-1] if rows else {}
+
+
 def lookup_company_name(symbol: str) -> str:
-    """yfinanceから銘柄コードに対応する会社名を取得する（取得失敗時は空文字）"""
+    """会社名を返す。J-Quants（日本語名）を優先し、無ければ yfinance（英語名）。失敗時は空文字"""
+    name = jquants_master(symbol).get("CoName")
+    if name:
+        return name
     try:
         info = yf.Ticker(_to_yf_symbol(symbol)).info
     except Exception as e:
@@ -267,12 +295,10 @@ def lookup_company_name(symbol: str) -> str:
 
 
 def lookup_sector(symbol: str) -> str:
-    """yfinanceから銘柄コードに対応するセクターを取得する（取得失敗時は空文字）。
+    """J-Quants の17業種名（S17Nm）を返す（取得失敗時は空文字）。
     RiskManager.check_sector_concentration() のセクター集中リスク判定に使用する。
+
+    yfinance へはフォールバックしない: 英語の分類が混ざると同じ業種が別セクターとして
+    数えられ、集中判定が効かなくなるため（2026-11-18 に17業種へ統一）。
     """
-    try:
-        info = yf.Ticker(_to_yf_symbol(symbol)).info
-    except Exception as e:
-        logger.warning(f"セクター取得失敗: {symbol} {e}")
-        return ""
-    return info.get("sector") or ""
+    return jquants_master(symbol).get("S17Nm") or ""
