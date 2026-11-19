@@ -867,9 +867,10 @@ class TradingServices:
                     price = board.get("CurrentPrice") or board.get("Buy1", {}).get("Price", 0)
                 if not price:
                     continue
-                self.order_mgr.sell(sig.symbol, float(price), qty,
-                                    rationale=_signal_rationale(sig),
-                                    source=source)
+                if not self.order_mgr.sell(sig.symbol, float(price), qty,
+                                           rationale=_signal_rationale(sig),
+                                           source=source):
+                    continue  # 見送り・拒否を「売り発注」と通知しない
                 logger.info(f"{label}売り発注: {sig.symbol} {qty}株 @{price:.0f}円")
                 alert(f"{label}売り発注",
                       f"{sig.symbol} {qty}株 @{price:,.0f}円（売りシグナルによる手仕舞い）",

@@ -27,7 +27,7 @@ from src.data.market_data import latest_closes
 from src.execution import lots
 from src.execution import order_status as st
 from src.execution.broker_gateway import BrokerGateway
-from src.risk.manager import RiskManager
+from src.risk.manager import RiskManager, loss_sell_paused
 
 
 # 既存リスクを減らす退出操作の reason（sell_market で新規発注ゲートをバイパスする）
@@ -455,6 +455,9 @@ class OrderManager:
     def sell(self, symbol: str, price: float, quantity: int,
              rationale: Optional[str] = None, source: str = "manual") -> Optional[str]:
         """指値売り注文を発注する（rationale=発注根拠。7.6 / source=発注のきっかけ。4.2）"""
+        if loss_sell_paused(symbol, price):
+            logger.info(f"売り見送り: {symbol} @{price:.0f}円 は取得単価を下回ります（data/stop_loss.pause）")
+            return None
         if not self._precheck(symbol, quantity):
             return None
 

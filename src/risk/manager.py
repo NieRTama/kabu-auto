@@ -27,8 +27,21 @@ from src.execution import order_status as st
 # 「株価 × 100」に満たない銘柄は買えない（買える株数が0になる）。
 LOT_SIZE = 100
 
-# 置くと損切り・保有期限の売りを止める（本体の再起動不要。消せば再開）
+# 置くと損切り・保有期限の売りと、取得単価を下回る売りを止める（本体の再起動不要。消せば再開）
 STOP_LOSS_PAUSE = Path(__file__).resolve().parents[2] / "data" / "stop_loss.pause"
+
+
+def loss_sell_paused(symbol: str, price: float) -> bool:
+    """data/stop_loss.pause がある間に、取得単価を下回る値で売ろうとしているか。
+
+    2026-11-19: 損切りを止めていても、売りシグナル（8053、-17,630円）と建値撤退（2353、-90円）が
+    含み損のまま売っていた。ユーザー指示で、pause 中は損が出る売りをすべて止める。
+    """
+    if not STOP_LOSS_PAUSE.exists():
+        return False
+    with get_session() as session:
+        avg_cost = session.scalar(select(Position.avg_cost).where(Position.symbol == symbol))
+    return bool(avg_cost) and price < avg_cost
 
 
 @dataclass
@@ -602,9 +615,10 @@ class RiskManager:
                 effective_stop_price = max(effective_stop_price, peak * (1 - trailing_pct))
 
         # data/stop_loss.pause がある間は損切りと保有期限の売りをしない（2026-11-10 ユーザー指示）。
-        # 建値ストップ・トレーリング（armed）は利益を守る売りなので止めない
+        # 建値ストップ・トレーリング（armed）も、取得単価を下回るなら売らない（2026-11-19 ユーザー指示）
         paused = STOP_LOSS_PAUSE.exists()
-        if current_price <= effective_stop_price and (armed or not paused):
+        blocked = paused and (not armed or current_price < avg_cost)
+        if current_price <= effective_stop_price and not blocked:
             pnl_pct = (current_price - avg_cost) / avg_cost
             reason = "trailing_stop" if armed else "stop_loss"
             label = "トレーリングストップ/ブレークイーブン到達" if armed else "損切りライン到達"

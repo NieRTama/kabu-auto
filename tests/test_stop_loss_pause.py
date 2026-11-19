@@ -40,3 +40,21 @@ def test_trailing_still_works_while_paused(isolated_db):
     _hold(peak=1100.0)  # ピーク +10% で建値ストップ・トレーリングが有効
     risk_mod.STOP_LOSS_PAUSE.write_text("")
     assert _exit(1050.0) == (True, "trailing_stop")  # 1100×0.96=1056 を下回った
+
+
+def test_breakeven_at_a_loss_paused(isolated_db):
+    # 2026-11-19 の 2353: 建値撤退が取得単価を下回って約定し -90円。pause 中は損が出る売りをしない
+    _hold(peak=1030.0)  # ピーク +3% で建値ストップが有効（トレーリング 1030×0.96=988.8 より建値が高い）
+    risk_mod.STOP_LOSS_PAUSE.write_text("")
+    assert _exit(995.0) == (False, "")
+    assert _exit(1000.0) == (True, "trailing_stop")  # 取得単価ちょうどは損が出ないので売る
+
+
+def test_sell_signal_at_a_loss_paused(isolated_db):
+    # 2026-11-19 の 8053: 売りシグナルで取得単価を下回って売り -17,630円
+    _hold()
+    assert risk_mod.loss_sell_paused("7203", 900.0) is False   # 置く前は売る
+    risk_mod.STOP_LOSS_PAUSE.write_text("")
+    assert risk_mod.loss_sell_paused("7203", 900.0) is True
+    assert risk_mod.loss_sell_paused("7203", 1000.0) is False  # 損が出なければ売る
+    assert risk_mod.loss_sell_paused("9999", 1.0) is False     # 保有が無ければ判定しない
